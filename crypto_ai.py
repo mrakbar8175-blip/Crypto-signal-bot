@@ -15,23 +15,19 @@ portfolio = {
     "daily_loss_limit": -50
 }
 
-# ---------- COIN MAPPING ----------
+# ---------- COIN MAPPING (10 altcoins universe; no BTC,ETH,LINK,LTC,MATIC) ----------
 COIN_MAP = {
-    "bitcoin": "BTCUSDT",
-    "ethereum": "ETHUSDT",
     "binancecoin": "BNBUSDT",
     "ripple": "XRPUSDT",
     "cardano": "ADAUSDT",
     "solana": "SOLUSDT",
     "dogecoin": "DOGEUSDT",
     "polkadot": "DOTUSDT",
-    "matic-network": "MATICUSDT",
-    "chainlink": "LINKUSDT",
     "uniswap": "UNIUSDT",
     "avalanche-2": "AVAXUSDT",
-    "litecoin": "LTCUSDT",
+    "near": "NEARUSDT",               # replaced MATIC
     "cosmos": "ATOMUSDT",
-    "ethereum-classic": "ETCUSDT"
+    # Additional coins are available but the bot only scans the top 10 by volume
 }
 
 # ---------- DATA HELPERS ----------
@@ -43,7 +39,6 @@ def fetch_binance(endpoint):
         return {"error": "request failed"}
 
 def get_order_book_level2(symbol, fallback_price=None):
-    """Return Level2 data using Binance depth, or build a minimal snapshot from fallback_price."""
     depth = fetch_binance(f"/fapi/v1/depth?symbol={symbol}&limit=10")
     if "bids" in depth and "asks" in depth:
         bids = depth["bids"]
@@ -70,7 +65,6 @@ def get_order_book_level2(symbol, fallback_price=None):
             "bid_depth_10": bid_vol_10, "ask_depth_10": ask_vol_10
         }
 
-    # Fallback: use the price we already got from CoinGecko top‑markets list
     if fallback_price and fallback_price > 0:
         bid = fallback_price * 0.9999
         ask = fallback_price * 1.0001
@@ -141,7 +135,6 @@ def get_trending(coin_id):
     return False
 
 def gather_market_data(symbols, price_map):
-    """symbols: list of 'BTCUSDT' strings. price_map: dict {symbol: price} from CoinGecko."""
     results = []
     for sym in symbols:
         print(f"Collecting L2 data for {sym}...")
@@ -203,44 +196,53 @@ def call_groq(prompt_text):
 
 # ---------- AI DECISION ----------
 def ai_decision():
-    # Get top coins from CoinGecko WITH their prices
+    # Get top coins from CoinGecko, EXCLUDE: bitcoin, ethereum, chainlink, litecoin, matic-network
     try:
-        url = "https://api.coingecko.com/api/v3/coins/markets?vs_currency=usd&order=volume_desc&per_page=15&page=1"
+        url = "https://api.coingecko.com/api/v3/coins/markets?vs_currency=usd&order=volume_desc&per_page=30&page=1"
         resp = requests.get(url, timeout=10)
         if resp.status_code == 200:
-            top_coins = resp.json()
+            all_coins = resp.json()
+            excluded_ids = {"bitcoin", "ethereum", "chainlink", "litecoin", "matic-network"}
+            filtered = [coin for coin in all_coins if coin["id"] not in excluded_ids]
+            candidates = []
+            for coin in filtered:
+                if coin["id"] in COIN_MAP:
+                    candidates.append(coin)
+                if len(candidates) >= 10:
+                    break
+            top_coins = candidates
         else:
             raise ValueError("CoinGecko markets failed")
     except Exception as e:
         print(f"CoinGecko failed: {e}")
-        # Ultimate fallback: use a static list
-        top_coins = [{"id": k, "current_price": 0, "total_volume": 0, "price_change_percentage_24h": 0} for k in COIN_MAP]
-        for coin in top_coins:
-            coin["current_price"] = 0  # will be ignored
+        # Fallback: use first 10 altcoins from our map (excluding the five)
+        fallback_ids = [k for k in COIN_MAP.keys() if k not in {"bitcoin", "ethereum", "chainlink", "litecoin", "matic-network"}][:10]
+        top_coins = [{"id": k, "current_price": 0, "total_volume": 0, "price_change_percentage_24h": 0}
+                     for k in fallback_ids]
 
     symbols = []
     price_map = {}
     for coin in top_coins:
-        if coin["id"] in COIN_MAP:
-            sym = COIN_MAP[coin["id"]]
-            symbols.append(sym)
-            price_map[sym] = coin.get("current_price", 0)
+        sym = COIN_MAP[coin["id"]]
+        symbols.append(sym)
+        price_map[sym] = coin.get("current_price", 0)
 
     if not symbols:
-        symbols = list(COIN_MAP.values())[:12]
+        symbols = [s for s in list(COIN_MAP.values())[:10] if s not in ["LINKUSDT", "LTCUSDT", "MATICUSDT"]]
         price_map = {s: 0 for s in symbols}
 
-    print(f"Gathering Level2+ data for {len(symbols)} coins...")
+    print(f"Gathering Level2+ data for {len(symbols)} altcoins (excl BTC,ETH,LINK,LTC,MATIC): {symbols}")
     market_data = gather_market_data(symbols, price_map)
     if not market_data:
         return {"action": "HOLD", "reasoning": "No market data available"}
 
     prompt = f"""
 You are "Crypto Institutional Desk – Multi‑Analysis". You trade USDT perpetuals on a 1000 USDT paper account.
+(BTC, ETH, LINK, LTC, MATIC are excluded. Universe includes NEAR and other liquid altcoins.)
 
 Current portfolio: {json.dumps(portfolio)}
 
-Real‑time Level 2 market data for the most liquid coins:
+Real‑time Level 2 market data for the top 10 altcoins by volume:
 {json.dumps(market_data, indent=2)}
 
 Analyse each coin using these 6 layers (0‑2 points each, max 12):
@@ -261,7 +263,7 @@ Only issue a trade if **total score ≥ 7** AND the order‑book imbalance clear
 - TAKE PROFIT: entry ± 2 * stop_distance (minimum). If score ≥ 9 and walls are massive, extend to 3:1 or 4:1. NEVER below 2:1.
 
 **Output ONLY a JSON (no markdown):**
-{{"action":"LONG"|"SHORT"|"HOLD","symbol":"BTCUSDT","quantity":0.0,"order_type":"LIMIT","limit_price":0.0,"stop_loss":0.0,"take_profit":0.0,"confidence_score":0,"reasoning":"..."}}
+{{"action":"LONG"|"SHORT"|"HOLD","symbol":"BNBUSDT","quantity":0.0,"order_type":"LIMIT","limit_price":0.0,"stop_loss":0.0,"take_profit":0.0,"confidence_score":0,"reasoning":"..."}}
 If HOLD, omit numeric fields or set to 0 and explain briefly.
 """
     print("Calling Groq...")
@@ -289,7 +291,14 @@ def send_telegram(text):
 def main():
     try:
         dec = ai_decision()
+        if dec.get("action") in ["LONG", "SHORT"]:
+            entry_price = dec.get("limit_price", 0)
+            current_price_line = f"Current price (bid/ask): {entry_price}\n"
+        else:
+            current_price_line = ""
+
         msg = (f"📊 {dec.get('action','HOLD')} {dec.get('symbol','')}\n"
+               f"{current_price_line}"
                f"Qty: {dec.get('quantity','')} | Score: {dec.get('confidence_score','')}\n"
                f"Stop: {dec.get('stop_loss','')} TP: {dec.get('take_profit','')}\n"
                f"Reason: {dec.get('reasoning','')}")
