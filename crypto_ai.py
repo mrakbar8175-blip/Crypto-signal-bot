@@ -1,12 +1,9 @@
-import requests, json, os, time, traceback
-from pycoingecko import CoinGeckoAPI
+import requests, json, os, traceback
 
 # ---------- ENVIRONMENT ----------
 TELEGRAM_TOKEN = os.environ["TELEGRAM_TOKEN"]
 CHAT_ID = os.environ["CHAT_ID"]
 GEMINI_API_KEY = os.environ["GEMINI_API_KEY"]
-
-cg = CoinGeckoAPI()
 
 # ---------- PAPER PORTFOLIO ----------
 portfolio = {
@@ -35,16 +32,7 @@ COIN_MAP = {
     "ethereum-classic": "ETCUSDT"
 }
 
-# ---------- SAFE BINANCE FETCH ----------
-def safe_get(dictionary, *keys, default=None):
-    """Traverse nested dicts safely."""
-    for key in keys:
-        if isinstance(dictionary, dict) and key in dictionary:
-            dictionary = dictionary[key]
-        else:
-            return default
-    return dictionary
-
+# ---------- SIMPLE HTTP HELPERS ----------
 def fetch_binance(endpoint):
     try:
         r = requests.get("https://fapi.binance.com" + endpoint, timeout=10)
@@ -52,9 +40,24 @@ def fetch_binance(endpoint):
     except:
         return {"error": "request failed"}
 
+def get_cg_price(coin_id):
+    """Get price from CoinGecko simple API (direct HTTP, no library)."""
+    try:
+        url = f"https://api.coingecko.com/api/v3/simple/price?ids={coin_id}&vs_currencies=usd"
+        resp = requests.get(url, timeout=10)
+        if resp.status_code == 200:
+            data = resp.json()
+            return data.get(coin_id, {}).get("usd", 0)
+        else:
+            print(f"CoinGecko price status {resp.status_code} for {coin_id}")
+            return 0
+    except Exception as e:
+        print(f"CoinGecko price error for {coin_id}: {e}")
+        return 0
+
 def get_order_book_data(symbol):
-    """Return a dict with bid, ask, spread, imbalance, vwap, atr, volume. Uses CoinGecko as ultimate fallback."""
-    # Try Binance depth
+    """Return dict with bid, ask, spread, imbalance, vwap, atr, volume. Falls back to CoinGecko price."""
+    # Try Binance depth first
     depth = fetch_binance(f"/fapi/v1/depth?symbol={symbol}&limit=5")
     if "bids" in depth and "asks" in depth:
         bids = depth["bids"]
@@ -67,10 +70,11 @@ def get_order_book_data(symbol):
         total = bid_vol + ask_vol
         imbalance = (bid_vol - ask_vol) / total if total else 0
     else:
-        # Fallback to CoinGecko
+        # Fallback to CoinGecko price
         coin_id = [k for k, v in COIN_MAP.items() if v == symbol][0]
         price = get_cg_price(coin_id)
         if price == 0:
+            print(f"No price for {symbol}, skipping")
             return None
         bid = price * 0.9999
         ask = price * 1.0001
@@ -121,7 +125,7 @@ def get_funding(symbol):
     data = fetch_binance(f"/fapi/v1/premiumIndex?symbol={symbol}")
     if "lastFundingRate" in data:
         return float(data["lastFundingRate"]) * 100
-    return 0.01  # neutral
+    return 0.01
 
 def get_ls_ratio(symbol):
     data = fetch_binance(f"/futures/data/globalLongShortAccountRatio?symbol={symbol}&period=5m")
@@ -137,10 +141,13 @@ def get_oi(symbol):
 
 def get_trending(coin_id):
     try:
-        trending = cg.get_search_trending()
-        for item in trending.get("coins", []):
-            if item["item"]["id"] == coin_id:
-                return True
+        url = "https://api.coingecko.com/api/v3/search/trending"
+        resp = requests.get(url, timeout=10)
+        if resp.status_code == 200:
+            trending = resp.json()
+            for item in trending.get("coins", []):
+                if item["item"]["id"] == coin_id:
+                    return True
     except:
         pass
     return False
@@ -149,7 +156,7 @@ def get_coin_data(symbol):
     coin_id = [k for k, v in COIN_MAP.items() if v == symbol][0]
     base = get_order_book_data(symbol)
     if base is None:
-        return None  # price unavailable
+        return None
     base["symbol"] = symbol
     base["funding_rate"] = get_funding(symbol)
     base["long_short_ratio"] = get_ls_ratio(symbol)
@@ -160,15 +167,15 @@ def get_coin_data(symbol):
 def gather_market_data(symbols):
     results = []
     for sym in symbols:
-        try:
-            info = get_coin_data(sym)
-            if info:
-                results.append(info)
-        except Exception as e:
-            print(f"Skipping {sym} due to error: {e}")
+        print(f"Fetching {sym}...")
+        info = get_coin_data(sym)
+        if info:
+            results.append(info)
+        else:
+            print(f"  -> skipped {sym}")
     return results
 
-# ---------- GEMINI REST API ----------
+# ---------- GEMINI REST CALL ----------
 def call_gemini(prompt_text):
     url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent"
     headers = {"Content-Type": "application/json"}
@@ -179,55 +186,55 @@ def call_gemini(prompt_text):
     try:
         resp = requests.post(url, headers=headers, params={"key": GEMINI_API_KEY}, json=body, timeout=30)
         if resp.status_code != 200:
-            print(f"Gemini API error {resp.status_code}: {resp.text}")
+            print(f"Gemini error {resp.status_code}: {resp.text}")
             return None
         data = resp.json()
         return data["candidates"][0]["content"]["parts"][0]["text"]
     except Exception as e:
-        print("Gemini call exception:", e)
+        print("Gemini exception:", e)
         return None
 
 # ---------- AI DECISION ----------
 def ai_decision():
     # Get top symbols from CoinGecko
     try:
-        top_coins = cg.get_coins_markets(vs_currency='usd', order='volume_desc', per_page=15, page=1)
-        symbols = [COIN_MAP[coin['id']] for coin in top_coins if coin['id'] in COIN_MAP]
-        if not symbols:
-            raise ValueError("No matching coins")
+        url = "https://api.coingecko.com/api/v3/coins/markets?vs_currency=usd&order=volume_desc&per_page=15&page=1"
+        resp = requests.get(url, timeout=10)
+        if resp.status_code == 200:
+            top_coins = resp.json()
+            symbols = [COIN_MAP[coin['id']] for coin in top_coins if coin['id'] in COIN_MAP]
+        else:
+            raise ValueError("CoinGecko markets failed")
     except Exception as e:
-        print("Fallback to default list:", e)
+        print(f"Fallback to default list: {e}")
         symbols = list(COIN_MAP.values())[:12]
 
-    print(f"Fetching data for {len(symbols)} coins...")
+    print(f"Gathering data for {len(symbols)} coins: {symbols}")
     market_data = gather_market_data(symbols)
 
     if not market_data:
-        return {"action": "HOLD", "reasoning": "No market data available for any coin"}
+        return {"action": "HOLD", "reasoning": "No market data available"}
 
     prompt = f"""
 You are "Crypto Institutional Desk – Multi‑Analysis", a paper trader on USDT perpetuals. Portfolio: {json.dumps(portfolio)}.
 
-Real‑time data for the most liquid coins (already fetched, no need to call any function):
+Real‑time market data (already fetched):
 {json.dumps(market_data, indent=2)}
 
-Analyse each coin using these layers (0‑2 points each):
-1. Momentum & Microstructure: last price vs VWAP, orderbook imbalance, spread.
-2. Positioning: long/short ratio (if not null), open interest, funding rate.
-3. Derivatives: funding rate neutrality, OI changes (assume flat if not provided).
-4. Volatility & Volume: ATR% of price (ideal 1–8%), 24h volume > 500k USDT.
-5. Catalyst / Sentiment: is_trending, 24h change, and any general market news you know.
+Analyse each coin (0‑2 points each):
+1. Momentum & Microstructure: last vs vwap, orderbook imbalance, spread.
+2. Positioning: long/short ratio (null = ignore), OI, funding rate.
+3. Derivatives: funding rate neutrality.
+4. Vol & Volume: ATR% ideal 1-8%, 24h vol > 500k USDT.
+5. Catalyst: is_trending, 24h change, any general news.
 
-Only output a trade if total score ≥ 7. Risk management:
-- risk = 5 USDT (0.5% of 1000)
-- stop distance = atr_14 * 1.8
-- quantity = floor(5 / stop distance), capped so that position notional ≤ 150 USDT
-- STOP LOSS: entry ± stop distance
-- TAKE PROFIT: entry ± 2× stop distance minimum. If score ≥ 8 and strong momentum, extend to 3:1 or 4:1. NEVER below 2:1.
+Only trade if total score ≥ 7. Risk:
+- risk = 5 USDT, stop = atr*1.8, qty = floor(5/stop) cap 150 USDT notional.
+- STOP LOSS: entry ± stop. TAKE PROFIT: entry ± 2*stop (min). If score ≥8 and strong momentum, extend to 3:1 or 4:1. NEVER below 2:1.
 
-OUTPUT ONLY A JSON (no other text):
-{{"action":"LONG"|"SHORT"|"HOLD","symbol":"BTCUSDT","quantity":0.01,"order_type":"LIMIT","limit_price":70000,"stop_loss":69800,"take_profit":70400,"confidence_score":8,"reasoning":"..."}}
-If no trade qualifies, use action "HOLD" and explain briefly.
+OUTPUT ONLY JSON (no markdown):
+{{"action":"LONG"|"SHORT"|"HOLD","symbol":"...","quantity":0.0,"order_type":"LIMIT","limit_price":0.0,"stop_loss":0.0,"take_profit":0.0,"confidence_score":0,"reasoning":"..."}}
+If HOLD, omit numeric fields or set to 0 and explain.
 """
     print("Calling Gemini...")
     response = call_gemini(prompt)
@@ -236,23 +243,20 @@ If no trade qualifies, use action "HOLD" and explain briefly.
 
     try:
         text = response.strip()
-        if text.startswith("```json"):
-            text = text[7:]
-        if text.endswith("```"):
-            text = text[:-3]
+        if "```" in text:
+            text = text.split("```")[1].split("```")[0]
         return json.loads(text)
     except:
-        print("Failed to parse Gemini response:", response)
+        print("Gemini raw:", response)
         return {"action": "HOLD", "reasoning": "JSON parse error"}
 
 # ---------- TELEGRAM ----------
 def send_telegram(text):
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     try:
-        resp = requests.post(url, data={"chat_id": CHAT_ID, "text": text}, timeout=10)
-        print("Telegram status:", resp.status_code)
+        requests.post(url, data={"chat_id": CHAT_ID, "text": text}, timeout=10)
     except Exception as e:
-        print("Telegram send failed:", e)
+        print("Telegram fail:", e)
 
 def main():
     try:
@@ -264,7 +268,7 @@ def main():
         print(msg)
         send_telegram(msg)
     except Exception as e:
-        err_msg = f"Bot crashed: {traceback.format_exc()}"
+        err_msg = f"Fatal: {traceback.format_exc()}"
         print(err_msg)
         send_telegram(err_msg[:500])
 
