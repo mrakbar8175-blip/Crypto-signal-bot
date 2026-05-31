@@ -1,7 +1,7 @@
 name: Crypto Signal Every Minute
 on:
   schedule:
-    - cron: '* * * * *'
+    - cron: '0 * * * *'     # runs at minute 0 of every hour
   workflow_dispatch:
 jobs:
   run-bot:
