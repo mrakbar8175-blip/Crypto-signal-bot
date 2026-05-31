@@ -2,7 +2,7 @@ import requests, json, os
 import google.generativeai as genai
 
 TELEGRAM_TOKEN = os.environ["8631237233:AAEc_QP5HnI6qDrfQVaJxRuLG8q6s-C3YEc"]
-CHAT_ID = os.environ["CHAT_ID"]
+CHAT_ID = os.environ["0"]
 GEMINI_API_KEY = os.environ["AQ.Ab8RN6J48afeUOtT0PNu1p5nnkI9iU8Sm2bMYXU6smnWfy4GVg"]
 
 genai.configure(api_key=GEMINI_API_KEY)
