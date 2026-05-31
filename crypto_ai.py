@@ -3,7 +3,7 @@ import requests, json, os, traceback
 # ---------- ENVIRONMENT ----------
 TELEGRAM_TOKEN = os.environ["TELEGRAM_TOKEN"]
 CHAT_ID = os.environ["CHAT_ID"]
-GEMINI_API_KEY = os.environ["GEMINI_API_KEY"]
+DEEPSEEK_API_KEY = os.environ["DEEPSEEK_API_KEY"]
 
 # ---------- PAPER PORTFOLIO ----------
 portfolio = {
@@ -32,7 +32,7 @@ COIN_MAP = {
     "ethereum-classic": "ETCUSDT"
 }
 
-# ---------- SIMPLE HTTP HELPERS ----------
+# ---------- DATA HELPERS ----------
 def fetch_binance(endpoint):
     try:
         r = requests.get("https://fapi.binance.com" + endpoint, timeout=10)
@@ -41,27 +41,19 @@ def fetch_binance(endpoint):
         return {"error": "request failed"}
 
 def get_cg_price(coin_id):
-    """Get price from CoinGecko simple API (direct HTTP, no library)."""
     try:
         url = f"https://api.coingecko.com/api/v3/simple/price?ids={coin_id}&vs_currencies=usd"
         resp = requests.get(url, timeout=10)
         if resp.status_code == 200:
-            data = resp.json()
-            return data.get(coin_id, {}).get("usd", 0)
-        else:
-            print(f"CoinGecko price status {resp.status_code} for {coin_id}")
-            return 0
-    except Exception as e:
-        print(f"CoinGecko price error for {coin_id}: {e}")
-        return 0
+            return resp.json().get(coin_id, {}).get("usd", 0)
+    except:
+        pass
+    return 0
 
 def get_order_book_data(symbol):
-    """Return dict with bid, ask, spread, imbalance, vwap, atr, volume. Falls back to CoinGecko price."""
-    # Try Binance depth first
     depth = fetch_binance(f"/fapi/v1/depth?symbol={symbol}&limit=5")
     if "bids" in depth and "asks" in depth:
-        bids = depth["bids"]
-        asks = depth["asks"]
+        bids, asks = depth["bids"], depth["asks"]
         bid = float(bids[0][0])
         ask = float(asks[0][0])
         spread_pct = (ask - bid) / ask * 100
@@ -70,18 +62,15 @@ def get_order_book_data(symbol):
         total = bid_vol + ask_vol
         imbalance = (bid_vol - ask_vol) / total if total else 0
     else:
-        # Fallback to CoinGecko price
         coin_id = [k for k, v in COIN_MAP.items() if v == symbol][0]
         price = get_cg_price(coin_id)
         if price == 0:
-            print(f"No price for {symbol}, skipping")
             return None
         bid = price * 0.9999
         ask = price * 1.0001
         spread_pct = 0.02
         imbalance = 0
 
-    # ATR & VWAP from klines
     klines = fetch_binance(f"/fapi/v1/klines?symbol={symbol}&interval=1m&limit=60")
     if isinstance(klines, list) and len(klines) >= 60:
         cv, cvp = 0, 0
@@ -101,7 +90,6 @@ def get_order_book_data(symbol):
         vwap = bid
         atr = bid * 0.015
 
-    # Volume from ticker
     ticker = fetch_binance(f"/fapi/v1/ticker/24hr?symbol={symbol}")
     if "symbol" in ticker:
         volume = float(ticker.get("quoteVolume", 0))
@@ -111,8 +99,8 @@ def get_order_book_data(symbol):
         change = 0
 
     return {
-        "bid": bid,
-        "ask": ask,
+        "symbol": symbol,
+        "bid": bid, "ask": ask,
         "spread_pct": spread_pct,
         "orderbook_imbalance": imbalance,
         "vwap_1h": vwap,
@@ -141,8 +129,7 @@ def get_oi(symbol):
 
 def get_trending(coin_id):
     try:
-        url = "https://api.coingecko.com/api/v3/search/trending"
-        resp = requests.get(url, timeout=10)
+        resp = requests.get("https://api.coingecko.com/api/v3/search/trending", timeout=10)
         if resp.status_code == 200:
             trending = resp.json()
             for item in trending.get("coins", []):
@@ -152,51 +139,50 @@ def get_trending(coin_id):
         pass
     return False
 
-def get_coin_data(symbol):
-    coin_id = [k for k, v in COIN_MAP.items() if v == symbol][0]
-    base = get_order_book_data(symbol)
-    if base is None:
-        return None
-    base["symbol"] = symbol
-    base["funding_rate"] = get_funding(symbol)
-    base["long_short_ratio"] = get_ls_ratio(symbol)
-    base["open_interest"] = get_oi(symbol)
-    base["is_trending"] = get_trending(coin_id)
-    return base
-
 def gather_market_data(symbols):
     results = []
     for sym in symbols:
         print(f"Fetching {sym}...")
-        info = get_coin_data(sym)
-        if info:
-            results.append(info)
-        else:
-            print(f"  -> skipped {sym}")
+        base = get_order_book_data(sym)
+        if base is None:
+            continue
+        base["funding_rate"] = get_funding(sym)
+        base["long_short_ratio"] = get_ls_ratio(sym)
+        base["open_interest"] = get_oi(sym)
+        coin_id = [k for k, v in COIN_MAP.items() if v == sym][0]
+        base["is_trending"] = get_trending(coin_id)
+        results.append(base)
     return results
 
-# ---------- GEMINI REST CALL ----------
-def call_gemini(prompt_text):
-    url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent"
-    headers = {"Content-Type": "application/json"}
-    body = {
-        "contents": [{"parts": [{"text": prompt_text}]}],
-        "generationConfig": {"temperature": 0.1, "maxOutputTokens": 400}
+# ---------- DEEPSEEK API CALL ----------
+def call_deepseek(prompt_text):
+    url = "https://api.deepseek.com/v1/chat/completions"
+    headers = {
+        "Authorization": f"Bearer {DEEPSEEK_API_KEY}",
+        "Content-Type": "application/json"
+    }
+    payload = {
+        "model": "deepseek-chat",       # fast & reliable
+        "messages": [
+            {"role": "user", "content": prompt_text}
+        ],
+        "temperature": 0.1,
+        "max_tokens": 400
     }
     try:
-        resp = requests.post(url, headers=headers, params={"key": GEMINI_API_KEY}, json=body, timeout=30)
+        resp = requests.post(url, headers=headers, json=payload, timeout=30)
         if resp.status_code != 200:
-            print(f"Gemini error {resp.status_code}: {resp.text}")
+            print(f"DeepSeek API error {resp.status_code}: {resp.text}")
             return None
         data = resp.json()
-        return data["candidates"][0]["content"]["parts"][0]["text"]
+        return data["choices"][0]["message"]["content"]
     except Exception as e:
-        print("Gemini exception:", e)
+        print("DeepSeek call exception:", e)
         return None
 
 # ---------- AI DECISION ----------
 def ai_decision():
-    # Get top symbols from CoinGecko
+    # Top coins from CoinGecko
     try:
         url = "https://api.coingecko.com/api/v3/coins/markets?vs_currency=usd&order=volume_desc&per_page=15&page=1"
         resp = requests.get(url, timeout=10)
@@ -209,7 +195,7 @@ def ai_decision():
         print(f"Fallback to default list: {e}")
         symbols = list(COIN_MAP.values())[:12]
 
-    print(f"Gathering data for {len(symbols)} coins: {symbols}")
+    print(f"Gathering data for {len(symbols)} coins...")
     market_data = gather_market_data(symbols)
 
     if not market_data:
@@ -236,10 +222,10 @@ OUTPUT ONLY JSON (no markdown):
 {{"action":"LONG"|"SHORT"|"HOLD","symbol":"...","quantity":0.0,"order_type":"LIMIT","limit_price":0.0,"stop_loss":0.0,"take_profit":0.0,"confidence_score":0,"reasoning":"..."}}
 If HOLD, omit numeric fields or set to 0 and explain.
 """
-    print("Calling Gemini...")
-    response = call_gemini(prompt)
+    print("Calling DeepSeek...")
+    response = call_deepseek(prompt)
     if not response:
-        return {"action": "HOLD", "reasoning": "Gemini API error"}
+        return {"action": "HOLD", "reasoning": "DeepSeek API error"}
 
     try:
         text = response.strip()
@@ -247,7 +233,7 @@ If HOLD, omit numeric fields or set to 0 and explain.
             text = text.split("```")[1].split("```")[0]
         return json.loads(text)
     except:
-        print("Gemini raw:", response)
+        print("DeepSeek raw:", response)
         return {"action": "HOLD", "reasoning": "JSON parse error"}
 
 # ---------- TELEGRAM ----------
