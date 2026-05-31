@@ -1,20 +1,40 @@
-import requests, json, os
+import requests, json, os, time
+from pycoingecko import CoinGeckoAPI
 import google.generativeai as genai
 
+# Read secrets from environment
 TELEGRAM_TOKEN = os.environ["TELEGRAM_TOKEN"]
 CHAT_ID = os.environ["CHAT_ID"]
 GEMINI_API_KEY = os.environ["GEMINI_API_KEY"]
 
-
 genai.configure(api_key=GEMINI_API_KEY)
+cg = CoinGeckoAPI()
 
-BASE = "https://fapi.binance.com"
-
+# Paper portfolio
 portfolio = {
     "balance_usdt": 1000.0,
     "positions": [],
     "realized_pnl": 0.0,
     "daily_loss_limit": -50
+}
+
+# Stable list of CoinGecko IDs for top USDT perpetuals (mapped to Binance symbols)
+COIN_MAP = {
+    "bitcoin": "BTCUSDT",
+    "ethereum": "ETHUSDT",
+    "binancecoin": "BNBUSDT",
+    "ripple": "XRPUSDT",
+    "cardano": "ADAUSDT",
+    "solana": "SOLUSDT",
+    "dogecoin": "DOGEUSDT",
+    "polkadot": "DOTUSDT",
+    "matic-network": "MATICUSDT",
+    "chainlink": "LINKUSDT",
+    "uniswap": "UNIUSDT",
+    "avalanche-2": "AVAXUSDT",
+    "litecoin": "LTCUSDT",
+    "cosmos": "ATOMUSDT",
+    "ethereum-classic": "ETCUSDT"
 }
 
 SYSTEM_PROMPT = """
@@ -44,26 +64,46 @@ OUTPUT ONLY JSON:
 {"action":"LONG"|"SHORT"|"HOLD","symbol":"BTCUSDT","quantity":0.01,"order_type":"LIMIT","limit_price":70000,"stop_loss":69800,"take_profit":70400,"confidence_score":8,"reasoning":"..."}
 """
 
-def fetch(url):
+def fetch_binance(endpoint):
+    """Try Binance; if blocked, return error dict."""
     try:
-        r = requests.get(BASE + url, timeout=15)
+        r = requests.get("https://fapi.binance.com" + endpoint, timeout=10)
         return r.json()
     except:
         return {"error": "request failed"}
 
-def get_order_book(symbol):
-    depth = fetch(f"/fapi/v1/depth?symbol={symbol}&limit=5")
-    if "error" in depth: return depth
-    bids, asks = depth["bids"], depth["asks"]
-    bid, ask = float(bids[0][0]), float(asks[0][0])
-    spread_pct = (ask - bid) / ask * 100
-    bid_vol = sum(float(b[1]) for b in bids[:3])
-    ask_vol = sum(float(a[1]) for a in asks[:3])
-    total = bid_vol + ask_vol
-    imbalance = (bid_vol - ask_vol)/total if total else 0
+def get_cg_price(coin_id):
+    """Get price in USDT from CoinGecko."""
+    try:
+        data = cg.get_price(ids=coin_id, vs_currencies='usd')
+        return data[coin_id]['usd']
+    except:
+        return 0
 
-    klines = fetch(f"/fapi/v1/klines?symbol={symbol}&interval=1m&limit=60")
-    if "error" not in klines and len(klines)>=60:
+def get_order_book(symbol):
+    # Try Binance first, fallback to CoinGecko approximation
+    depth = fetch_binance(f"/fapi/v1/depth?symbol={symbol}&limit=5")
+    if "error" not in depth and "bids" in depth:
+        bids, asks = depth["bids"], depth["asks"]
+        bid = float(bids[0][0])
+        ask = float(asks[0][0])
+        spread_pct = (ask - bid) / ask * 100
+        bid_vol = sum(float(b[1]) for b in bids[:3])
+        ask_vol = sum(float(a[1]) for a in asks[:3])
+        total = bid_vol + ask_vol
+        imbalance = (bid_vol - ask_vol) / total if total else 0
+    else:
+        # Fallback: use CoinGecko price as mid
+        coin_id = [k for k,v in COIN_MAP.items() if v == symbol][0]
+        price = get_cg_price(coin_id)
+        if price == 0: return {"error": "price unavailable"}
+        bid = price * 0.9999
+        ask = price * 1.0001
+        spread_pct = 0.02
+        imbalance = 0
+    # ATR and VWAP from Binance klines, or approximate
+    klines = fetch_binance(f"/fapi/v1/klines?symbol={symbol}&interval=1m&limit=60")
+    if "error" not in klines and len(klines) >= 60:
         cv, cvp = 0,0
         trs = []
         for i in range(len(klines)-14, len(klines)):
@@ -77,28 +117,31 @@ def get_order_book(symbol):
         vwap = cvp/cv if cv else bid
         atr = sum(trs)/len(trs)
     else:
-        vwap, atr = bid, ask-bid
-
-    ticker = fetch(f"/fapi/v1/ticker/24hr?symbol={symbol}")
-    last = float(ticker.get("lastPrice", bid)) if "error" not in ticker else bid
-    vol = float(ticker.get("quoteVolume", 0)) if "error" not in ticker else 0
-
+        # Approximate ATR as 1.5% of price
+        vwap = bid
+        atr = bid * 0.015
+    volume = 0
+    ticker = fetch_binance(f"/fapi/v1/ticker/24hr?symbol={symbol}")
+    if "error" not in ticker:
+        volume = float(ticker.get("quoteVolume", 0))
+    else:
+        volume = 1000000  # assume liquid
     return {"bid":bid, "ask":ask, "spread_pct":spread_pct, "orderbook_imbalance":imbalance,
-            "last_price":last, "vwap_1h":vwap, "atr_14":atr, "volume_24h":vol}
+            "last_price":bid, "vwap_1h":vwap, "atr_14":atr, "volume_24h":volume}
 
 def get_funding_rate(symbol):
-    d = fetch(f"/fapi/v1/premiumIndex?symbol={symbol}")
-    if "error" in d: return d
+    d = fetch_binance(f"/fapi/v1/premiumIndex?symbol={symbol}")
+    if "error" in d: return {"funding_rate": 0.01}  # assume neutral
     return {"funding_rate": float(d["lastFundingRate"])*100}
 
 def get_long_short_ratio(symbol):
-    d = fetch(f"/futures/data/globalLongShortAccountRatio?symbol={symbol}&period=5m")
+    d = fetch_binance(f"/futures/data/globalLongShortAccountRatio?symbol={symbol}&period=5m")
     if "error" in d or not d: return {"error":"unavailable"}
     return {"long_short_ratio": float(d[0]["longShortRatio"])}
 
 def get_open_interest(symbol):
-    d = fetch(f"/fapi/v1/openInterest?symbol={symbol}")
-    if "error" in d: return d
+    d = fetch_binance(f"/fapi/v1/openInterest?symbol={symbol}")
+    if "error" in d: return {"open_interest": 0, "oi_change_1h_pct": 0.0}
     return {"open_interest": float(d["openInterest"]), "oi_change_1h_pct": 0.0}
 
 def call_func(name, args):
@@ -110,55 +153,72 @@ def call_func(name, args):
     return {"error":"unknown"}
 
 def ai_decision():
-    tickers = fetch("/fapi/v1/ticker/24hr")
-    print("Binance raw tickers type:", type(tickers))
-    # Print first 500 chars of response for debugging
-    if isinstance(tickers, dict):
-        print("Tickers response (dict):", json.dumps(tickers)[:300])
-    elif isinstance(tickers, list):
-        print(f"Got {len(tickers)} tickers")
-    else:
-        print("Tickers is something else:", str(tickers)[:300])
-
-    # Fallback list of liquid USDT perpetuals if tickers endpoint fails
-    fallback_symbols = [
-        "BTCUSDT", "ETHUSDT", "BNBUSDT", "XRPUSDT", "ADAUSDT",
-        "SOLUSDT", "DOGEUSDT", "DOTUSDT", "MATICUSDT", "LINKUSDT",
-        "UNIUSDT", "AVAXUSDT", "LTCUSDT", "ATOMUSDT", "ETCUSDT"
-    ]
-
-    if isinstance(tickers, dict) and "error" in tickers:
-        print("Binance error, using fallback list")
-        # Build minimal top_list from fallback
+    # Get top coins by volume from CoinGecko
+    try:
+        top_coins = cg.get_coins_markets(vs_currency='usd', order='volume_desc', per_page=15, page=1)
         top_list = []
-        for sym in fallback_symbols:
-            # get individual ticker data
-            t = fetch(f"/fapi/v1/ticker/24hr?symbol={sym}")
-            if isinstance(t, dict) and "symbol" in t:
+        for coin in top_coins:
+            symbol = COIN_MAP.get(coin['id'])
+            if symbol:
                 top_list.append({
-                    "symbol": t["symbol"],
-                    "volume": float(t.get("quoteVolume", 0)),
-                    "change": float(t.get("priceChangePercent", 0))
+                    "symbol": symbol,
+                    "volume": coin.get('total_volume', 0),
+                    "change": coin.get('price_change_percentage_24h', 0)
                 })
-        top_list.sort(key=lambda x: x["volume"], reverse=True)
-        top_list = top_list[:15]
-    elif isinstance(tickers, list) and len(tickers) > 0:
-        top = sorted(tickers, key=lambda x: float(x.get("quoteVolume",0)), reverse=True)[:20]
-        top_list = [{"symbol":t["symbol"], "volume":float(t["quoteVolume"]), "change":float(t["priceChangePercent"])} for t in top]
-    else:
-        print("No valid ticker data, using fallback without volume sorting")
-        top_list = [{"symbol":s, "volume":0, "change":0} for s in fallback_symbols]
+        if not top_list:
+            raise ValueError("No matching coins")
+    except Exception as e:
+        print("CoinGecko failed, using fallback list:", e)
+        # Fallback static list
+        top_list = [{"symbol": s, "volume": 0, "change": 0} for s in COIN_MAP.values()]
 
-    print("Top coins being sent to AI:", len(top_list), "coins")
+    print("Top coins:", len(top_list))
 
     msgs = [{"role":"user", "parts":[{"text":SYSTEM_PROMPT}]},
             {"role":"user", "parts":[{"text":f"Portfolio: {json.dumps(portfolio)}\nTop coins: {json.dumps(top_list)}\nGive ONE trade decision."}]}]
 
+    # Fixed tool definitions (no "type": "object")
     tools = [
-        {"name":"get_order_book","description":"Live order book & ATR","parameters":{"type":"object","properties":{"symbol":{"type":"string"}},"required":["symbol"]}},
-        {"name":"get_funding_rate","description":"Funding rate","parameters":{"type":"object","properties":{"symbol":{"type":"string"}},"required":["symbol"]}},
-        {"name":"get_long_short_ratio","description":"Long/short ratio","parameters":{"type":"object","properties":{"symbol":{"type":"string"}},"required":["symbol"]}},
-        {"name":"get_open_interest","description":"Open interest","parameters":{"type":"object","properties":{"symbol":{"type":"string"}},"required":["symbol"]}}
+        {
+            "name": "get_order_book",
+            "description": "Live order book & ATR",
+            "parameters": {
+                "properties": {
+                    "symbol": {"type": "string"}
+                },
+                "required": ["symbol"]
+            }
+        },
+        {
+            "name": "get_funding_rate",
+            "description": "Funding rate",
+            "parameters": {
+                "properties": {
+                    "symbol": {"type": "string"}
+                },
+                "required": ["symbol"]
+            }
+        },
+        {
+            "name": "get_long_short_ratio",
+            "description": "Long/short ratio",
+            "parameters": {
+                "properties": {
+                    "symbol": {"type": "string"}
+                },
+                "required": ["symbol"]
+            }
+        },
+        {
+            "name": "get_open_interest",
+            "description": "Open interest",
+            "parameters": {
+                "properties": {
+                    "symbol": {"type": "string"}
+                },
+                "required": ["symbol"]
+            }
+        }
     ]
 
     model = genai.GenerativeModel("gemini-1.5-flash", tools=tools)
@@ -183,8 +243,12 @@ def ai_decision():
     return {"action":"HOLD","reasoning":"No decision"}
 
 def send_telegram(text):
-    requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
-                  data={"chat_id": CHAT_ID, "text": text})
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+    try:
+        resp = requests.post(url, data={"chat_id": CHAT_ID, "text": text}, timeout=10)
+        print("Telegram response:", resp.status_code, resp.text)
+    except Exception as e:
+        print("Telegram send failed:", e)
 
 def main():
     dec = ai_decision()
