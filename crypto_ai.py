@@ -42,46 +42,46 @@ def fetch_binance(endpoint):
     except:
         return {"error": "request failed"}
 
-def get_cg_price(coin_id):
-    try:
-        url = f"https://api.coingecko.com/api/v3/simple/price?ids={coin_id}&vs_currencies=usd"
-        resp = requests.get(url, timeout=10)
-        if resp.status_code == 200:
-            return resp.json().get(coin_id, {}).get("usd", 0)
-    except:
-        pass
-    return 0
-
-def get_order_book_level2(symbol):
+def get_order_book_level2(symbol, fallback_price=None):
+    """Return Level2 data using Binance depth, or build a minimal snapshot from fallback_price."""
     depth = fetch_binance(f"/fapi/v1/depth?symbol={symbol}&limit=10")
-    if "bids" not in depth or "asks" not in depth:
-        return None
-    bids = depth["bids"]
-    asks = depth["asks"]
-    bid = float(bids[0][0])
-    ask = float(asks[0][0])
-    spread_pct = (ask - bid) / ask * 100
+    if "bids" in depth and "asks" in depth:
+        bids = depth["bids"]
+        asks = depth["asks"]
+        bid = float(bids[0][0])
+        ask = float(asks[0][0])
+        spread_pct = (ask - bid) / ask * 100
+        bid_vol_10 = sum(float(b[1]) for b in bids[:10])
+        ask_vol_10 = sum(float(a[1]) for a in asks[:10])
+        total_vol_10 = bid_vol_10 + ask_vol_10
+        imbalance_10 = (bid_vol_10 - ask_vol_10) / total_vol_10 if total_vol_10 else 0
+        bid_wall = max(bids[:10], key=lambda x: float(x[1]))
+        ask_wall = max(asks[:10], key=lambda x: float(x[1]))
+        mid = (bid + ask) / 2
+        bid_vol_1pct = sum(float(b[1]) for b in bids if float(b[0]) >= mid * 0.99)
+        ask_vol_1pct = sum(float(a[1]) for a in asks if float(a[0]) <= mid * 1.01)
+        total_1pct = bid_vol_1pct + ask_vol_1pct
+        imbalance_1pct = (bid_vol_1pct - ask_vol_1pct) / total_1pct if total_1pct else 0
+        return {
+            "bid": bid, "ask": ask, "spread_pct": spread_pct,
+            "imbalance_10": imbalance_10, "imbalance_1pct": imbalance_1pct,
+            "bid_wall_price": float(bid_wall[0]), "bid_wall_volume": float(bid_wall[1]),
+            "ask_wall_price": float(ask_wall[0]), "ask_wall_volume": float(ask_wall[1]),
+            "bid_depth_10": bid_vol_10, "ask_depth_10": ask_vol_10
+        }
 
-    bid_vol_10 = sum(float(b[1]) for b in bids[:10])
-    ask_vol_10 = sum(float(a[1]) for a in asks[:10])
-    total_vol_10 = bid_vol_10 + ask_vol_10
-    imbalance_10 = (bid_vol_10 - ask_vol_10) / total_vol_10 if total_vol_10 else 0
-
-    bid_wall = max(bids[:10], key=lambda x: float(x[1]))
-    ask_wall = max(asks[:10], key=lambda x: float(x[1]))
-    mid = (bid + ask) / 2
-    bid_vol_1pct = sum(float(b[1]) for b in bids if float(b[0]) >= mid * 0.99)
-    ask_vol_1pct = sum(float(a[1]) for a in asks if float(a[0]) <= mid * 1.01)
-    total_1pct = bid_vol_1pct + ask_vol_1pct
-    imbalance_1pct = (bid_vol_1pct - ask_vol_1pct) / total_1pct if total_1pct else 0
-
-    return {
-        "bid": bid, "ask": ask, "spread_pct": spread_pct,
-        "imbalance_10": imbalance_10, "imbalance_1pct": imbalance_1pct,
-        "bid_wall_price": float(bid_wall[0]), "bid_wall_volume": float(bid_wall[1]),
-        "ask_wall_price": float(ask_wall[0]), "ask_wall_volume": float(ask_wall[1]),
-        "bid_depth_10": bid_vol_10, "ask_depth_10": ask_vol_10
-    }
+    # Fallback: use the price we already got from CoinGecko top‑markets list
+    if fallback_price and fallback_price > 0:
+        bid = fallback_price * 0.9999
+        ask = fallback_price * 1.0001
+        return {
+            "bid": bid, "ask": ask, "spread_pct": 0.02,
+            "imbalance_10": 0, "imbalance_1pct": 0,
+            "bid_wall_price": bid, "bid_wall_volume": 1,
+            "ask_wall_price": ask, "ask_wall_volume": 1,
+            "bid_depth_10": 1, "ask_depth_10": 1
+        }
+    return None
 
 def get_volatility_atr(symbol, bid):
     klines = fetch_binance(f"/fapi/v1/klines?symbol={symbol}&interval=1m&limit=60")
@@ -140,11 +140,13 @@ def get_trending(coin_id):
         pass
     return False
 
-def gather_market_data(symbols):
+def gather_market_data(symbols, price_map):
+    """symbols: list of 'BTCUSDT' strings. price_map: dict {symbol: price} from CoinGecko."""
     results = []
     for sym in symbols:
         print(f"Collecting L2 data for {sym}...")
-        l2 = get_order_book_level2(sym)
+        fallback_price = price_map.get(sym)
+        l2 = get_order_book_level2(sym, fallback_price)
         if not l2:
             continue
         vwap, atr = get_volatility_atr(sym, l2["bid"])
@@ -201,21 +203,35 @@ def call_groq(prompt_text):
 
 # ---------- AI DECISION ----------
 def ai_decision():
-    # Top coins from CoinGecko
+    # Get top coins from CoinGecko WITH their prices
     try:
         url = "https://api.coingecko.com/api/v3/coins/markets?vs_currency=usd&order=volume_desc&per_page=15&page=1"
         resp = requests.get(url, timeout=10)
         if resp.status_code == 200:
             top_coins = resp.json()
-            symbols = [COIN_MAP[coin['id']] for coin in top_coins if coin['id'] in COIN_MAP]
         else:
             raise ValueError("CoinGecko markets failed")
     except Exception as e:
-        print(f"Fallback to default list: {e}")
+        print(f"CoinGecko failed: {e}")
+        # Ultimate fallback: use a static list
+        top_coins = [{"id": k, "current_price": 0, "total_volume": 0, "price_change_percentage_24h": 0} for k in COIN_MAP]
+        for coin in top_coins:
+            coin["current_price"] = 0  # will be ignored
+
+    symbols = []
+    price_map = {}
+    for coin in top_coins:
+        if coin["id"] in COIN_MAP:
+            sym = COIN_MAP[coin["id"]]
+            symbols.append(sym)
+            price_map[sym] = coin.get("current_price", 0)
+
+    if not symbols:
         symbols = list(COIN_MAP.values())[:12]
+        price_map = {s: 0 for s in symbols}
 
     print(f"Gathering Level2+ data for {len(symbols)} coins...")
-    market_data = gather_market_data(symbols)
+    market_data = gather_market_data(symbols, price_map)
     if not market_data:
         return {"action": "HOLD", "reasoning": "No market data available"}
 
