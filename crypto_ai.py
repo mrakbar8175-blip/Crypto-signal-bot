@@ -1,9 +1,10 @@
 import requests, json, os
 import google.generativeai as genai
 
-TELEGRAM_TOKEN = os.environ["8631237233:AAEYzg8_BJpfQBQQrALZJ2LirJaCCmz8FDw"]
-CHAT_ID = os.environ["6934840473"]
-GEMINI_API_KEY = os.environ["AQ.Ab8RN6J48afeUOtT0PNu1p5nnkI9iU8Sm2bMYXU6smnWfy4GVg"]
+TELEGRAM_TOKEN = os.environ["TELEGRAM_TOKEN"]
+CHAT_ID = os.environ["CHAT_ID"]
+GEMINI_API_KEY = os.environ["GEMINI_API_KEY"]
+
 
 genai.configure(api_key=GEMINI_API_KEY)
 
