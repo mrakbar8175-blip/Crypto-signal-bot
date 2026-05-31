@@ -1,13 +1,14 @@
-import requests, json, os, time
+import requests, json, os
 from pycoingecko import CoinGeckoAPI
-import google.generativeai as genai
+from google import genai
+from google.genai import types as genai_types
 
 # Read secrets from environment
 TELEGRAM_TOKEN = os.environ["TELEGRAM_TOKEN"]
 CHAT_ID = os.environ["CHAT_ID"]
 GEMINI_API_KEY = os.environ["GEMINI_API_KEY"]
 
-genai.configure(api_key=GEMINI_API_KEY)
+client = genai.Client(api_key=GEMINI_API_KEY)
 cg = CoinGeckoAPI()
 
 # Paper portfolio
@@ -18,7 +19,7 @@ portfolio = {
     "daily_loss_limit": -50
 }
 
-# Stable list of CoinGecko IDs for top USDT perpetuals (mapped to Binance symbols)
+# CoinGecko id -> Binance symbol mapping
 COIN_MAP = {
     "bitcoin": "BTCUSDT",
     "ethereum": "ETHUSDT",
@@ -65,7 +66,6 @@ OUTPUT ONLY JSON:
 """
 
 def fetch_binance(endpoint):
-    """Try Binance; if blocked, return error dict."""
     try:
         r = requests.get("https://fapi.binance.com" + endpoint, timeout=10)
         return r.json()
@@ -73,7 +73,6 @@ def fetch_binance(endpoint):
         return {"error": "request failed"}
 
 def get_cg_price(coin_id):
-    """Get price in USDT from CoinGecko."""
     try:
         data = cg.get_price(ids=coin_id, vs_currencies='usd')
         return data[coin_id]['usd']
@@ -81,7 +80,6 @@ def get_cg_price(coin_id):
         return 0
 
 def get_order_book(symbol):
-    # Try Binance first, fallback to CoinGecko approximation
     depth = fetch_binance(f"/fapi/v1/depth?symbol={symbol}&limit=5")
     if "error" not in depth and "bids" in depth:
         bids, asks = depth["bids"], depth["asks"]
@@ -93,7 +91,6 @@ def get_order_book(symbol):
         total = bid_vol + ask_vol
         imbalance = (bid_vol - ask_vol) / total if total else 0
     else:
-        # Fallback: use CoinGecko price as mid
         coin_id = [k for k,v in COIN_MAP.items() if v == symbol][0]
         price = get_cg_price(coin_id)
         if price == 0: return {"error": "price unavailable"}
@@ -101,7 +98,6 @@ def get_order_book(symbol):
         ask = price * 1.0001
         spread_pct = 0.02
         imbalance = 0
-    # ATR and VWAP from Binance klines, or approximate
     klines = fetch_binance(f"/fapi/v1/klines?symbol={symbol}&interval=1m&limit=60")
     if "error" not in klines and len(klines) >= 60:
         cv, cvp = 0,0
@@ -117,7 +113,6 @@ def get_order_book(symbol):
         vwap = cvp/cv if cv else bid
         atr = sum(trs)/len(trs)
     else:
-        # Approximate ATR as 1.5% of price
         vwap = bid
         atr = bid * 0.015
     volume = 0
@@ -125,13 +120,13 @@ def get_order_book(symbol):
     if "error" not in ticker:
         volume = float(ticker.get("quoteVolume", 0))
     else:
-        volume = 1000000  # assume liquid
+        volume = 1000000
     return {"bid":bid, "ask":ask, "spread_pct":spread_pct, "orderbook_imbalance":imbalance,
             "last_price":bid, "vwap_1h":vwap, "atr_14":atr, "volume_24h":volume}
 
 def get_funding_rate(symbol):
     d = fetch_binance(f"/fapi/v1/premiumIndex?symbol={symbol}")
-    if "error" in d: return {"funding_rate": 0.01}  # assume neutral
+    if "error" in d: return {"funding_rate": 0.01}
     return {"funding_rate": float(d["lastFundingRate"])*100}
 
 def get_long_short_ratio(symbol):
@@ -153,7 +148,7 @@ def call_func(name, args):
     return {"error":"unknown"}
 
 def ai_decision():
-    # Get top coins by volume from CoinGecko
+    # Top coins from CoinGecko
     try:
         top_coins = cg.get_coins_markets(vs_currency='usd', order='volume_desc', per_page=15, page=1)
         top_list = []
@@ -168,69 +163,79 @@ def ai_decision():
         if not top_list:
             raise ValueError("No matching coins")
     except Exception as e:
-        print("CoinGecko failed, using fallback list:", e)
-        # Fallback static list
+        print("CoinGecko fallback used:", e)
         top_list = [{"symbol": s, "volume": 0, "change": 0} for s in COIN_MAP.values()]
 
     print("Top coins:", len(top_list))
 
-    msgs = [{"role":"user", "parts":[{"text":SYSTEM_PROMPT}]},
-            {"role":"user", "parts":[{"text":f"Portfolio: {json.dumps(portfolio)}\nTop coins: {json.dumps(top_list)}\nGive ONE trade decision."}]}]
+    # Messages for the model
+    msgs = [f"{SYSTEM_PROMPT}\nPortfolio: {json.dumps(portfolio)}\nTop coins: {json.dumps(top_list)}\nGive ONE trade decision."]
 
-    # Fixed tool definitions (no "type": "object")
+    # Define tools with correct new SDK types
     tools = [
-        {
-            "name": "get_order_book",
-            "description": "Live order book & ATR",
-            "parameters": {
-                "properties": {
-                    "symbol": {"type": "string"}
-                },
-                "required": ["symbol"]
-            }
-        },
-        {
-            "name": "get_funding_rate",
-            "description": "Funding rate",
-            "parameters": {
-                "properties": {
-                    "symbol": {"type": "string"}
-                },
-                "required": ["symbol"]
-            }
-        },
-        {
-            "name": "get_long_short_ratio",
-            "description": "Long/short ratio",
-            "parameters": {
-                "properties": {
-                    "symbol": {"type": "string"}
-                },
-                "required": ["symbol"]
-            }
-        },
-        {
-            "name": "get_open_interest",
-            "description": "Open interest",
-            "parameters": {
-                "properties": {
-                    "symbol": {"type": "string"}
-                },
-                "required": ["symbol"]
-            }
-        }
+        genai_types.Tool(function_declarations=[
+            genai_types.FunctionDeclaration(
+                name="get_order_book",
+                description="Live order book & ATR for a USDT perpetual symbol",
+                parameters=genai_types.Schema(
+                    type=genai_types.Type.OBJECT,
+                    properties={"symbol": genai_types.Schema(type=genai_types.Type.STRING)},
+                    required=["symbol"]
+                )
+            ),
+            genai_types.FunctionDeclaration(
+                name="get_funding_rate",
+                description="Current funding rate",
+                parameters=genai_types.Schema(
+                    type=genai_types.Type.OBJECT,
+                    properties={"symbol": genai_types.Schema(type=genai_types.Type.STRING)},
+                    required=["symbol"]
+                )
+            ),
+            genai_types.FunctionDeclaration(
+                name="get_long_short_ratio",
+                description="Global long/short ratio",
+                parameters=genai_types.Schema(
+                    type=genai_types.Type.OBJECT,
+                    properties={"symbol": genai_types.Schema(type=genai_types.Type.STRING)},
+                    required=["symbol"]
+                )
+            ),
+            genai_types.FunctionDeclaration(
+                name="get_open_interest",
+                description="Current open interest",
+                parameters=genai_types.Schema(
+                    type=genai_types.Type.OBJECT,
+                    properties={"symbol": genai_types.Schema(type=genai_types.Type.STRING)},
+                    required=["symbol"]
+                )
+            )
+        ])
     ]
 
-    model = genai.GenerativeModel("gemini-1.5-flash", tools=tools)
+    # Generate content with function calling
     for _ in range(10):
-        resp = model.generate_content(msgs)
-        part = resp.candidates[0].content.parts[0]
-        if "function_call" in part:
-            fn = part["function_call"]["name"]
-            args = part["function_call"]["args"]
-            result = call_func(fn, args)
-            msgs.append({"role":"user","parts":[{"function_response":{"name":fn,"response":result}}]})
-        else:
+        response = client.models.generate_content(
+            model='gemini-2.0-flash',
+            contents=msgs,
+            config=genai_types.GenerateContentConfig(
+                tools=tools,
+                temperature=0.1,
+            )
+        )
+
+        # If there are function calls
+        if response.candidates and response.candidates[0].content.parts:
+            part = response.candidates[0].content.parts[0]
+            if hasattr(part, 'function_call') and part.function_call:
+                fn_name = part.function_call.name
+                args = dict(part.function_call.args)
+                result = call_func(fn_name, args)
+                # Add the model's function call and our result to the conversation
+                msgs.append({"role": "model", "parts": [{"function_call": {"name": fn_name, "args": args}}]})
+                msgs.append({"role": "user", "parts": [{"function_response": {"name": fn_name, "response": result}}]})
+                continue
+            # Otherwise, we have a final text response
             raw = part.text
             if "```json" in raw:
                 raw = raw.split("```json")[1].split("```")[0]
@@ -239,14 +244,14 @@ def ai_decision():
             try:
                 return json.loads(raw)
             except:
-                return {"action":"HOLD","reasoning":"JSON error"}
-    return {"action":"HOLD","reasoning":"No decision"}
+                return {"action":"HOLD","reasoning":"JSON parse error"}
+    return {"action":"HOLD","reasoning":"No decision after max iterations"}
 
 def send_telegram(text):
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     try:
         resp = requests.post(url, data={"chat_id": CHAT_ID, "text": text}, timeout=10)
-        print("Telegram response:", resp.status_code, resp.text)
+        print("Telegram status:", resp.status_code, resp.text[:100])
     except Exception as e:
         print("Telegram send failed:", e)
 
