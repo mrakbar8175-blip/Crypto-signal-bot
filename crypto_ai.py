@@ -111,7 +111,11 @@ def call_func(name, args):
 
 def ai_decision():
     tickers = fetch("/fapi/v1/ticker/24hr")
-    if "error" in tickers: return {"action":"HOLD","reasoning":"Binance data unavailable"}
+    if isinstance(tickers, dict) and "error" in tickers:
+        return {"action":"HOLD","reasoning":"Binance data unavailable"}
+    if not isinstance(tickers, list):
+        return {"action":"HOLD","reasoning":"Unexpected Binance response"}
+
     top = sorted(tickers, key=lambda x: float(x.get("quoteVolume",0)), reverse=True)[:20]
     top_list = [{"symbol":t["symbol"], "volume":float(t["quoteVolume"]), "change":float(t["priceChangePercent"])} for t in top]
 
