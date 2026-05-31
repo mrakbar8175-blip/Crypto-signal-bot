@@ -111,13 +111,45 @@ def call_func(name, args):
 
 def ai_decision():
     tickers = fetch("/fapi/v1/ticker/24hr")
-    if isinstance(tickers, dict) and "error" in tickers:
-        return {"action":"HOLD","reasoning":"Binance data unavailable"}
-    if not isinstance(tickers, list):
-        return {"action":"HOLD","reasoning":"Unexpected Binance response"}
+    print("Binance raw tickers type:", type(tickers))
+    # Print first 500 chars of response for debugging
+    if isinstance(tickers, dict):
+        print("Tickers response (dict):", json.dumps(tickers)[:300])
+    elif isinstance(tickers, list):
+        print(f"Got {len(tickers)} tickers")
+    else:
+        print("Tickers is something else:", str(tickers)[:300])
 
-    top = sorted(tickers, key=lambda x: float(x.get("quoteVolume",0)), reverse=True)[:20]
-    top_list = [{"symbol":t["symbol"], "volume":float(t["quoteVolume"]), "change":float(t["priceChangePercent"])} for t in top]
+    # Fallback list of liquid USDT perpetuals if tickers endpoint fails
+    fallback_symbols = [
+        "BTCUSDT", "ETHUSDT", "BNBUSDT", "XRPUSDT", "ADAUSDT",
+        "SOLUSDT", "DOGEUSDT", "DOTUSDT", "MATICUSDT", "LINKUSDT",
+        "UNIUSDT", "AVAXUSDT", "LTCUSDT", "ATOMUSDT", "ETCUSDT"
+    ]
+
+    if isinstance(tickers, dict) and "error" in tickers:
+        print("Binance error, using fallback list")
+        # Build minimal top_list from fallback
+        top_list = []
+        for sym in fallback_symbols:
+            # get individual ticker data
+            t = fetch(f"/fapi/v1/ticker/24hr?symbol={sym}")
+            if isinstance(t, dict) and "symbol" in t:
+                top_list.append({
+                    "symbol": t["symbol"],
+                    "volume": float(t.get("quoteVolume", 0)),
+                    "change": float(t.get("priceChangePercent", 0))
+                })
+        top_list.sort(key=lambda x: x["volume"], reverse=True)
+        top_list = top_list[:15]
+    elif isinstance(tickers, list) and len(tickers) > 0:
+        top = sorted(tickers, key=lambda x: float(x.get("quoteVolume",0)), reverse=True)[:20]
+        top_list = [{"symbol":t["symbol"], "volume":float(t["quoteVolume"]), "change":float(t["priceChangePercent"])} for t in top]
+    else:
+        print("No valid ticker data, using fallback without volume sorting")
+        top_list = [{"symbol":s, "volume":0, "change":0} for s in fallback_symbols]
+
+    print("Top coins being sent to AI:", len(top_list), "coins")
 
     msgs = [{"role":"user", "parts":[{"text":SYSTEM_PROMPT}]},
             {"role":"user", "parts":[{"text":f"Portfolio: {json.dumps(portfolio)}\nTop coins: {json.dumps(top_list)}\nGive ONE trade decision."}]}]
