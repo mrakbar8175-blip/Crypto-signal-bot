@@ -36,7 +36,7 @@ COIN_MAP = {
     "1inch": "1INCHUSDT", "curve-dao-token": "CRVUSDT",
 }
 
-# ---------- DATA HELPERS (unchanged) ----------
+# ---------- DATA HELPERS ----------
 def fetch_binance(endpoint):
     try:
         r = requests.get("https://fapi.binance.com" + endpoint, timeout=10)
@@ -75,6 +75,21 @@ def ichimoku(highs, lows):
     tenkan = (max(highs[-9:]) + min(lows[-9:]))/2
     kijun = (max(highs[-26:]) + min(lows[-26:]))/2
     return {"tenkan": tenkan, "kijun": kijun}
+
+# ---------- NEW: fetch 4h ATR ----------
+def get_4h_atr(symbol, current_bid):
+    klines = fetch_binance(f"/fapi/v1/klines?symbol={symbol}&interval=4h&limit=50")
+    if isinstance(klines, list) and len(klines) >= 14:
+        highs = [float(k[2]) for k in klines]
+        lows = [float(k[3]) for k in klines]
+        closes = [float(k[4]) for k in klines]
+        trs = []
+        for i in range(1, len(klines)):
+            h, l, prev_c = highs[i], lows[i], closes[i-1]
+            tr = max(h - l, abs(h - prev_c), abs(l - prev_c))
+            trs.append(tr)
+        return sum(trs[-14:]) / 14
+    return current_bid * 0.02   # fallback 2%
 
 def get_multi_tf_analysis(symbol):
     data = {}
@@ -228,6 +243,7 @@ def gather_market_data(symbols, price_map):
         ls = get_ls_ratio(sym)
         oi = get_oi(sym)
         vol24, change24 = get_24h_metrics(sym)
+        atr_4h = get_4h_atr(sym, l2["bid"])                # <-- added
         coin_id = [k for k, v in COIN_MAP.items() if v == sym][0]
         trending = get_trending(coin_id)
         data = {
@@ -247,7 +263,8 @@ def gather_market_data(symbols, price_map):
             "open_interest": oi,
             "24h_volume": vol24,
             "24h_change_pct": change24,
-            "is_trending": trending
+            "is_trending": trending,
+            "atr_14_4h": atr_4h                     # <-- added
         }
         results.append(data)
     return results, macro
@@ -335,7 +352,7 @@ def ai_decision():
     if not market_data:
         return {"action": "HOLD", "reasoning": "No market data available"}
 
-    # ---------- ULTRA-STRICT PROMPT WITH EXACT JSON TEMPLATE ----------
+    # ---------- REVISED PROMPT (market orders, proper stops) ----------
     prompt = (
         "You are the head of quantitative research at a crypto prop trading firm. "
         "Analyze the following real-time data for 10 altcoins and produce ONE trade signal.\n\n"
@@ -357,14 +374,16 @@ def ai_decision():
         "   Conviction 2.0–2.4 → Confidence 7-8\n"
         "   Conviction 1.5–1.9 → Confidence 5-6\n"
         "   Below 1.5 → NO TRADE\n"
-        "4. For the chosen coin, set entry at current bid (long) or ask (short), or use a LIMIT order at a high-probability level (POC, VAL/VAH, recent swing) if better. "
-        "Stop-loss beyond a logical swing level or 1.5× ATR, ensuring risk ≤ 1% of virtual account (10 USDT). "
-        "quantity must be the result of 10 divided by the stop distance (abs(entry - stop)), rounded to 4 decimal places. "
-        "Six take-profit levels must be set at exactly these R-multiples from entry: 0.2R, 0.4R, 0.8R, 1.2R, 1.6R, 2.5R, where R = stop distance. "
-        "Example: if entry=100, stop=98 (risk=2), then TP1=100+0.4=100.4, TP2=100+0.8=100.8, etc. Round to 6 decimal places.\n"
-        "5. You MUST output exactly this JSON structure and nothing else. Fill in the values with your analysis results. "
+        "4. Use a MARKET order at the current bid (for LONG) or ask (for SHORT). order_type must be 'MARKET'.\n"
+        "5. STOP LOSS must be placed at a distance of at least 1.5 * atr_14_4h from entry. "
+        "If atr_14_4h is missing or zero, use 2% of the entry price as the minimum stop distance.\n"
+        "6. RISK per trade = 1% of virtual account (10 USDT). quantity = 10 / (stop distance). "
+        "If the stop distance is less than the required minimum, use the minimum distance to calculate quantity.\n"
+        "7. Six take-profit levels must be set at exactly these R-multiples from entry: 0.2R, 0.4R, 0.8R, 1.2R, 1.6R, 2.5R, where R = stop distance. "
+        "Round TP prices to 6 decimal places.\n"
+        "8. You MUST output exactly this JSON structure and nothing else. Fill in the values with your analysis results. "
         "The JSON must be a single flat object with these exact keys:\n\n"
-        '{"action":"LONG","symbol":"BNBUSDT","quantity":0.0,"order_type":"LIMIT","limit_price":0.0,"stop_loss":0.0,"take_profit_1":0.0,"take_profit_2":0.0,"take_profit_3":0.0,"take_profit_4":0.0,"take_profit_5":0.0,"take_profit_6":0.0,"confidence_score":6,"reasoning":"short explanation"}\n\n'
+        '{"action":"LONG","symbol":"BNBUSDT","quantity":0.0,"order_type":"MARKET","limit_price":0.0,"stop_loss":0.0,"take_profit_1":0.0,"take_profit_2":0.0,"take_profit_3":0.0,"take_profit_4":0.0,"take_profit_5":0.0,"take_profit_6":0.0,"confidence_score":6,"reasoning":"short explanation"}\n\n'
         "For HOLD: {\"action\":\"HOLD\",\"symbol\":\"\",\"quantity\":0,\"order_type\":\"MARKET\",\"limit_price\":0,\"stop_loss\":0,\"take_profit_1\":0,\"take_profit_2\":0,\"take_profit_3\":0,\"take_profit_4\":0,\"take_profit_5\":0,\"take_profit_6\":0,\"confidence_score\":0,\"reasoning\":\"...\"}\n\n"
         "Do not include any markdown, explanations, or additional text. Only the JSON object."
     )
@@ -393,12 +412,38 @@ def ai_decision():
         if risk <= 0:
             return {"action": "HOLD", "reasoning": "Stop on wrong side"}
 
+        # Enforce minimum stop distance using ATR (if we have the coin data)
+        sym = decision.get("symbol")
+        coin_data = next((c for c in market_data if c["symbol"] == sym), None)
+        if coin_data:
+            atr = coin_data.get("atr_14_4h", 0)
+            if atr > 0:
+                min_stop = 1.5 * atr
+            else:
+                min_stop = entry * 0.02
+        else:
+            min_stop = entry * 0.02
+
+        if risk < min_stop:
+            print(f"Stop distance {risk} too small, enforcing min {min_stop}")
+            risk = min_stop
+            if action == "LONG":
+                stop = entry - risk
+            else:
+                stop = entry + risk
+            decision["stop_loss"] = round(stop, 6)
+            decision["reasoning"] = decision.get("reasoning", "") + " | stop adjusted for minimum distance"
+
         raw_qty = float(decision.get("quantity", 0))
         max_qty = 10 / risk if risk > 0 else 0
         if raw_qty > max_qty:
             decision["quantity"] = round(max_qty, 4)
-            decision["reasoning"] += f" | Qty capped to {decision['quantity']} for 1% risk"
+            decision["reasoning"] = decision.get("reasoning", "") + f" | Qty capped to {decision['quantity']} for 1% risk"
+        else:
+            # Ensure quantity is exactly 10/risk for consistency
+            decision["quantity"] = round(max_qty, 4)
 
+        # TP corrections – no longer append messages
         tp_levels = [f"take_profit_{i}" for i in range(1,7)]
         req_r = [0.2, 0.4, 0.8, 1.2, 1.6, 2.5]
         for i, tp_key in enumerate(tp_levels):
@@ -408,12 +453,13 @@ def ai_decision():
                     min_tp = entry + desired_r * risk
                     if decision[tp_key] < min_tp:
                         decision[tp_key] = round(min_tp, 6)
-                        decision["reasoning"] += f" | TP{i+1} corrected to {min_tp}"
                 else:
                     min_tp = entry - desired_r * risk
                     if decision[tp_key] > min_tp:
                         decision[tp_key] = round(min_tp, 6)
-                        decision["reasoning"] += f" | TP{i+1} corrected to {min_tp}"
+
+        # Force order_type to MARKET
+        decision["order_type"] = "MARKET"
 
         conf = int(decision.get("confidence_score", 0))
         if conf < 6:
@@ -434,12 +480,17 @@ def main():
         dec = ai_decision()
         action = dec.get('action', 'HOLD')
         if action in ["LONG", "SHORT"]:
+            # Clean reasoning: remove any TP correction messages (precaution)
+            reason = dec.get("reasoning", "")
+            # remove any substring like " | TP1 corrected to ..." etc.
+            import re
+            reason = re.sub(r'\s*\|.*?\bTP\d+\b.*?(?=\||$)', '', reason).strip()
             msg = (f"📊 {action} {dec.get('symbol')}\n"
-                   f"Order: {dec.get('order_type','MARKET')} @ {dec.get('limit_price','CMP')}\n"
+                   f"Order: MARKET @ {dec.get('limit_price','CMP')}\n"
                    f"Stop: {dec.get('stop_loss')}\n"
                    f"TPs: {dec.get('take_profit_1')} | {dec.get('take_profit_2')} | {dec.get('take_profit_3')} | {dec.get('take_profit_4')} | {dec.get('take_profit_5')} | {dec.get('take_profit_6')}\n"
                    f"Qty: {dec.get('quantity')} | Confidence: {dec.get('confidence_score')}/10\n"
-                   f"Reason: {dec.get('reasoning')}")
+                   f"Reason: {reason}")
         else:
             msg = f"📊 HOLD\nReason: {dec.get('reasoning','No signal')}"
         print(msg)
