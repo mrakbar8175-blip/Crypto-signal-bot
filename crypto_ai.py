@@ -1,4 +1,4 @@
-import requests, json, os, traceback, time
+import requests, json, os, traceback, time, re
 
 # ---------- ENVIRONMENT ----------
 TELEGRAM_TOKEN = os.environ["TELEGRAM_TOKEN"]
@@ -70,13 +70,6 @@ def compute_ema(data, period):
         ema = (price - ema)*k + ema
     return ema
 
-def ichimoku(highs, lows):
-    if len(highs)<26: return None
-    tenkan = (max(highs[-9:]) + min(lows[-9:]))/2
-    kijun = (max(highs[-26:]) + min(lows[-26:]))/2
-    return {"tenkan": tenkan, "kijun": kijun}
-
-# ---------- NEW: fetch 4h ATR ----------
 def get_4h_atr(symbol, current_bid):
     klines = fetch_binance(f"/fapi/v1/klines?symbol={symbol}&interval=4h&limit=50")
     if isinstance(klines, list) and len(klines) >= 14:
@@ -89,105 +82,45 @@ def get_4h_atr(symbol, current_bid):
             tr = max(h - l, abs(h - prev_c), abs(l - prev_c))
             trs.append(tr)
         return sum(trs[-14:]) / 14
-    return current_bid * 0.02   # fallback 2%
+    return current_bid * 0.02
 
-def get_multi_tf_analysis(symbol):
-    data = {}
-    for interval, limit in [("4h", 50), ("1h", 50), ("15m", 50)]:
+def get_multi_tf_trend(symbol):
+    """Return a simple trend signal: 1=up, -1=down, 0=neutral based on 4h/1h EMAs."""
+    signals = []
+    for interval, limit in [("4h", 50), ("1h", 50)]:
         klines = fetch_binance(f"/fapi/v1/klines?symbol={symbol}&interval={interval}&limit={limit}")
         if isinstance(klines, list) and len(klines) >= limit:
-            opens = [float(k[1]) for k in klines]
-            highs = [float(k[2]) for k in klines]
-            lows = [float(k[3]) for k in klines]
             closes = [float(k[4]) for k in klines]
-            rsi = calculate_rsi(closes)
             ema50 = compute_ema(closes, 50) if len(closes)>=50 else closes[-1]
-            ema200 = compute_ema(closes, 200) if len(closes)>=200 else closes[-1]
-            ichi = ichimoku(highs, lows) if interval == "1h" else None
-            trend = "up" if closes[-1] > ema50 else "down"
-            data[interval] = {
-                "close": closes[-1],
-                "rsi": rsi,
-                "ema50": ema50,
-                "ema200": ema200,
-                "trend": trend,
-                "ichi": ichi
-            }
+            if closes[-1] > ema50:
+                signals.append(1)
+            else:
+                signals.append(-1)
         else:
-            data[interval] = None
-    return data
+            signals.append(0)
+    avg = sum(signals)/len(signals) if signals else 0
+    if avg > 0.5: return 1
+    if avg < -0.5: return -1
+    return 0
 
-def get_volume_profile_approx(symbol, bid, ask):
-    depth = fetch_binance(f"/fapi/v1/depth?symbol={symbol}&limit=20")
-    if "bids" in depth and "asks" in depth:
-        bids = depth["bids"]
-        asks = depth["asks"]
-        all_levels = [(float(p), float(q)) for p,q in bids] + [(float(p), float(q)) for p,q in asks]
-        all_levels.sort(key=lambda x: x[0])
-        if all_levels:
-            poc = max(all_levels, key=lambda x: x[1])[0]
-            return {"poc": poc, "vah": ask, "val": bid}
-    return {"poc": bid, "vah": ask, "val": bid}
-
-def get_order_book_level2(symbol, fallback_price=None):
+def get_order_book_imbalance(symbol, fallback_price=None):
     depth = fetch_binance(f"/fapi/v1/depth?symbol={symbol}&limit=10")
     if "bids" in depth and "asks" in depth:
         bids = depth["bids"]
         asks = depth["asks"]
-        bid = float(bids[0][0])
-        ask = float(asks[0][0])
-        spread_pct = (ask - bid) / ask * 100
         bid_vol_10 = sum(float(b[1]) for b in bids[:10])
         ask_vol_10 = sum(float(a[1]) for a in asks[:10])
-        total_vol_10 = bid_vol_10 + ask_vol_10
-        imbalance_10 = (bid_vol_10 - ask_vol_10) / total_vol_10 if total_vol_10 else 0
-        bid_wall = max(bids[:10], key=lambda x: float(x[1]))
-        ask_wall = max(asks[:10], key=lambda x: float(x[1]))
-        mid = (bid + ask) / 2
-        bid_vol_1pct = sum(float(b[1]) for b in bids if float(b[0]) >= mid * 0.99)
-        ask_vol_1pct = sum(float(a[1]) for a in asks if float(a[0]) <= mid * 1.01)
-        total_1pct = bid_vol_1pct + ask_vol_1pct
-        imbalance_1pct = (bid_vol_1pct - ask_vol_1pct) / total_1pct if total_1pct else 0
-        vp = get_volume_profile_approx(symbol, bid, ask)
-        return {
-            "bid": bid, "ask": ask, "spread_pct": spread_pct,
-            "imbalance_10": imbalance_10, "imbalance_1pct": imbalance_1pct,
-            "bid_wall_price": float(bid_wall[0]), "bid_wall_volume": float(bid_wall[1]),
-            "ask_wall_price": float(ask_wall[0]), "ask_wall_volume": float(ask_wall[1]),
-            "bid_depth_10": bid_vol_10, "ask_depth_10": ask_vol_10,
-            "volume_profile": vp
-        }
-
+        total = bid_vol_10 + ask_vol_10
+        return (bid_vol_10 - ask_vol_10) / total if total else 0, float(bids[0][0]), float(asks[0][0])
     if fallback_price and fallback_price > 0:
-        bid = fallback_price * 0.9999
-        ask = fallback_price * 1.0001
-        return {
-            "bid": bid, "ask": ask, "spread_pct": 0.02,
-            "imbalance_10": 0, "imbalance_1pct": 0,
-            "bid_wall_price": bid, "bid_wall_volume": 1,
-            "ask_wall_price": ask, "ask_wall_volume": 1,
-            "bid_depth_10": 1, "ask_depth_10": 1,
-            "volume_profile": {"poc": bid, "vah": ask, "val": bid}
-        }
-    return None
+        return 0, fallback_price * 0.9999, fallback_price * 1.0001
+    return None, None, None
 
 def get_funding(symbol):
     data = fetch_binance(f"/fapi/v1/premiumIndex?symbol={symbol}")
     if "lastFundingRate" in data:
         return float(data["lastFundingRate"]) * 100
     return 0.01
-
-def get_ls_ratio(symbol):
-    data = fetch_binance(f"/futures/data/globalLongShortAccountRatio?symbol={symbol}&period=5m")
-    if isinstance(data, list) and len(data) > 0 and "longShortRatio" in data[0]:
-        return float(data[0]["longShortRatio"])
-    return None
-
-def get_oi(symbol):
-    data = fetch_binance(f"/fapi/v1/openInterest?symbol={symbol}")
-    if "openInterest" in data:
-        return float(data["openInterest"])
-    return 0
 
 def get_24h_metrics(symbol):
     ticker = fetch_binance(f"/fapi/v1/ticker/24hr?symbol={symbol}")
@@ -212,7 +145,6 @@ def get_macro_data():
     if data:
         total_mcap = data["data"]["total_market_cap"]["usd"]
         btc_mcap = data["data"]["market_cap_percentage"]["btc"]
-        eth_mcap = data["data"]["market_cap_percentage"]["eth"]
         others = data["data"]["market_cap_percentage"].get("others", 10)
         total2 = total_mcap * (1 - btc_mcap/100)
         total3 = total_mcap * (others/100)
@@ -229,243 +161,168 @@ def get_macro_data():
         }
     return None
 
-def gather_market_data(symbols, price_map):
-    macro = get_macro_data()
-    results = []
-    for sym in symbols:
-        print(f"Enhancing data for {sym}...")
-        fallback_price = price_map.get(sym)
-        l2 = get_order_book_level2(sym, fallback_price)
-        if not l2:
-            continue
-        multi_tf = get_multi_tf_analysis(sym)
-        funding = get_funding(sym)
-        ls = get_ls_ratio(sym)
-        oi = get_oi(sym)
-        vol24, change24 = get_24h_metrics(sym)
-        atr_4h = get_4h_atr(sym, l2["bid"])                # <-- added
-        coin_id = [k for k, v in COIN_MAP.items() if v == sym][0]
-        trending = get_trending(coin_id)
-        data = {
-            "symbol": sym,
-            "bid": l2["bid"], "ask": l2["ask"],
-            "spread_pct": l2["spread_pct"],
-            "imbalance_10": l2["imbalance_10"],
-            "imbalance_1pct": l2["imbalance_1pct"],
-            "bid_wall_price": l2["bid_wall_price"],
-            "bid_wall_volume": l2["bid_wall_volume"],
-            "ask_wall_price": l2["ask_wall_price"],
-            "ask_wall_volume": l2["ask_wall_volume"],
-            "volume_profile": l2["volume_profile"],
-            "multi_tf": multi_tf,
-            "funding_rate": funding,
-            "long_short_ratio": ls,
-            "open_interest": oi,
-            "24h_volume": vol24,
-            "24h_change_pct": change24,
-            "is_trending": trending,
-            "atr_14_4h": atr_4h                     # <-- added
-        }
-        results.append(data)
-    return results, macro
+# ---------- SIMPLIFIED SCORING (Python, not AI) ----------
+def score_coin(symbol, bid, ask, fallback_price):
+    """Return a conviction score from -3 to +3 based on cheaply computed metrics."""
+    score = 0.0
 
-# ---------- GROQ API CALL (NO JSON MODE) ----------
-def call_groq(prompt_text):
+    # 1. Trend (25%)
+    trend = get_multi_tf_trend(symbol)
+    score += 0.25 * trend * 3
+
+    # 2. Order book imbalance (15%)
+    imbalance, _, _ = get_order_book_imbalance(symbol, fallback_price)
+    if imbalance is not None:
+        score += 0.15 * (imbalance * 3)
+
+    # 3. Volume & momentum (10%)
+    vol, change = get_24h_metrics(symbol)
+    if vol > 1_000_000:
+        score += 0.10 * (min(change/10, 3) if change > 0 else max(change/10, -3))
+
+    # 4. Funding (10%)
+    funding = get_funding(symbol)
+    if abs(funding) < 0.05:
+        score += 0.10 * 2
+    elif abs(funding) < 0.1:
+        score += 0.10 * 1
+
+    # 5. Macro (20%)
+    macro = get_macro_data()
+    if macro:
+        # Favorable if TOTAL2 is rising and BTC.D is not too high
+        if macro["btc_d"] < 55:
+            score += 0.20 * 2
+        elif macro["btc_d"] < 60:
+            score += 0.20 * 1
+
+    # 6. Trending (5%)
+    coin_id = [k for k, v in COIN_MAP.items() if v == symbol][0]
+    if get_trending(coin_id):
+        score += 0.05 * 2
+
+    return max(-3, min(3, score))
+
+# ---------- AI FOR REASONING ONLY ----------
+def call_groq_for_reasoning(symbol, bid, ask, atr, macro):
+    prompt = (
+        f"You are a crypto trading desk analyst. A trade signal has been generated for {symbol}.\n"
+        f"Entry: {bid} (long) or {ask} (short). 4h ATR: {atr:.6f}. Macro data: {json.dumps(macro)}.\n"
+        "Based on your knowledge of current market conditions and this data, provide a short reasoning (1-2 sentences) "
+        "and a confidence score from 1 to 10 for this trade. "
+        "Reply EXACTLY in this format:\n"
+        "CONFIDENCE: 7 | REASONING: The trend is up, order book shows buying pressure, and macro is supportive."
+    )
     url = "https://api.groq.com/openai/v1/chat/completions"
-    headers = {
-        "Authorization": f"Bearer {GROQ_API_KEY}",
-        "Content-Type": "application/json"
-    }
+    headers = {"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"}
     payload = {
         "model": "llama-3.3-70b-versatile",
-        "messages": [{"role": "user", "content": prompt_text}],
-        "temperature": 0.1,
-        "max_tokens": 800
+        "messages": [{"role": "user", "content": prompt}],
+        "temperature": 0.3,
+        "max_tokens": 150
     }
-    for attempt in range(3):
-        try:
-            resp = requests.post(url, headers=headers, json=payload, timeout=45)
-            if resp.status_code == 200:
-                return resp.json()["choices"][0]["message"]["content"]
-            elif resp.status_code == 429:
-                wait = 20 + (attempt * 5)
-                print(f"Rate limit hit, waiting {wait}s...")
-                time.sleep(wait)
-                continue
-            else:
-                print(f"Groq error {resp.status_code}: {resp.text}")
-                return None
-        except Exception as e:
-            print("Groq call exception:", e)
-            time.sleep(5)
-    return None
+    try:
+        resp = requests.post(url, headers=headers, json=payload, timeout=30)
+        if resp.status_code == 200:
+            text = resp.json()["choices"][0]["message"]["content"]
+            # Parse confidence and reasoning
+            conf_match = re.search(r'CONFIDENCE:\s*(\d+)', text)
+            reason_match = re.search(r'REASONING:\s*(.*)', text)
+            conf = int(conf_match.group(1)) if conf_match else 6
+            reason = reason_match.group(1).strip() if reason_match else "Signal generated by quantitative model."
+            return conf, reason
+    except Exception as e:
+        print(f"Groq reasoning error: {e}")
+    return 6, "Automated signal based on real-time data."
 
-# ---------- ROBUST JSON EXTRACTION ----------
-def extract_json(text):
-    text = text.strip()
-    if text.startswith("```"):
-        parts = text.split("```", 2)
-        if len(parts) >= 3:
-            text = parts[1]
-            if text.startswith("json"):
-                text = text[4:]
-            text = text.strip()
-    start = text.find('{')
-    end = text.rfind('}')
-    if start != -1 and end != -1:
-        return text[start:end+1]
-    return text
-
-# ---------- AI DECISION ----------
-def ai_decision():
-    # Fetch top 15 from CoinGecko, keep first 10 after filtering
+# ---------- MAIN SIGNAL GENERATION ----------
+def generate_signal():
+    # Fetch top 10 altcoins (excluded)
     try:
         url = "https://api.coingecko.com/api/v3/coins/markets?vs_currency=usd&order=volume_desc&per_page=100&page=1"
         resp = requests.get(url, timeout=15)
-        if resp.status_code == 200:
-            all_coins = resp.json()
-        else:
-            raise ValueError("CoinGecko markets failed")
-    except Exception as e:
-        print(f"CoinGecko failed: {e}")
-        all_coins = [{"id": k, "current_price": 0, "total_volume": 0, "price_change_percentage_24h": 0}
-                     for k in COIN_MAP if k not in {"bitcoin", "ethereum", "chainlink", "litecoin", "matic-network"}][:10]
+        all_coins = resp.json() if resp.status_code == 200 else []
+    except:
+        all_coins = []
 
     excluded_ids = {"bitcoin", "ethereum", "chainlink", "litecoin", "matic-network"}
     candidates = [coin for coin in all_coins if coin["id"] not in excluded_ids and coin["id"] in COIN_MAP]
     candidates.sort(key=lambda x: x.get("total_volume", 0), reverse=True)
     top_coins = candidates[:10]
 
-    symbols = []
-    price_map = {}
+    if not top_coins:
+        return {"action": "HOLD", "reasoning": "No altcoins available in the current universe."}
+
+    best_coin = None
+    best_score = -999
+    best_data = {}
+
+    macro = get_macro_data()
     for coin in top_coins:
         sym = COIN_MAP[coin["id"]]
-        symbols.append(sym)
-        price_map[sym] = coin.get("current_price", 0)
+        fallback_price = coin.get("current_price", 0)
+        imbalance, bid, ask = get_order_book_imbalance(sym, fallback_price)
+        if bid is None:
+            continue
+        score = score_coin(sym, bid, ask, fallback_price)
+        atr = get_4h_atr(sym, bid)
+        data = {
+            "symbol": sym,
+            "bid": bid,
+            "ask": ask,
+            "score": score,
+            "atr": atr
+        }
+        if abs(score) > abs(best_score):
+            best_score = score
+            best_coin = sym
+            best_data = data
 
-    if not symbols:
-        symbols = list(COIN_MAP.values())[:10]
-        price_map = {s: 0 for s in symbols}
+    if best_coin is None or abs(best_score) < 1.5:
+        return {"action": "HOLD", "reasoning": f"No strong conviction. Highest score: {best_score:.2f} for {best_coin or 'none'}."}
 
-    print(f"Gathering institutional data for {len(symbols)} altcoins...")
-    market_data, macro = gather_market_data(symbols, price_map)
-    if not market_data:
-        return {"action": "HOLD", "reasoning": "No market data available"}
+    # Determine direction
+    direction = "LONG" if best_score > 0 else "SHORT"
+    entry = best_data["bid"] if direction == "LONG" else best_data["ask"]
+    atr = best_data["atr"]
 
-    # ---------- REVISED PROMPT (market orders, proper stops) ----------
-    prompt = (
-        "You are the head of quantitative research at a crypto prop trading firm. "
-        "Analyze the following real-time data for 10 altcoins and produce ONE trade signal.\n\n"
-        "MACRO CONTEXT: " + json.dumps(macro) + "\n\n"
-        "DETAILED ALTCOIN DATA: " + json.dumps(market_data) + "\n\n"
-        "INSTRUCTIONS:\n"
-        "1. For each coin, compute a weighted conviction score from -3 (strong short) to +3 (strong long) using these layers:\n"
-        "   - Technical (multi-TF: 4h,1h,15m trend, RSI, EMAs, Ichimoku) – weight 25%\n"
-        "   - Volume Profile (POC, VAH, VAL, walls) – weight 15%\n"
-        "   - Order Flow (order book imbalance, CVD proxy) – weight 15%\n"
-        "   - Derivatives (funding, OI, LS ratio) – weight 10%\n"
-        "   - Volume & Momentum (24h vol, change) – weight 10%\n"
-        "   - Sentiment (is_trending) – weight 5%\n"
-        "   - Macro Confluence (TOTAL1,2,3, DXY, BTC.D) – weight 20%\n"
-        "2. The highest absolute conviction score must be ≥ 1.5 (confidence score ≥ 6) to trigger a trade. "
-        "If the best coin falls below this threshold, or if macro strongly contradicts, output HOLD.\n"
-        "3. Map conviction to confidence 1-10 exactly as:\n"
-        "   Conviction ≥ 2.5 → Confidence 9-10\n"
-        "   Conviction 2.0–2.4 → Confidence 7-8\n"
-        "   Conviction 1.5–1.9 → Confidence 5-6\n"
-        "   Below 1.5 → NO TRADE\n"
-        "4. Use a MARKET order at the current bid (for LONG) or ask (for SHORT). order_type must be 'MARKET'.\n"
-        "5. STOP LOSS must be placed at a distance of at least 1.5 * atr_14_4h from entry. "
-        "If atr_14_4h is missing or zero, use 2% of the entry price as the minimum stop distance.\n"
-        "6. RISK per trade = 1% of virtual account (10 USDT). quantity = 10 / (stop distance). "
-        "If the stop distance is less than the required minimum, use the minimum distance to calculate quantity.\n"
-        "7. Six take-profit levels must be set at exactly these R-multiples from entry: 0.2R, 0.4R, 0.8R, 1.2R, 1.6R, 2.5R, where R = stop distance. "
-        "Round TP prices to 6 decimal places.\n"
-        "8. You MUST output exactly this JSON structure and nothing else. Fill in the values with your analysis results. "
-        "The JSON must be a single flat object with these exact keys:\n\n"
-        '{"action":"LONG","symbol":"BNBUSDT","quantity":0.0,"order_type":"MARKET","limit_price":0.0,"stop_loss":0.0,"take_profit_1":0.0,"take_profit_2":0.0,"take_profit_3":0.0,"take_profit_4":0.0,"take_profit_5":0.0,"take_profit_6":0.0,"confidence_score":6,"reasoning":"short explanation"}\n\n'
-        "For HOLD: {\"action\":\"HOLD\",\"symbol\":\"\",\"quantity\":0,\"order_type\":\"MARKET\",\"limit_price\":0,\"stop_loss\":0,\"take_profit_1\":0,\"take_profit_2\":0,\"take_profit_3\":0,\"take_profit_4\":0,\"take_profit_5\":0,\"take_profit_6\":0,\"confidence_score\":0,\"reasoning\":\"...\"}\n\n"
-        "Do not include any markdown, explanations, or additional text. Only the JSON object."
-    )
+    # Stop loss distance
+    min_stop = max(1.5 * atr, entry * 0.02)
+    stop = entry - min_stop if direction == "LONG" else entry + min_stop
+    stop = round(stop, 6)
 
-    print("Calling Groq...")
-    response = call_groq(prompt)
-    if not response:
-        return {"action": "HOLD", "reasoning": "Groq API error"}
+    risk = abs(entry - stop)
+    qty = round(10 / risk, 4)
 
-    clean = extract_json(response)
-    try:
-        decision = json.loads(clean)
-    except:
-        print(f"JSON parse failed. Raw: {response[:500]}")
-        return {"action": "HOLD", "reasoning": "JSON parse error"}
-
-    # ---------- VALIDATE & ENFORCE RULES ----------
-    action = decision.get("action")
-    if action in ("LONG", "SHORT"):
-        entry = float(decision.get("limit_price", 0))
-        stop = float(decision.get("stop_loss", 0))
-        if entry <= 0 or stop <= 0:
-            return {"action": "HOLD", "reasoning": "Invalid entry or stop"}
-
-        risk = abs(entry - stop)
-        if risk <= 0:
-            return {"action": "HOLD", "reasoning": "Stop on wrong side"}
-
-        # Enforce minimum stop distance using ATR (if we have the coin data)
-        sym = decision.get("symbol")
-        coin_data = next((c for c in market_data if c["symbol"] == sym), None)
-        if coin_data:
-            atr = coin_data.get("atr_14_4h", 0)
-            if atr > 0:
-                min_stop = 1.5 * atr
-            else:
-                min_stop = entry * 0.02
+    # TPs
+    tps = []
+    for r_mult in [0.2, 0.4, 0.8, 1.2, 1.6, 2.5]:
+        if direction == "LONG":
+            tps.append(round(entry + r_mult * risk, 6))
         else:
-            min_stop = entry * 0.02
+            tps.append(round(entry - r_mult * risk, 6))
 
-        if risk < min_stop:
-            print(f"Stop distance {risk} too small, enforcing min {min_stop}")
-            risk = min_stop
-            if action == "LONG":
-                stop = entry - risk
-            else:
-                stop = entry + risk
-            decision["stop_loss"] = round(stop, 6)
-            decision["reasoning"] = decision.get("reasoning", "") + " | stop adjusted for minimum distance"
+    # Get reasoning from AI
+    conf, reason = call_groq_for_reasoning(best_coin, entry, best_data["ask"], atr, macro)
+    if conf < 6:
+        return {"action": "HOLD", "reasoning": f"AI confidence too low ({conf}/10). {reason}"}
 
-        raw_qty = float(decision.get("quantity", 0))
-        max_qty = 10 / risk if risk > 0 else 0
-        if raw_qty > max_qty:
-            decision["quantity"] = round(max_qty, 4)
-            decision["reasoning"] = decision.get("reasoning", "") + f" | Qty capped to {decision['quantity']} for 1% risk"
-        else:
-            # Ensure quantity is exactly 10/risk for consistency
-            decision["quantity"] = round(max_qty, 4)
-
-        # TP corrections – no longer append messages
-        tp_levels = [f"take_profit_{i}" for i in range(1,7)]
-        req_r = [0.2, 0.4, 0.8, 1.2, 1.6, 2.5]
-        for i, tp_key in enumerate(tp_levels):
-            if tp_key in decision and decision[tp_key] != 0:
-                desired_r = req_r[i]
-                if action == "LONG":
-                    min_tp = entry + desired_r * risk
-                    if decision[tp_key] < min_tp:
-                        decision[tp_key] = round(min_tp, 6)
-                else:
-                    min_tp = entry - desired_r * risk
-                    if decision[tp_key] > min_tp:
-                        decision[tp_key] = round(min_tp, 6)
-
-        # Force order_type to MARKET
-        decision["order_type"] = "MARKET"
-
-        conf = int(decision.get("confidence_score", 0))
-        if conf < 6:
-            return {"action": "HOLD", "reasoning": f"Confidence score {conf} below minimum threshold of 6"}
-
-    return decision
+    return {
+        "action": direction,
+        "symbol": best_coin,
+        "quantity": qty,
+        "order_type": "MARKET",
+        "limit_price": entry,
+        "stop_loss": stop,
+        "take_profit_1": tps[0],
+        "take_profit_2": tps[1],
+        "take_profit_3": tps[2],
+        "take_profit_4": tps[3],
+        "take_profit_5": tps[4],
+        "take_profit_6": tps[5],
+        "confidence_score": conf,
+        "reasoning": reason
+    }
 
 # ---------- TELEGRAM ----------
 def send_telegram(text):
@@ -477,20 +334,15 @@ def send_telegram(text):
 
 def main():
     try:
-        dec = ai_decision()
+        dec = generate_signal()
         action = dec.get('action', 'HOLD')
         if action in ["LONG", "SHORT"]:
-            # Clean reasoning: remove any TP correction messages (precaution)
-            reason = dec.get("reasoning", "")
-            # remove any substring like " | TP1 corrected to ..." etc.
-            import re
-            reason = re.sub(r'\s*\|.*?\bTP\d+\b.*?(?=\||$)', '', reason).strip()
             msg = (f"📊 {action} {dec.get('symbol')}\n"
-                   f"Order: MARKET @ {dec.get('limit_price','CMP')}\n"
+                   f"Entry: MARKET @ {dec.get('limit_price','CMP')}\n"
                    f"Stop: {dec.get('stop_loss')}\n"
                    f"TPs: {dec.get('take_profit_1')} | {dec.get('take_profit_2')} | {dec.get('take_profit_3')} | {dec.get('take_profit_4')} | {dec.get('take_profit_5')} | {dec.get('take_profit_6')}\n"
                    f"Qty: {dec.get('quantity')} | Confidence: {dec.get('confidence_score')}/10\n"
-                   f"Reason: {reason}")
+                   f"Reason: {dec.get('reasoning')}")
         else:
             msg = f"📊 HOLD\nReason: {dec.get('reasoning','No signal')}"
         print(msg)
