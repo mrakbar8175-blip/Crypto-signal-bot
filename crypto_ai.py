@@ -1,13 +1,13 @@
 import requests, json, os, traceback, time, re
 
-# ---------- ENVIRONMENT ----------
+# ========== ENVIRONMENT ==========
 TELEGRAM_TOKEN = os.environ["TELEGRAM_TOKEN"]
 CHAT_ID = os.environ["CHAT_ID"]
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
 if not GROQ_API_KEY:
     raise RuntimeError("GROQ_API_KEY not set in secrets.")
 
-# ---------- PAPER PORTFOLIO ----------
+# ========== PAPER PORTFOLIO ==========
 portfolio = {
     "balance_usdt": 1000.0,
     "positions": [],
@@ -15,7 +15,7 @@ portfolio = {
     "daily_loss_limit": -20
 }
 
-# ---------- COIN MAPPING (CoinGecko id -> Binance symbol) ----------
+# ========== COIN MAPPING (CoinGecko id → Binance symbol) ==========
 COIN_MAP = {
     "binancecoin": "BNBUSDT", "ripple": "XRPUSDT", "cardano": "ADAUSDT",
     "solana": "SOLUSDT", "dogecoin": "DOGEUSDT", "polkadot": "DOTUSDT",
@@ -36,29 +36,34 @@ COIN_MAP = {
     "1inch": "1INCHUSDT", "curve-dao-token": "CRVUSDT",
 }
 
-# ---------- DATA HELPERS (Binance is optional) ----------
-def fetch_binance(endpoint, default=None):
-    if default is None:
-        default = {"error": "request failed"}
+# ========== DATA HELPERS ==========
+def fetch_binance(endpoint):
+    """Try Binance; return empty dict on failure."""
     try:
         r = requests.get("https://fapi.binance.com" + endpoint, timeout=10)
         return r.json()
     except:
-        return default
+        return {}
 
-def fetch_coingecko(url, default=None):
-    if default is None:
-        default = {}
+def fetch_coingecko(url):
+    """Try CoinGecko; return empty dict on failure."""
     try:
         r = requests.get(url, timeout=15)
-        return r.json() if r.status_code == 200 else default
+        return r.json() if r.status_code == 200 else {}
     except:
-        return default
+        return {}
 
-# ---------- ENHANCED ATR (fallback to CoinGecko approximation) ----------
-def get_atr_4h(symbol, current_price):
-    """Try Binance 4h ATR, otherwise use 2% of price."""
-    klines = fetch_binance(f"/fapi/v1/klines?symbol={symbol}&interval=4h&limit=50", default=[])
+def get_binance_last_price(symbol):
+    """Ultimate fallback price from Binance ticker."""
+    ticker = fetch_binance(f"/fapi/v1/ticker/price?symbol={symbol}")
+    if "price" in ticker:
+        return float(ticker["price"])
+    return 0
+
+# ---------- ATR (4h) ----------
+def get_4h_atr(symbol, current_price):
+    """Try Binance 4h ATR; fallback to 2% of current price."""
+    klines = fetch_binance(f"/fapi/v1/klines?symbol={symbol}&interval=4h&limit=50")
     if isinstance(klines, list) and len(klines) >= 14:
         highs = [float(k[2]) for k in klines]
         lows = [float(k[3]) for k in klines]
@@ -69,14 +74,12 @@ def get_atr_4h(symbol, current_price):
             tr = max(h - l, abs(h - prev_c), abs(l - prev_c))
             trs.append(tr)
         return sum(trs[-14:]) / 14
-    return current_price * 0.02   # fallback 2%
+    return current_price * 0.02
 
-# ---------- SIMPLE TREND FROM COINGECKO PRICE CHANGE ----------
+# ---------- TREND SIGNAL (24h change) ----------
 def get_trend_signal(symbol):
-    """Return 1 (up), -1 (down), or 0 based on 24h change from CoinGecko."""
-    # Try Binance 24h ticker first, fallback to Coingecko's market data (we already have it)
-    # Since we call this inside the loop, we can pass 24h_change if available, but we'll use Binance if possible.
-    ticker = fetch_binance(f"/fapi/v1/ticker/24hr?symbol={symbol}", default={})
+    """1 = up, -1 = down, 0 = neutral based on 24h change."""
+    ticker = fetch_binance(f"/fapi/v1/ticker/24hr?symbol={symbol}")
     if "priceChangePercent" in ticker:
         change = float(ticker["priceChangePercent"])
         if change > 1:
@@ -85,9 +88,10 @@ def get_trend_signal(symbol):
             return -1
     return 0
 
-# ---------- ORDER BOOK IMBALANCE (attempt Binance, fallback 0) ----------
+# ---------- ORDER BOOK IMBALANCE ----------
 def get_imbalance(symbol, fallback_price):
-    depth = fetch_binance(f"/fapi/v1/depth?symbol={symbol}&limit=10", default={})
+    """Get order book imbalance from Binance; 0 if unavailable."""
+    depth = fetch_binance(f"/fapi/v1/depth?symbol={symbol}&limit=10")
     if "bids" in depth and "asks" in depth:
         bids = depth["bids"]
         asks = depth["asks"]
@@ -96,9 +100,17 @@ def get_imbalance(symbol, fallback_price):
         total = bid_vol + ask_vol
         if total:
             return (bid_vol - ask_vol) / total
-    return 0.0  # neutral
+    return 0.0
 
-# ---------- MACRO ----------
+# ---------- FUNDING ----------
+def get_funding(symbol):
+    """Fetch funding rate from Binance; 0.01% default."""
+    data = fetch_binance(f"/fapi/v1/premiumIndex?symbol={symbol}")
+    if "lastFundingRate" in data:
+        return float(data["lastFundingRate"]) * 100
+    return 0.01
+
+# ---------- MACRO DATA (CoinGecko global) ----------
 def get_macro_data():
     data = fetch_coingecko("https://api.coingecko.com/api/v3/global")
     if data:
@@ -112,27 +124,25 @@ def get_macro_data():
         return {"total2": total2, "total3": total3, "btc_d": btc_d, "usdt_d": usdt_d}
     return None
 
-# ---------- SCORING (uses only data we already have) ----------
+# ---------- SCORING (multi-factor) ----------
 def score_coin(symbol, bid, ask, vol, change24):
+    """Return conviction score from -3 to +3."""
     score = 0.0
 
-    # 1. Trend (25%): from Binance 24h change or fallback
+    # 1. Trend (25%)
     trend = get_trend_signal(symbol)
     score += 0.25 * trend * 3
 
-    # 2. Order book imbalance (15%)
-    imbalance = get_imbalance(symbol, bid)   # bid = fallback_price
+    # 2. Order book (15%)
+    imbalance = get_imbalance(symbol, bid)
     score += 0.15 * (imbalance * 3)
 
     # 3. Volume & Momentum (10%)
     if vol > 1_000_000:
         score += 0.10 * (min(change24/10, 3) if change24 > 0 else max(change24/10, -3))
 
-    # 4. Funding (10%) – try Binance, default 0.01
-    funding_data = fetch_binance(f"/fapi/v1/premiumIndex?symbol={symbol}", default={})
-    funding = 0.01
-    if "lastFundingRate" in funding_data:
-        funding = float(funding_data["lastFundingRate"]) * 100
+    # 4. Funding (10%)
+    funding = get_funding(symbol)
     if abs(funding) < 0.05:
         score += 0.10 * 2
     elif abs(funding) < 0.1:
@@ -148,11 +158,10 @@ def score_coin(symbol, bid, ask, vol, change24):
 
     # 6. Trending (5%)
     try:
-        trending_resp = requests.get("https://api.coingecko.com/api/v3/search/trending", timeout=10)
-        if trending_resp.status_code == 200:
-            trending_data = trending_resp.json()
+        trending = fetch_coingecko("https://api.coingecko.com/api/v3/search/trending")
+        if trending:
             coin_id = [k for k, v in COIN_MAP.items() if v == symbol][0]
-            for item in trending_data.get("coins", []):
+            for item in trending.get("coins", []):
                 if item["item"]["id"] == coin_id:
                     score += 0.05 * 2
                     break
@@ -161,11 +170,11 @@ def score_coin(symbol, bid, ask, vol, change24):
 
     return max(-3, min(3, score))
 
-# ---------- AI REASONING (lightweight) ----------
-def call_groq_for_reasoning(symbol, entry, atr, macro):
+# ---------- AI REASONING (Groq, fallback 6) ----------
+def call_groq_reasoning(symbol, entry, atr, macro):
     prompt = (
         f"Trade signal for {symbol} at {entry}. 4h ATR: {atr:.4f}. "
-        f"Macro: {json.dumps(macro)}. Provide a short reasoning (1 sentence) and confidence 1-10.\n"
+        f"Macro: {json.dumps(macro)}. Provide a short reasoning and confidence 1-10.\n"
         "Format: CONFIDENCE: 7 | REASONING: [text]"
     )
     url = "https://api.groq.com/openai/v1/chat/completions"
@@ -185,15 +194,15 @@ def call_groq_for_reasoning(symbol, entry, atr, macro):
             conf = int(conf_match.group(1)) if conf_match else 6
             reason = reason_match.group(1).strip() if reason_match else "Automated quantitative signal."
             return conf, reason
-    except Exception as e:
-        print(f"Groq reasoning error: {e}")
+    except:
+        pass
     return 6, "Signal based on multi-factor model."
 
-# ---------- MAIN SIGNAL GENERATION ----------
+# ========== MAIN SIGNAL GENERATION ==========
 def generate_signal():
-    # Step 1: Get top 10 altcoins from CoinGecko with all necessary data
-    url = "https://api.coingecko.com/api/v3/coins/markets?vs_currency=usd&order=volume_desc&per_page=50&page=1&sparkline=false"
-    coins_data = fetch_coingecko(url, default=[])
+    # 1. Get top 10 altcoins from CoinGecko (with current price & volume)
+    url = "https://api.coingecko.com/api/v3/coins/markets?vs_currency=usd&order=volume_desc&per_page=50&page=1"
+    coins_data = fetch_coingecko(url)
     if not coins_data:
         return {"action": "HOLD", "reasoning": "CoinGecko API unavailable."}
 
@@ -202,13 +211,18 @@ def generate_signal():
     for coin in coins_data:
         if coin["id"] in excluded_ids or coin["id"] not in COIN_MAP:
             continue
-        symbol = COIN_MAP[coin["id"]]
+        sym = COIN_MAP[coin["id"]]
         price = coin.get("current_price", 0)
         volume = coin.get("total_volume", 0)
         change = coin.get("price_change_percentage_24h", 0)
         if price > 0 and volume > 0:
+            # Use CoinGecko price as base; fallback to Binance if zero
+            if price == 0:
+                price = get_binance_last_price(sym)
+            if price == 0:
+                continue
             candidates.append({
-                "symbol": symbol,
+                "symbol": sym,
                 "price": price,
                 "volume": volume,
                 "change": change
@@ -217,32 +231,31 @@ def generate_signal():
             break
 
     if not candidates:
-        # Fallback: static list with approximate price? We'll just exit.
         return {"action": "HOLD", "reasoning": "No liquid altcoins found."}
 
-    # Step 2: Score each candidate
+    # 2. Score each candidate
     macro = get_macro_data()
     best = None
-    best_score = -999
+    best_score = 0   # reset to 0, first coin will become new best
     for coin in candidates:
         sym = coin["symbol"]
-        # Use CoinGecko price to derive bid/ask
+        # bid/ask derived from CoinGecko price
         bid = coin["price"] * 0.999
         ask = coin["price"] * 1.001
         score = score_coin(sym, bid, ask, coin["volume"], coin["change"])
-        atr = get_atr_4h(sym, coin["price"])   # tries Binance, falls back to 2%
+        atr = get_4h_atr(sym, coin["price"])
         coin["score"] = score
         coin["atr"] = atr
         coin["bid"] = bid
         coin["ask"] = ask
-        if abs(score) > abs(best_score):
-            best_score = score
+        if best is None or abs(score) > abs(best_score):
             best = coin
+            best_score = score
 
-    if not best or abs(best_score) < 1.5:
-        return {"action": "HOLD", "reasoning": f"No strong conviction. Best score: {best_score:.2f}."}
+    if best is None or abs(best_score) < 1.5:
+        return {"action": "HOLD", "reasoning": f"No strong conviction. Best score: {best_score:.2f} for {best['symbol'] if best else 'none'}."}
 
-    # Step 3: Determine direction and trade parameters
+    # 3. Determine trade parameters
     direction = "LONG" if best_score > 0 else "SHORT"
     entry = best["bid"] if direction == "LONG" else best["ask"]
     atr = best["atr"]
@@ -259,8 +272,8 @@ def generate_signal():
         else:
             tps.append(round(entry - mult * risk, 6))
 
-    # Step 4: Get AI reasoning (or fallback)
-    conf, reason = call_groq_for_reasoning(best["symbol"], entry, atr, macro)
+    # 4. Get AI reasoning (or fallback)
+    conf, reason = call_groq_reasoning(best["symbol"], entry, atr, macro)
     if conf < 6:
         return {"action": "HOLD", "reasoning": f"AI confidence too low ({conf}/10). {reason}"}
 
@@ -281,7 +294,7 @@ def generate_signal():
         "reasoning": reason
     }
 
-# ---------- TELEGRAM ----------
+# ========== TELEGRAM SENDER ==========
 def send_telegram(text):
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     try:
@@ -289,6 +302,7 @@ def send_telegram(text):
     except Exception as e:
         print("Telegram fail:", e)
 
+# ========== MAIN ==========
 def main():
     try:
         dec = generate_signal()
