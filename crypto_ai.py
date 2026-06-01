@@ -15,7 +15,7 @@ portfolio = {
     "daily_loss_limit": -50
 }
 
-# ---------- COIN MAPPING (10 altcoins universe; no BTC,ETH,LINK,LTC,MATIC) ----------
+# ---------- EXPANDED COIN MAPPING (30+ altcoins) ----------
 COIN_MAP = {
     "binancecoin": "BNBUSDT",
     "ripple": "XRPUSDT",
@@ -25,9 +25,48 @@ COIN_MAP = {
     "polkadot": "DOTUSDT",
     "uniswap": "UNIUSDT",
     "avalanche-2": "AVAXUSDT",
-    "near": "NEARUSDT",               # replaced MATIC
+    "near": "NEARUSDT",
     "cosmos": "ATOMUSDT",
-    # Additional coins are available but the bot only scans the top 10 by volume
+    "ethereum-classic": "ETCUSDT",
+    "stellar": "XLMUSDT",
+    "vechain": "VETUSDT",
+    "filecoin": "FILUSDT",
+    "aptos": "APTUSDT",
+    "arbitrum": "ARBUSDT",
+    "optimism": "OPUSDT",
+    "injective-protocol": "INJUSDT",
+    "celestia": "TIAUSDT",
+    "sei-network": "SEIUSDT",
+    "sui": "SUIUSDT",
+    "thorchain": "RUNEUSDT",
+    "the-graph": "GRTUSDT",
+    "aave": "AAVEUSDT",
+    "algorand": "ALGOUSDT",
+    "the-sandbox": "SANDUSDT",
+    "decentraland": "MANAUSDT",
+    "theta-token": "THETAUSDT",
+    "fantom": "FTMUSDT",
+    "eos": "EOSUSDT",
+    "maker": "MKRUSDT",
+    "lido-dao": "LDOUSDT",
+    "immutable-x": "IMXUSDT",
+    "flow": "FLOWUSDT",
+    "tezos": "XTZUSDT",
+    "neo": "NEOUSDT",
+    "kusama": "KSMUSDT",
+    "zcash": "ZECUSDT",
+    "dash": "DASHUSDT",
+    "elrond-erd-2": "EGLDUSDT",
+    "mina-protocol": "MINAUSDT",
+    "gala": "GALAUSDT",
+    "helium": "HNTUSDT",
+    "conflux-token": "CFXUSDT",
+    "arweave": "ARUSDT",
+    "fetch-ai": "FETUSDT",
+    "singularitynet": "AGIXUSDT",
+    "ocean-protocol": "OCEANUSDT",
+    "1inch": "1INCHUSDT",
+    "curve-dao-token": "CRVUSDT",
 }
 
 # ---------- DATA HELPERS ----------
@@ -182,10 +221,10 @@ def call_groq(prompt_text):
         "model": "llama-3.3-70b-versatile",
         "messages": [{"role": "user", "content": prompt_text}],
         "temperature": 0.1,
-        "max_tokens": 500
+        "max_tokens": 800
     }
     try:
-        resp = requests.post(url, headers=headers, json=payload, timeout=30)
+        resp = requests.post(url, headers=headers, json=payload, timeout=45)
         if resp.status_code != 200:
             print(f"Groq error {resp.status_code}: {resp.text}")
             return None
@@ -196,29 +235,23 @@ def call_groq(prompt_text):
 
 # ---------- AI DECISION ----------
 def ai_decision():
-    # Get top coins from CoinGecko, EXCLUDE: bitcoin, ethereum, chainlink, litecoin, matic-network
+    # Fetch top 100 coins from CoinGecko, filter to our universe, take top 30 by volume
     try:
-        url = "https://api.coingecko.com/api/v3/coins/markets?vs_currency=usd&order=volume_desc&per_page=30&page=1"
-        resp = requests.get(url, timeout=10)
+        url = "https://api.coingecko.com/api/v3/coins/markets?vs_currency=usd&order=volume_desc&per_page=100&page=1"
+        resp = requests.get(url, timeout=15)
         if resp.status_code == 200:
             all_coins = resp.json()
-            excluded_ids = {"bitcoin", "ethereum", "chainlink", "litecoin", "matic-network"}
-            filtered = [coin for coin in all_coins if coin["id"] not in excluded_ids]
-            candidates = []
-            for coin in filtered:
-                if coin["id"] in COIN_MAP:
-                    candidates.append(coin)
-                if len(candidates) >= 10:
-                    break
-            top_coins = candidates
         else:
             raise ValueError("CoinGecko markets failed")
     except Exception as e:
         print(f"CoinGecko failed: {e}")
-        # Fallback: use first 10 altcoins from our map (excluding the five)
-        fallback_ids = [k for k in COIN_MAP.keys() if k not in {"bitcoin", "ethereum", "chainlink", "litecoin", "matic-network"}][:10]
-        top_coins = [{"id": k, "current_price": 0, "total_volume": 0, "price_change_percentage_24h": 0}
-                     for k in fallback_ids]
+        fallback_ids = [k for k in COIN_MAP.keys() if k not in {"bitcoin", "ethereum", "chainlink", "litecoin", "matic-network"}][:30]
+        all_coins = [{"id": k, "current_price": 0, "total_volume": 0, "price_change_percentage_24h": 0} for k in fallback_ids]
+
+    excluded_ids = {"bitcoin", "ethereum", "chainlink", "litecoin", "matic-network"}
+    candidates = [coin for coin in all_coins if coin["id"] not in excluded_ids and coin["id"] in COIN_MAP]
+    candidates.sort(key=lambda x: x.get("total_volume", 0), reverse=True)
+    top_coins = candidates[:30]
 
     symbols = []
     price_map = {}
@@ -228,42 +261,75 @@ def ai_decision():
         price_map[sym] = coin.get("current_price", 0)
 
     if not symbols:
-        symbols = [s for s in list(COIN_MAP.values())[:10] if s not in ["LINKUSDT", "LTCUSDT", "MATICUSDT"]]
+        symbols = list(COIN_MAP.values())[:30]
         price_map = {s: 0 for s in symbols}
 
-    print(f"Gathering Level2+ data for {len(symbols)} altcoins (excl BTC,ETH,LINK,LTC,MATIC): {symbols}")
+    print(f"Gathering Level2+ data for {len(symbols)} altcoins...")
     market_data = gather_market_data(symbols, price_map)
     if not market_data:
         return {"action": "HOLD", "reasoning": "No market data available"}
 
+    # ---------- STRICT SCORING PROMPT ----------
     prompt = f"""
 You are "Crypto Institutional Desk – Multi‑Analysis". You trade USDT perpetuals on a 1000 USDT paper account.
-(BTC, ETH, LINK, LTC, MATIC are excluded. Universe includes NEAR and other liquid altcoins.)
+Your analysis MUST be based only on the real data provided below. Do NOT invent any numbers.
+
+Universe: 30 most liquid altcoins (BTC, ETH, LINK, LTC, MATIC excluded).
 
 Current portfolio: {json.dumps(portfolio)}
 
-Real‑time Level 2 market data for the top 10 altcoins by volume:
+Real‑time Level 2 market data:
 {json.dumps(market_data, indent=2)}
 
-Analyse each coin using these 6 layers (0‑2 points each, max 12):
-1. **Order‑Book Depth & Walls** – imbalance_10, imbalance_1pct, bid/ask wall sizes.
-2. **Momentum & Microstructure** – bid vs vwap_1h, spread, 24h_change_pct.
-3. **Positioning** – long_short_ratio (null = ignore), open_interest, funding_rate.
-4. **Volatility & Volume** – atr_14% of price (ideal 1‑8%), 24h_volume > 500k USDT.
-5. **Catalyst / Sentiment** – is_trending, 24h_change_pct magnitude, any news you know.
-6. **Risk/Reward & Confluence** – only high‑confidence setups.
+For each coin, assign a strict score 0‑2 on these 6 layers (max 12). You MUST show the layer breakdown in the reasoning field like: "L1:2 L2:1 L3:2 L4:1 L5:2 L6:0" and then a short explanation.
 
-Only issue a trade if **total score ≥ 7** AND the order‑book imbalance clearly supports the direction.
+**Layer criteria (very strict):**
 
-**Risk management:**
+1. **Order‑Book Depth & Walls (0‑2):**
+   - 2 points: imbalance_10 > 0.5 AND imbalance_1pct > 0.3 AND bid_wall_volume > ask_wall_volume*1.5 (for longs) OR the opposite for shorts.
+   - 1 point: moderate positive imbalance but walls not extremely dominant.
+   - 0 points: weak or contradictory order book.
+
+2. **Momentum & Microstructure (0‑2):**
+   - 2 points: (bid > vwap_1h for longs, or ask < vwap_1h for shorts) AND spread_pct < 0.03% AND 24h_change_pct in the direction of trade > 2%.
+   - 1 point: some alignment but not all conditions.
+   - 0 points: contradictory signals.
+
+3. **Positioning (0‑2):**
+   - 2 points: long_short_ratio between 1.5‑2.5 (for longs, bullish positioning without being extreme) AND funding_rate between -0.05% and 0.05% AND open_interest > 0.
+   - 1 point: mixed signals.
+   - 0 points: extreme funding or missing data.
+
+4. **Volatility & Volume (0‑2):**
+   - 2 points: atr_14 between 2% and 6% of price (ideal tradeable range) AND 24h_volume > 1M USDT.
+   - 1 point: ATR okay but volume borderline.
+   - 0 points: too volatile (>10%) or too little volume.
+
+5. **Catalyst / Sentiment (0‑2):**
+   - 2 points: is_trending = True AND 24h_change_pct > 5% (if long) or < -5% (if short).
+   - 1 point: one of the two is true.
+   - 0 points: no catalyst.
+
+6. **Risk/Reward & Confluence (0‑2):**
+   - 2 points: all five above layers score at least 1 point and the overall setup is highly consistent.
+   - 1 point: some layers weak but RR still acceptable.
+   - 0 points: contradictory layers.
+
+**Trading rules:**
+- Only issue a trade if **total score ≥ 7** AND the order‑book imbalance clearly supports the direction.
+- For a confidence_score field, use the TOTAL POINTS out of 12 (not an inflated number). **A score of 9‑10 is extremely rare and requires near‑perfect conditions.**
+- If no coin reaches 7, action = HOLD.
+
+**Risk management – you MUST follow these rules exactly:**
 - risk = 5 USDT (0.5% of portfolio)
-- stop distance = atr_14 * 1.8
+- stop distance = atr_14 * 1.8   (use the provided atr_14)
 - quantity = floor(5 / stop_distance), capped at 150 USDT notional
 - STOP LOSS: entry ± stop_distance
-- TAKE PROFIT: entry ± 2 * stop_distance (minimum). If score ≥ 9 and walls are massive, extend to 3:1 or 4:1. NEVER below 2:1.
+- TAKE PROFIT: entry ± 2 * stop_distance (minimum). **Verify your math: for LONG, TP must be ≥ entry + 2*(entry - stop_loss). For SHORT, TP must be ≤ entry - 2*(stop_loss - entry).**
+- If score ≥ 10 and walls are extremely strong, you may extend to 3:1 or 4:1, but never below 2:1.
 
-**Output ONLY a JSON (no markdown):**
-{{"action":"LONG"|"SHORT"|"HOLD","symbol":"BNBUSDT","quantity":0.0,"order_type":"LIMIT","limit_price":0.0,"stop_loss":0.0,"take_profit":0.0,"confidence_score":0,"reasoning":"..."}}
+**Output ONLY a JSON object (no markdown):**
+{{"action":"LONG"|"SHORT"|"HOLD","symbol":"BNBUSDT","quantity":0.0,"order_type":"LIMIT","limit_price":0.0,"stop_loss":0.0,"take_profit":0.0,"confidence_score":0,"reasoning":"L1:X L2:Y ... explanation"}}
 If HOLD, omit numeric fields or set to 0 and explain briefly.
 """
     print("Calling Groq...")
@@ -275,10 +341,64 @@ If HOLD, omit numeric fields or set to 0 and explain briefly.
         text = response.strip()
         if "```" in text:
             text = text.split("```")[1].split("```")[0]
-        return json.loads(text)
+        decision = json.loads(text)
     except:
         print("Raw Groq response:", response)
         return {"action": "HOLD", "reasoning": "JSON parse error"}
+
+    # ---------- AUTO-CORRECT RR (must be ≥ 2:1) ----------
+    action = decision.get("action")
+    if action in ("LONG", "SHORT"):
+        entry = float(decision.get("limit_price", 0))
+        stop = float(decision.get("stop_loss", 0))
+        tp = float(decision.get("take_profit", 0))
+
+        if entry <= 0 or stop <= 0 or tp <= 0:
+            return {"action": "HOLD", "reasoning": "Invalid price values from AI"}
+
+        if action == "LONG":
+            risk = entry - stop
+            if risk <= 0:
+                return {"action": "HOLD", "reasoning": "Stop loss above entry for LONG"}
+            min_tp = entry + 2 * risk
+            if tp < min_tp:
+                print(f"Correcting TP from {tp} to {min_tp} (2:1 RR)")
+                decision["take_profit"] = round(min_tp, 6)
+                decision["reasoning"] += " | TP auto-corrected to enforce 2:1 minimum RR"
+        else:  # SHORT
+            risk = stop - entry
+            if risk <= 0:
+                return {"action": "HOLD", "reasoning": "Stop loss below entry for SHORT"}
+            min_tp = entry - 2 * risk
+            if tp > min_tp:
+                print(f"Correcting TP from {tp} to {min_tp} (2:1 RR)")
+                decision["take_profit"] = round(min_tp, 6)
+                decision["reasoning"] += " | TP auto-corrected to enforce 2:1 minimum RR"
+
+    # ---------- SANITY CHECK ON CONFIDENCE SCORE ----------
+    try:
+        raw_score = int(decision.get("confidence_score", 0))
+        sym = decision.get("symbol")
+        coin_data = next((c for c in market_data if c["symbol"] == sym), None)
+        if coin_data:
+            spread = coin_data.get("spread_pct", 0)
+            imbalance = abs(coin_data.get("imbalance_10", 0))
+            vol = coin_data.get("24h_volume", 0)
+            atr_pct = (coin_data.get("atr_14", 0) / coin_data.get("bid", 1)) * 100
+
+            if spread > 0.05:
+                raw_score = min(raw_score, 7)
+            if vol < 500000:
+                raw_score = min(raw_score, 6)
+            if imbalance < 0.2:
+                raw_score = min(raw_score, 7)
+            if atr_pct > 8 or atr_pct < 0.5:
+                raw_score = min(raw_score, 6)
+            decision["confidence_score"] = raw_score
+    except:
+        pass
+
+    return decision
 
 # ---------- TELEGRAM ----------
 def send_telegram(text):
