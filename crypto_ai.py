@@ -252,7 +252,7 @@ def gather_market_data(symbols, price_map):
         results.append(data)
     return results, macro
 
-# ---------- GROQ API CALL (with rate‑limit handling) ----------
+# ---------- GROQ API CALL (JSON MODE + RETRY) ----------
 def call_groq(prompt_text):
     url = "https://api.groq.com/openai/v1/chat/completions"
     headers = {
@@ -263,7 +263,8 @@ def call_groq(prompt_text):
         "model": "llama-3.3-70b-versatile",
         "messages": [{"role": "user", "content": prompt_text}],
         "temperature": 0.1,
-        "max_tokens": 800
+        "max_tokens": 1200,
+        "response_format": {"type": "json_object"}   # forces JSON output
     }
     for attempt in range(3):
         try:
@@ -271,7 +272,6 @@ def call_groq(prompt_text):
             if resp.status_code == 200:
                 return resp.json()["choices"][0]["message"]["content"]
             elif resp.status_code == 429:
-                # Rate limited – wait before retrying
                 wait = 20 + (attempt * 5)
                 print(f"Rate limit hit, waiting {wait}s...")
                 time.sleep(wait)
@@ -302,7 +302,7 @@ def extract_json(text):
 
 # ---------- AI DECISION ----------
 def ai_decision():
-    # Fetch top 15 from CoinGecko, but only keep the first 10 after filtering
+    # Fetch top 15 from CoinGecko, keep first 10 after filtering
     try:
         url = "https://api.coingecko.com/api/v3/coins/markets?vs_currency=usd&order=volume_desc&per_page=100&page=1"
         resp = requests.get(url, timeout=15)
@@ -318,7 +318,7 @@ def ai_decision():
     excluded_ids = {"bitcoin", "ethereum", "chainlink", "litecoin", "matic-network"}
     candidates = [coin for coin in all_coins if coin["id"] not in excluded_ids and coin["id"] in COIN_MAP]
     candidates.sort(key=lambda x: x.get("total_volume", 0), reverse=True)
-    top_coins = candidates[:10]   # <--- ONLY 10 COINS
+    top_coins = candidates[:10]
 
     symbols = []
     price_map = {}
@@ -336,7 +336,7 @@ def ai_decision():
     if not market_data:
         return {"action": "HOLD", "reasoning": "No market data available"}
 
-    # ---------- COMPACT PROMPT (no indents, smaller) ----------
+    # ---------- COMPACT PROMPT (JSON mode compatible) ----------
     prompt = (
         "You are the head of quantitative research at a crypto prop trading firm. "
         "Analyze the following real-time data for 10 altcoins and produce ONE trade signal.\n\n"
@@ -364,9 +364,7 @@ def ai_decision():
         "   - TP1 = 0.2R, TP2 = 0.4R, TP3 = 0.8R, TP4 = 1.2R, TP5 = 1.6R, TP6 ≥ 2.5R\n"
         "   Place TPs at the nearest logical level (round numbers, volume profile nodes, prior highs/lows).\n"
         "   Scale: 20% | 20% | 20% | 15% | 15% | 10%\n"
-        "5. Output ONLY a clean JSON (no markdown, no extra text). The JSON must be exactly in this format:\n"
-        '{"action":"LONG","symbol":"BNBUSDT","quantity":0.0,"order_type":"LIMIT","limit_price":0.0,"stop_loss":0.0,"take_profit_1":0.0,"take_profit_2":0.0,"take_profit_3":0.0,"take_profit_4":0.0,"take_profit_5":0.0,"take_profit_6":0.0,"confidence_score":6,"reasoning":"..."}\n'
-        'If HOLD, output: {"action":"HOLD","reasoning":"..."}'
+        "5. Your output must be a valid JSON object. Do not include any text outside the JSON."
     )
 
     print("Calling Groq...")
@@ -374,7 +372,7 @@ def ai_decision():
     if not response:
         return {"action": "HOLD", "reasoning": "Groq API error"}
 
-    # ---------- PARSE (single attempt, robust extraction) ----------
+    # JSON mode guarantees valid JSON, but we still strip fences
     clean = extract_json(response)
     try:
         decision = json.loads(clean)
