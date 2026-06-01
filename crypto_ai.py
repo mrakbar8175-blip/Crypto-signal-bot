@@ -69,7 +69,7 @@ COIN_MAP = {
     "curve-dao-token": "CRVUSDT",
 }
 
-# ---------- DATA HELPERS ----------
+# ---------- DATA HELPERS (swing version uses 4h klines) ----------
 def fetch_binance(endpoint):
     try:
         r = requests.get("https://fapi.binance.com" + endpoint, timeout=10)
@@ -116,26 +116,43 @@ def get_order_book_level2(symbol, fallback_price=None):
         }
     return None
 
-def get_volatility_atr(symbol, bid):
-    klines = fetch_binance(f"/fapi/v1/klines?symbol={symbol}&interval=1m&limit=60")
-    if isinstance(klines, list) and len(klines) >= 60:
+def get_swing_metrics(symbol, bid):
+    klines = fetch_binance(f"/fapi/v1/klines?symbol={symbol}&interval=4h&limit=50")
+    if isinstance(klines, list) and len(klines) >= 14:
+        closes = [float(k[4]) for k in klines]
+        highs = [float(k[2]) for k in klines]
+        lows = [float(k[3]) for k in klines]
+        volumes = [float(k[5]) for k in klines]
+
         cv, cvp = 0, 0
-        trs = []
-        for i in range(len(klines)-14, len(klines)):
-            h, l, c = float(klines[i][2]), float(klines[i][3]), float(klines[i][4])
-            v = float(klines[i][5])
+        for i in range(len(klines)):
+            h, l, c = highs[i], lows[i], closes[i]
+            v = volumes[i]
             tp = (h + l + c) / 3
             cvp += tp * v
             cv += v
-            prev_c = float(klines[i-1][4])
+        vwap = cvp / cv if cv else bid
+
+        trs = []
+        for i in range(len(klines)-14, len(klines)):
+            h, l = highs[i], lows[i]
+            prev_c = closes[i-1]
             tr = max(h - l, abs(h - prev_c), abs(l - prev_c))
             trs.append(tr)
-        vwap = cvp / cv if cv else bid
         atr = sum(trs) / len(trs)
+
+        sma20 = sum(closes[-20:]) / 20
+        trend = "up" if closes[-1] > sma20 else "down"
+
+        return {
+            "vwap_4h": vwap,
+            "atr_14_4h": atr,
+            "sma20_4h": sma20,
+            "trend_4h": trend,
+            "current_price": closes[-1]
+        }
     else:
-        vwap = bid
-        atr = bid * 0.015
-    return vwap, atr
+        return {"vwap_4h": bid, "atr_14_4h": bid * 0.02, "sma20_4h": bid, "trend_4h": "neutral", "current_price": bid}
 
 def get_funding(symbol):
     data = fetch_binance(f"/fapi/v1/premiumIndex?symbol={symbol}")
@@ -176,12 +193,12 @@ def get_trending(coin_id):
 def gather_market_data(symbols, price_map):
     results = []
     for sym in symbols:
-        print(f"Collecting L2 data for {sym}...")
+        print(f"Collecting swing data for {sym}...")
         fallback_price = price_map.get(sym)
         l2 = get_order_book_level2(sym, fallback_price)
         if not l2:
             continue
-        vwap, atr = get_volatility_atr(sym, l2["bid"])
+        swing = get_swing_metrics(sym, l2["bid"])
         vol24, change24 = get_24h_metrics(sym)
         funding = get_funding(sym)
         ls = get_ls_ratio(sym)
@@ -198,13 +215,15 @@ def gather_market_data(symbols, price_map):
             "bid_wall_volume": l2["bid_wall_volume"],
             "ask_wall_price": l2["ask_wall_price"],
             "ask_wall_volume": l2["ask_wall_volume"],
-            "bid_depth_10": l2["bid_depth_10"],
-            "ask_depth_10": l2["ask_depth_10"],
-            "vwap_1h": vwap, "atr_14": atr,
+            "vwap_4h": swing["vwap_4h"],
+            "atr_14_4h": swing["atr_14_4h"],
+            "sma20_4h": swing["sma20_4h"],
+            "trend_4h": swing["trend_4h"],
             "funding_rate": funding,
             "long_short_ratio": ls,
             "open_interest": oi,
-            "24h_volume": vol24, "24h_change_pct": change24,
+            "24h_volume": vol24,
+            "24h_change_pct": change24,
             "is_trending": trending
         }
         results.append(data)
@@ -264,69 +283,66 @@ def ai_decision():
         symbols = list(COIN_MAP.values())[:30]
         price_map = {s: 0 for s in symbols}
 
-    print(f"Gathering Level2+ data for {len(symbols)} altcoins...")
+    print(f"Gathering swing data for {len(symbols)} altcoins...")
     market_data = gather_market_data(symbols, price_map)
     if not market_data:
         return {"action": "HOLD", "reasoning": "No market data available"}
 
-    # ---------- STRICT SCORING PROMPT ----------
+    # ---------- ROCK‑SOLID SWING PROMPT (score ≥ 7) ----------
     prompt = f"""
-You are "Crypto Institutional Desk – Multi‑Analysis". You trade USDT perpetuals on a 1000 USDT paper account.
-Your analysis MUST be based only on the real data provided below. Do NOT invent any numbers.
+You are "Crypto Institutional Desk – Swing Trader". You trade USDT perpetuals on a 1000 USDT paper account with a swing trading approach (holding periods of hours to a few days). Your analysis is based ONLY on the real data provided below. Do NOT invent any numbers.
 
 Universe: 30 most liquid altcoins (BTC, ETH, LINK, LTC, MATIC excluded).
 
 Current portfolio: {json.dumps(portfolio)}
 
-Real‑time Level 2 market data:
+Real‑time Level 2 and 4‑hour chart data:
 {json.dumps(market_data, indent=2)}
 
-For each coin, assign a strict score 0‑2 on these 6 layers (max 12). You MUST show the layer breakdown in the reasoning field like: "L1:2 L2:1 L3:2 L4:1 L5:2 L6:0" and then a short explanation.
+**Swing Trading Strategy:**
+- Look for coins in established 4‑hour trends (trend_4h = "up" or "down") with a retracement or breakout that aligns with the trend.
+- Entry should be near a key level (VWAP, SMA20) with order‑book confirmation (imbalance_10 > 0.3 for longs, < -0.3 for shorts).
+- Swing trades require a wider stop to avoid noise; use ATR_14_4h (already calculated) for volatility.
+- Favor coins with rising volume on the 4h candle and neutral funding rates.
+- Only take a trade if the 4h trend, order book, and volume all agree.
 
-**Layer criteria (very strict):**
-
-1. **Order‑Book Depth & Walls (0‑2):**
-   - 2 points: imbalance_10 > 0.5 AND imbalance_1pct > 0.3 AND bid_wall_volume > ask_wall_volume*1.5 (for longs) OR the opposite for shorts.
-   - 1 point: moderate positive imbalance but walls not extremely dominant.
-   - 0 points: weak or contradictory order book.
-
-2. **Momentum & Microstructure (0‑2):**
-   - 2 points: (bid > vwap_1h for longs, or ask < vwap_1h for shorts) AND spread_pct < 0.03% AND 24h_change_pct in the direction of trade > 2%.
-   - 1 point: some alignment but not all conditions.
-   - 0 points: contradictory signals.
-
-3. **Positioning (0‑2):**
-   - 2 points: long_short_ratio between 1.5‑2.5 (for longs, bullish positioning without being extreme) AND funding_rate between -0.05% and 0.05% AND open_interest > 0.
-   - 1 point: mixed signals.
-   - 0 points: extreme funding or missing data.
-
-4. **Volatility & Volume (0‑2):**
-   - 2 points: atr_14 between 2% and 6% of price (ideal tradeable range) AND 24h_volume > 1M USDT.
-   - 1 point: ATR okay but volume borderline.
-   - 0 points: too volatile (>10%) or too little volume.
-
-5. **Catalyst / Sentiment (0‑2):**
-   - 2 points: is_trending = True AND 24h_change_pct > 5% (if long) or < -5% (if short).
-   - 1 point: one of the two is true.
+**Scoring – assign 0‑2 points each (max 12):**
+1. **Trend Alignment (0‑2):** 
+   - 2 points: trend_4h is strongly up/down AND price recently bounced off VWAP/SMA20.
+   - 1 point: trend is up/down but price extended from moving averages.
+   - 0 points: no clear trend or trend is neutral.
+2. **Order‑Book Confirmation (0‑2):**
+   - 2 points: imbalance_10 > 0.5 (long) or < -0.5 (short) AND bid/ask walls strongly support the direction.
+   - 1 point: moderate imbalance.
+   - 0 points: weak or contradictory.
+3. **Positioning & Funding (0‑2):**
+   - 2 points: funding_rate between -0.05% and 0.05% AND long_short_ratio not excessively skewed (1.5‑2.5 for longs, 0.5‑1.5 for shorts, or null accepted).
+   - 1 point: mixed.
+   - 0 points: extreme funding or heavily one‑sided positioning.
+4. **Volume & Volatility (0‑2):**
+   - 2 points: 24h_volume > 1M USDT AND ATR_14_4h between 2% and 8% of price.
+   - 1 point: borderline.
+   - 0 points: too volatile or low volume.
+5. **Catalyst (0‑2):**
+   - 2 points: is_trending = True AND 24h_change_pct > 3% (if long) or < -3% (if short).
+   - 1 point: one condition true.
    - 0 points: no catalyst.
+6. **Swing Confluence (0‑2):**
+   - 2 points: at least 4 of the above layers score ≥1, and overall setup shows a clear swing entry.
+   - 1 point: somewhat mixed.
+   - 0 points: no confluence.
 
-6. **Risk/Reward & Confluence (0‑2):**
-   - 2 points: all five above layers score at least 1 point and the overall setup is highly consistent.
-   - 1 point: some layers weak but RR still acceptable.
-   - 0 points: contradictory layers.
-
-**Trading rules:**
-- Only issue a trade if **total score ≥ 7** AND the order‑book imbalance clearly supports the direction.
-- For a confidence_score field, use the TOTAL POINTS out of 12 (not an inflated number). **A score of 9‑10 is extremely rare and requires near‑perfect conditions.**
+**Trade rules:**
+- Only trade if **total score ≥ 7** AND 4h trend and order‑book imbalance strongly support the direction.
+- **confident_score** = total points (max 12). Do not inflate. A score of 9‑10 is extremely rare.
 - If no coin reaches 7, action = HOLD.
 
-**Risk management – you MUST follow these rules exactly:**
+**Risk management (SWING):**
 - risk = 5 USDT (0.5% of portfolio)
-- stop distance = atr_14 * 1.8   (use the provided atr_14)
+- stop distance = atr_14_4h * 1.5   (using 4‑hour ATR)
 - quantity = floor(5 / stop_distance), capped at 150 USDT notional
 - STOP LOSS: entry ± stop_distance
-- TAKE PROFIT: entry ± 2 * stop_distance (minimum). **Verify your math: for LONG, TP must be ≥ entry + 2*(entry - stop_loss). For SHORT, TP must be ≤ entry - 2*(stop_loss - entry).**
-- If score ≥ 10 and walls are extremely strong, you may extend to 3:1 or 4:1, but never below 2:1.
+- TAKE PROFIT: entry ± 2 * stop_distance (MINIMUM). If score ≥ 9 and trend is extremely strong, you may extend to 3:1. **Always verify your math; TP can never be closer than 2:1.**
 
 **Output ONLY a JSON object (no markdown):**
 {{"action":"LONG"|"SHORT"|"HOLD","symbol":"BNBUSDT","quantity":0.0,"order_type":"LIMIT","limit_price":0.0,"stop_loss":0.0,"take_profit":0.0,"confidence_score":0,"reasoning":"L1:X L2:Y ... explanation"}}
@@ -384,16 +400,16 @@ If HOLD, omit numeric fields or set to 0 and explain briefly.
             spread = coin_data.get("spread_pct", 0)
             imbalance = abs(coin_data.get("imbalance_10", 0))
             vol = coin_data.get("24h_volume", 0)
-            atr_pct = (coin_data.get("atr_14", 0) / coin_data.get("bid", 1)) * 100
+            atr_pct = (coin_data.get("atr_14_4h", 0) / coin_data.get("bid", 1)) * 100
 
-            if spread > 0.05:
-                raw_score = min(raw_score, 7)
+            if spread > 0.1:
+                raw_score = min(raw_score, 6)
             if vol < 500000:
-                raw_score = min(raw_score, 6)
+                raw_score = min(raw_score, 5)
             if imbalance < 0.2:
-                raw_score = min(raw_score, 7)
-            if atr_pct > 8 or atr_pct < 0.5:
                 raw_score = min(raw_score, 6)
+            if atr_pct > 12 or atr_pct < 1:
+                raw_score = min(raw_score, 5)
             decision["confidence_score"] = raw_score
     except:
         pass
@@ -417,7 +433,7 @@ def main():
         else:
             current_price_line = ""
 
-        msg = (f"📊 {dec.get('action','HOLD')} {dec.get('symbol','')}\n"
+        msg = (f"📊 SWING {dec.get('action','HOLD')} {dec.get('symbol','')}\n"
                f"{current_price_line}"
                f"Qty: {dec.get('quantity','')} | Score: {dec.get('confidence_score','')}\n"
                f"Stop: {dec.get('stop_loss','')} TP: {dec.get('take_profit','')}\n"
