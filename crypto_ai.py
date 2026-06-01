@@ -252,7 +252,7 @@ def gather_market_data(symbols, price_map):
         results.append(data)
     return results, macro
 
-# ---------- GROQ API CALL (JSON MODE + RETRY) ----------
+# ---------- GROQ API CALL (NO JSON MODE) ----------
 def call_groq(prompt_text):
     url = "https://api.groq.com/openai/v1/chat/completions"
     headers = {
@@ -263,8 +263,7 @@ def call_groq(prompt_text):
         "model": "llama-3.3-70b-versatile",
         "messages": [{"role": "user", "content": prompt_text}],
         "temperature": 0.1,
-        "max_tokens": 1200,
-        "response_format": {"type": "json_object"}   # forces JSON output
+        "max_tokens": 800
     }
     for attempt in range(3):
         try:
@@ -336,7 +335,7 @@ def ai_decision():
     if not market_data:
         return {"action": "HOLD", "reasoning": "No market data available"}
 
-    # ---------- COMPACT PROMPT (JSON mode compatible) ----------
+    # ---------- ULTRA-STRICT PROMPT WITH EXACT JSON TEMPLATE ----------
     prompt = (
         "You are the head of quantitative research at a crypto prop trading firm. "
         "Analyze the following real-time data for 10 altcoins and produce ONE trade signal.\n\n"
@@ -360,11 +359,14 @@ def ai_decision():
         "   Below 1.5 → NO TRADE\n"
         "4. For the chosen coin, set entry at current bid (long) or ask (short), or use a LIMIT order at a high-probability level (POC, VAL/VAH, recent swing) if better. "
         "Stop-loss beyond a logical swing level or 1.5× ATR, ensuring risk ≤ 1% of virtual account (10 USDT). "
-        "Position size = 10 / (stop distance in USDT). Six take-profits:\n"
-        "   - TP1 = 0.2R, TP2 = 0.4R, TP3 = 0.8R, TP4 = 1.2R, TP5 = 1.6R, TP6 ≥ 2.5R\n"
-        "   Place TPs at the nearest logical level (round numbers, volume profile nodes, prior highs/lows).\n"
-        "   Scale: 20% | 20% | 20% | 15% | 15% | 10%\n"
-        "5. Your output must be a valid JSON object. Do not include any text outside the JSON."
+        "quantity must be the result of 10 divided by the stop distance (abs(entry - stop)), rounded to 4 decimal places. "
+        "Six take-profit levels must be set at exactly these R-multiples from entry: 0.2R, 0.4R, 0.8R, 1.2R, 1.6R, 2.5R, where R = stop distance. "
+        "Example: if entry=100, stop=98 (risk=2), then TP1=100+0.4=100.4, TP2=100+0.8=100.8, etc. Round to 6 decimal places.\n"
+        "5. You MUST output exactly this JSON structure and nothing else. Fill in the values with your analysis results. "
+        "The JSON must be a single flat object with these exact keys:\n\n"
+        '{"action":"LONG","symbol":"BNBUSDT","quantity":0.0,"order_type":"LIMIT","limit_price":0.0,"stop_loss":0.0,"take_profit_1":0.0,"take_profit_2":0.0,"take_profit_3":0.0,"take_profit_4":0.0,"take_profit_5":0.0,"take_profit_6":0.0,"confidence_score":6,"reasoning":"short explanation"}\n\n'
+        "For HOLD: {\"action\":\"HOLD\",\"symbol\":\"\",\"quantity\":0,\"order_type\":\"MARKET\",\"limit_price\":0,\"stop_loss\":0,\"take_profit_1\":0,\"take_profit_2\":0,\"take_profit_3\":0,\"take_profit_4\":0,\"take_profit_5\":0,\"take_profit_6\":0,\"confidence_score\":0,\"reasoning\":\"...\"}\n\n"
+        "Do not include any markdown, explanations, or additional text. Only the JSON object."
     )
 
     print("Calling Groq...")
@@ -372,12 +374,11 @@ def ai_decision():
     if not response:
         return {"action": "HOLD", "reasoning": "Groq API error"}
 
-    # JSON mode guarantees valid JSON, but we still strip fences
     clean = extract_json(response)
     try:
         decision = json.loads(clean)
     except:
-        print(f"JSON parse failed. Raw response: {response[:500]}")
+        print(f"JSON parse failed. Raw: {response[:500]}")
         return {"action": "HOLD", "reasoning": "JSON parse error"}
 
     # ---------- VALIDATE & ENFORCE RULES ----------
