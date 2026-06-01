@@ -51,6 +51,13 @@ def fetch_coingecko(url):
     except:
         return {}
 
+def get_binance_last_price(symbol):
+    """Fallback price directly from Binance ticker."""
+    ticker = fetch_binance(f"/fapi/v1/ticker/price?symbol={symbol}")
+    if "price" in ticker:
+        return float(ticker["price"])
+    return 0
+
 def calculate_rsi(closes, period=14):
     if len(closes) < period+1: return 50
     deltas = [closes[i] - closes[i-1] for i in range(1, len(closes))]
@@ -85,7 +92,6 @@ def get_4h_atr(symbol, current_bid):
     return current_bid * 0.02
 
 def get_multi_tf_trend(symbol):
-    """Return a simple trend signal: 1=up, -1=down, 0=neutral based on 4h/1h EMAs."""
     signals = []
     for interval, limit in [("4h", 50), ("1h", 50)]:
         klines = fetch_binance(f"/fapi/v1/klines?symbol={symbol}&interval={interval}&limit={limit}")
@@ -111,9 +117,15 @@ def get_order_book_imbalance(symbol, fallback_price=None):
         bid_vol_10 = sum(float(b[1]) for b in bids[:10])
         ask_vol_10 = sum(float(a[1]) for a in asks[:10])
         total = bid_vol_10 + ask_vol_10
-        return (bid_vol_10 - ask_vol_10) / total if total else 0, float(bids[0][0]), float(asks[0][0])
+        imbalance = (bid_vol_10 - ask_vol_10) / total if total else 0
+        return imbalance, float(bids[0][0]), float(asks[0][0])
+    # Fallback price from CoinGecko or Binance
     if fallback_price and fallback_price > 0:
         return 0, fallback_price * 0.9999, fallback_price * 1.0001
+    # Try Binance last price
+    price = get_binance_last_price(symbol)
+    if price > 0:
+        return 0, price * 0.9999, price * 1.0001
     return None, None, None
 
 def get_funding(symbol):
@@ -161,49 +173,34 @@ def get_macro_data():
         }
     return None
 
-# ---------- SIMPLIFIED SCORING (Python, not AI) ----------
+# ---------- SIMPLIFIED SCORING ----------
 def score_coin(symbol, bid, ask, fallback_price):
-    """Return a conviction score from -3 to +3 based on cheaply computed metrics."""
     score = 0.0
-
-    # 1. Trend (25%)
     trend = get_multi_tf_trend(symbol)
     score += 0.25 * trend * 3
-
-    # 2. Order book imbalance (15%)
     imbalance, _, _ = get_order_book_imbalance(symbol, fallback_price)
     if imbalance is not None:
         score += 0.15 * (imbalance * 3)
-
-    # 3. Volume & momentum (10%)
     vol, change = get_24h_metrics(symbol)
     if vol > 1_000_000:
         score += 0.10 * (min(change/10, 3) if change > 0 else max(change/10, -3))
-
-    # 4. Funding (10%)
     funding = get_funding(symbol)
     if abs(funding) < 0.05:
         score += 0.10 * 2
     elif abs(funding) < 0.1:
         score += 0.10 * 1
-
-    # 5. Macro (20%)
     macro = get_macro_data()
     if macro:
-        # Favorable if TOTAL2 is rising and BTC.D is not too high
         if macro["btc_d"] < 55:
             score += 0.20 * 2
         elif macro["btc_d"] < 60:
             score += 0.20 * 1
-
-    # 6. Trending (5%)
     coin_id = [k for k, v in COIN_MAP.items() if v == symbol][0]
     if get_trending(coin_id):
         score += 0.05 * 2
-
     return max(-3, min(3, score))
 
-# ---------- AI FOR REASONING ONLY ----------
+# ---------- AI FOR REASONING ----------
 def call_groq_for_reasoning(symbol, bid, ask, atr, macro):
     prompt = (
         f"You are a crypto trading desk analyst. A trade signal has been generated for {symbol}.\n"
@@ -225,7 +222,6 @@ def call_groq_for_reasoning(symbol, bid, ask, atr, macro):
         resp = requests.post(url, headers=headers, json=payload, timeout=30)
         if resp.status_code == 200:
             text = resp.json()["choices"][0]["message"]["content"]
-            # Parse confidence and reasoning
             conf_match = re.search(r'CONFIDENCE:\s*(\d+)', text)
             reason_match = re.search(r'REASONING:\s*(.*)', text)
             conf = int(conf_match.group(1)) if conf_match else 6
@@ -237,7 +233,6 @@ def call_groq_for_reasoning(symbol, bid, ask, atr, macro):
 
 # ---------- MAIN SIGNAL GENERATION ----------
 def generate_signal():
-    # Fetch top 10 altcoins (excluded)
     try:
         url = "https://api.coingecko.com/api/v3/coins/markets?vs_currency=usd&order=volume_desc&per_page=100&page=1"
         resp = requests.get(url, timeout=15)
@@ -256,11 +251,14 @@ def generate_signal():
     best_coin = None
     best_score = -999
     best_data = {}
-
     macro = get_macro_data()
+
     for coin in top_coins:
         sym = COIN_MAP[coin["id"]]
         fallback_price = coin.get("current_price", 0)
+        # If CoinGecko didn't give a price, get it from Binance
+        if not fallback_price or fallback_price == 0:
+            fallback_price = get_binance_last_price(sym)
         imbalance, bid, ask = get_order_book_imbalance(sym, fallback_price)
         if bid is None:
             continue
@@ -281,12 +279,10 @@ def generate_signal():
     if best_coin is None or abs(best_score) < 1.5:
         return {"action": "HOLD", "reasoning": f"No strong conviction. Highest score: {best_score:.2f} for {best_coin or 'none'}."}
 
-    # Determine direction
     direction = "LONG" if best_score > 0 else "SHORT"
     entry = best_data["bid"] if direction == "LONG" else best_data["ask"]
     atr = best_data["atr"]
 
-    # Stop loss distance
     min_stop = max(1.5 * atr, entry * 0.02)
     stop = entry - min_stop if direction == "LONG" else entry + min_stop
     stop = round(stop, 6)
@@ -294,7 +290,6 @@ def generate_signal():
     risk = abs(entry - stop)
     qty = round(10 / risk, 4)
 
-    # TPs
     tps = []
     for r_mult in [0.2, 0.4, 0.8, 1.2, 1.6, 2.5]:
         if direction == "LONG":
@@ -302,7 +297,6 @@ def generate_signal():
         else:
             tps.append(round(entry - r_mult * risk, 6))
 
-    # Get reasoning from AI
     conf, reason = call_groq_for_reasoning(best_coin, entry, best_data["ask"], atr, macro)
     if conf < 6:
         return {"action": "HOLD", "reasoning": f"AI confidence too low ({conf}/10). {reason}"}
