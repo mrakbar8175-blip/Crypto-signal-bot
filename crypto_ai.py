@@ -199,11 +199,11 @@ def get_macro_data():
         btc_mcap = data["data"]["market_cap_percentage"]["btc"]
         eth_mcap = data["data"]["market_cap_percentage"]["eth"]
         others = data["data"]["market_cap_percentage"].get("others", 10)
-        total2 = total_mcap * (1 - btc_mcap/100)  # ex BTC
-        total3 = total_mcap * (others/100)        # small/mid cap
+        total2 = total_mcap * (1 - btc_mcap/100)
+        total3 = total_mcap * (others/100)
         btc_d = btc_mcap
         usdt_d = data["data"]["market_cap_percentage"].get("usdt", 3)
-        dxy = 104.5   # placeholder (free DXY API limited)
+        dxy = 104.5   # placeholder
         return {
             "total_mcap": total_mcap,
             "total2": total2,
@@ -275,6 +275,22 @@ def call_groq(prompt_text):
         print("Groq call exception:", e)
         return None
 
+# ---------- ROBUST JSON EXTRACTION ----------
+def extract_json(text):
+    text = text.strip()
+    if text.startswith("```"):
+        parts = text.split("```", 2)
+        if len(parts) >= 3:
+            text = parts[1]
+            if text.startswith("json"):
+                text = text[4:]
+            text = text.strip()
+    start = text.find('{')
+    end = text.rfind('}')
+    if start != -1 and end != -1:
+        return text[start:end+1]
+    return text
+
 # ---------- AI DECISION ----------
 def ai_decision():
     # Fetch top 30 coins (excluded list)
@@ -311,7 +327,7 @@ def ai_decision():
     if not market_data:
         return {"action": "HOLD", "reasoning": "No market data available"}
 
-    # ---------- INSTITUTIONAL PROMPT (confidence ≥6) ----------
+    # ---------- INSTITUTIONAL PROMPT ----------
     prompt = f"""
 You are the head of quantitative research at a crypto prop trading firm. Analyze the following real-time data for 30 altcoins and produce ONE trade signal.
 
@@ -345,40 +361,37 @@ You are the head of quantitative research at a crypto prop trading firm. Analyze
    Place TPs at the nearest logical level (round numbers, volume profile nodes, prior highs/lows).
    Scale: 20% | 20% | 20% | 15% | 15% | 10%
 
-5. Output ONLY a clean JSON (no markdown):
+5. Output ONLY a clean JSON (no markdown, no extra text). The JSON must be exactly in this format:
 
-{{
-"action": "LONG" or "SHORT" or "HOLD",
-"symbol": "BNBUSDT",
-"quantity": 0.0,
-"order_type": "LIMIT" or "MARKET",
-"limit_price": 0.0,
-"stop_loss": 0.0,
-"take_profit_1": 0.0,
-"take_profit_2": 0.0,
-"take_profit_3": 0.0,
-"take_profit_4": 0.0,
-"take_profit_5": 0.0,
-"take_profit_6": 0.0,
-"confidence_score": 6,
-"reasoning": "conviction X, breakdown..."
-}}
+{{"action":"LONG","symbol":"BNBUSDT","quantity":0.0,"order_type":"LIMIT","limit_price":0.0,"stop_loss":0.0,"take_profit_1":0.0,"take_profit_2":0.0,"take_profit_3":0.0,"take_profit_4":0.0,"take_profit_5":0.0,"take_profit_6":0.0,"confidence_score":6,"reasoning":"..."}}
 
-If HOLD, just {{"action":"HOLD","reasoning":"..."}}.
+If HOLD, output: {{"action":"HOLD","reasoning":"..."}}
 """
     print("Calling Groq...")
     response = call_groq(prompt)
     if not response:
         return {"action": "HOLD", "reasoning": "Groq API error"}
 
-    try:
-        text = response.strip()
-        if "```" in text:
-            text = text.split("```")[1].split("```")[0]
-        decision = json.loads(text)
-    except:
-        print("Raw Groq response:", response)
-        return {"action": "HOLD", "reasoning": "JSON parse error"}
+    # ---------- PARSE WITH RETRY ----------
+    decision = None
+    for attempt in range(2):
+        try:
+            clean = extract_json(response)
+            decision = json.loads(clean)
+            break
+        except Exception as e:
+            print(f"JSON parse attempt {attempt+1} failed. Raw: {response[:500]}")
+            if attempt == 0:
+                # Retry with stricter prompt
+                retry_prompt = "Output ONLY the JSON object. No markdown, no explanation.\n" + prompt
+                response = call_groq(retry_prompt)
+                if not response:
+                    return {"action": "HOLD", "reasoning": "Groq API error on retry"}
+            else:
+                return {"action": "HOLD", "reasoning": "JSON parse error after retry"}
+
+    if decision is None:
+        return {"action": "HOLD", "reasoning": "Failed to parse AI response"}
 
     # ---------- VALIDATE & ENFORCE RULES ----------
     action = decision.get("action")
@@ -416,7 +429,7 @@ If HOLD, just {{"action":"HOLD","reasoning":"..."}}.
                         decision[tp_key] = round(min_tp, 6)
                         decision["reasoning"] += f" | TP{i+1} corrected to {min_tp}"
 
-        # Ensure confidence score is at least 6; if not, reject trade
+        # Ensure confidence score is at least 6
         conf = int(decision.get("confidence_score", 0))
         if conf < 6:
             return {"action": "HOLD", "reasoning": f"Confidence score {conf} below minimum threshold of 6"}
