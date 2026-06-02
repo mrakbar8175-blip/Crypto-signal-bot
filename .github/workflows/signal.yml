@@ -1,9 +1,9 @@
-name: Swing Signal Every 4 Hours
+name: Crypto Swing Signal (4H Candle Close)
 
 on:
   schedule:
-    - cron: '0 */4 * * *'        # every 4 hours
-  workflow_dispatch:
+    - cron: '0 */4 * * *'        # At minute 0 of every 4th hour (UTC)
+  workflow_dispatch:              # Allows manual run
 
 jobs:
   run-bot:
