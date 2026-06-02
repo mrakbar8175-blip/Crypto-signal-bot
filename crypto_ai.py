@@ -59,7 +59,7 @@ def get_binance_last_price(symbol):
         return float(ticker["price"])
     return 0
 
-# ---------- TECHNICAL INDICATORS (1‑hour data) ----------
+# ---------- TECHNICAL INDICATORS ----------
 def get_klines_df(symbol, interval, limit=100):
     endpoint = f"/fapi/v1/klines?symbol={symbol}&interval={interval}&limit={limit}"
     data = fetch_binance(endpoint)
@@ -84,6 +84,20 @@ def compute_rsi(series, period=14):
 
 def compute_ema(series, period):
     return series.ewm(span=period, adjust=False).mean()
+
+def get_4h_trend(symbol):
+    """Return 'up', 'down', or 'neutral' based on 4H EMA50 vs EMA200."""
+    df = get_klines_df(symbol, '4h', limit=200)
+    if df.empty or len(df) < 200:
+        return 'neutral'
+    closes = df['close']
+    ema50 = compute_ema(closes, 50)
+    ema200 = compute_ema(closes, 200)
+    if ema50.iloc[-1] > ema200.iloc[-1]:
+        return 'up'
+    elif ema50.iloc[-1] < ema200.iloc[-1]:
+        return 'down'
+    return 'neutral'
 
 def get_technical_scores(symbol):
     df_1h = get_klines_df(symbol, '1h', limit=100)
@@ -209,35 +223,54 @@ def get_macro_data():
         return {"total2": total2, "total3": total3, "btc_d": btc_d, "usdt_d": usdt_d}
     return None
 
-# ---------- COIN SCORING (with 1h technicals) ----------
+# ---------- COIN SCORING (balanced for long/short) ----------
 def score_coin(symbol, bid, ask, vol, change24):
     score = 0.0
 
+    # 1. Technicals (30%)
     tech = get_technical_scores(symbol)
     tech_combined = (tech["trend_score"] * 0.5 +
                      tech["momentum_score"] * 0.3 +
                      tech["macd_score"] * 0.2) / 3
     score += 0.30 * tech_combined
 
+    # 2. Order flow (15%) – moderate only if strong
     imbalance = get_imbalance(symbol, bid)
-    score += 0.15 * (imbalance * 3)
+    if abs(imbalance) > 0.5:
+        score += 0.15 * (imbalance * 3)
+    elif abs(imbalance) > 0.2:
+        score += 0.15 * (imbalance * 3) * 0.5
+    # else no contribution
 
+    # 3. Volume/momentum (10%) – cap 24h change contribution
     if vol > 1_000_000:
-        score += 0.10 * (min(change24/10, 3) if change24 > 0 else max(change24/10, -3))
+        momentum = max(min(change24 / 10, 3), -3)
+        score += 0.10 * momentum
 
+    # 4. Funding (10%)
     funding = get_funding(symbol)
     if abs(funding) < 0.05:
         score += 0.10 * 2
     elif abs(funding) < 0.1:
         score += 0.10 * 1
 
+    # 5. Macro (20%) – only add if aligned with 4H trend
     macro = get_macro_data()
-    if macro:
-        if macro["btc_d"] < 55:
-            score += 0.20 * 2
-        elif macro["btc_d"] < 60:
-            score += 0.20 * 1
+    trend_4h = get_4h_trend(symbol)
+    if macro and trend_4h != 'neutral':
+        btc_d = macro["btc_d"]
+        if trend_4h == 'up':
+            if btc_d < 55:
+                score += 0.20 * 2   # bullish macro + uptrend → strong long
+            elif btc_d < 60:
+                score += 0.20 * 1
+        else:  # trend_4h == 'down'
+            if btc_d > 55:
+                score += 0.20 * (-1)  # risk-off + downtrend → bearish
+            else:
+                score += 0.20 * (-2)  # strong risk-on but trend down → still bearish
 
+    # 6. Trending (5%)
     try:
         trending = fetch_coingecko("https://api.coingecko.com/api/v3/search/trending")
         if trending:
@@ -332,7 +365,12 @@ def generate_signal():
         return {"action": "HOLD", "reasoning": f"No strong conviction. Best score: {best_score:.2f} for {best['symbol'] if best else 'none'}."}
 
     direction = "LONG" if best_score >= 0 else "SHORT"
-    # Entry = current bid (long) or ask (short) – used as LIMIT order price
+
+    # 4H trend filter – reject if counter-trend
+    trend_4h = get_4h_trend(best["symbol"])
+    if (direction == "LONG" and trend_4h == "down") or (direction == "SHORT" and trend_4h == "up"):
+        return {"action": "HOLD", "reasoning": f"Signal {direction} contradicts 4H trend ({trend_4h}). Best score: {best_score:.2f}"}
+
     entry = best["bid"] if direction == "LONG" else best["ask"]
     atr = best["atr"]
     min_stop = max(1.5 * atr, entry * 0.02)
@@ -356,7 +394,7 @@ def generate_signal():
         "action": direction,
         "symbol": best["symbol"],
         "quantity": qty,
-        "order_type": "LIMIT",          # <-- changed to LIMIT
+        "order_type": "LIMIT",
         "limit_price": entry,
         "stop_loss": stop,
         "take_profit_1": tps[0],
@@ -406,7 +444,7 @@ def main():
             msg = (
                 f"{symbol} ‼️\n\n"
                 f"{action} {direction_icon}\n\n"
-                f"ENTRY ⛔ LIMIT ${entry_price:,.2f}\n\n"          # <-- now shows LIMIT
+                f"ENTRY ⛔ LIMIT ${entry_price:,.2f}\n\n"
                 f"Stoploss 🛑 ${stop_price:,.2f}\n\n"
                 f"Targets 🎯\n"
                 f"{tp_lines}\n\n"
