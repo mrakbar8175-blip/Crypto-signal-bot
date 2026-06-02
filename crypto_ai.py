@@ -327,10 +327,12 @@ def generate_signal():
             best = coin
             best_score = score
 
-    if best is None or abs(best_score) < 0.4:
+    # Conviction threshold ≥ 1.5
+    if best is None or abs(best_score) < 1.5:
         return {"action": "HOLD", "reasoning": f"No strong conviction. Best score: {best_score:.2f} for {best['symbol'] if best else 'none'}."}
 
     direction = "LONG" if best_score >= 0 else "SHORT"
+    # Entry = current bid (long) or ask (short) – used as LIMIT order price
     entry = best["bid"] if direction == "LONG" else best["ask"]
     atr = best["atr"]
     min_stop = max(1.5 * atr, entry * 0.02)
@@ -354,7 +356,7 @@ def generate_signal():
         "action": direction,
         "symbol": best["symbol"],
         "quantity": qty,
-        "order_type": "MARKET",
+        "order_type": "LIMIT",          # <-- changed to LIMIT
         "limit_price": entry,
         "stop_loss": stop,
         "take_profit_1": tps[0],
@@ -404,7 +406,7 @@ def main():
             msg = (
                 f"{symbol} ‼️\n\n"
                 f"{action} {direction_icon}\n\n"
-                f"ENTRY ⛔ CMP — ${entry_price:,.2f}\n\n"
+                f"ENTRY ⛔ LIMIT ${entry_price:,.2f}\n\n"          # <-- now shows LIMIT
                 f"Stoploss 🛑 ${stop_price:,.2f}\n\n"
                 f"Targets 🎯\n"
                 f"{tp_lines}\n\n"
