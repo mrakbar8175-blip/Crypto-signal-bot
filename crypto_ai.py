@@ -59,7 +59,7 @@ def get_binance_last_price(symbol):
         return float(ticker["price"])
     return 0
 
-# ---------- TECHNICAL INDICATORS (from Binance klines) ----------
+# ---------- TECHNICAL INDICATORS (now using 1‑hour data) ----------
 def get_klines_df(symbol, interval, limit=100):
     endpoint = f"/fapi/v1/klines?symbol={symbol}&interval={interval}&limit={limit}"
     data = fetch_binance(endpoint)
@@ -86,43 +86,44 @@ def compute_ema(series, period):
     return series.ewm(span=period, adjust=False).mean()
 
 def get_technical_scores(symbol):
-    df_4h = get_klines_df(symbol, '4h', limit=100)
+    # Use 1‑hour data for main analysis, fallback to 15m if insufficient
     df_1h = get_klines_df(symbol, '1h', limit=100)
+    df_15m = get_klines_df(symbol, '15m', limit=100)
 
     trend_score = 0
     momentum_score = 0
     macd_score = 0
 
-    if not df_4h.empty and len(df_4h) >= 50:
-        closes_4h = df_4h['close']
-        ema50_4h = compute_ema(closes_4h, 50)
-        ema200_4h = compute_ema(closes_4h, 200) if len(closes_4h) >= 200 else ema50_4h
+    if not df_1h.empty and len(df_1h) >= 50:
+        closes_1h = df_1h['close']
+        ema50_1h = compute_ema(closes_1h, 50)
+        ema200_1h = compute_ema(closes_1h, 200) if len(closes_1h) >= 200 else ema50_1h
 
-        current_price = closes_4h.iloc[-1]
-        if current_price > ema50_4h.iloc[-1]:
+        current_price = closes_1h.iloc[-1]
+        if current_price > ema50_1h.iloc[-1]:
             trend_score += 1.5
         else:
             trend_score -= 1.5
-        if ema50_4h.iloc[-1] > ema200_4h.iloc[-1]:
+        if ema50_1h.iloc[-1] > ema200_1h.iloc[-1]:
             trend_score += 1.5
         else:
             trend_score -= 1.5
         trend_score = max(-3, min(3, trend_score))
 
-        rsi_4h = compute_rsi(closes_4h, 14)
-        if rsi_4h < 30:
+        rsi_1h = compute_rsi(closes_1h, 14)
+        if rsi_1h < 30:
             momentum_score = 2
-        elif rsi_4h > 70:
+        elif rsi_1h > 70:
             momentum_score = -2
-        elif rsi_4h > 60:
+        elif rsi_1h > 60:
             momentum_score = 1
-        elif rsi_4h < 40:
+        elif rsi_1h < 40:
             momentum_score = -1
         else:
             momentum_score = 0
 
-        ema12 = compute_ema(closes_4h, 12)
-        ema26 = compute_ema(closes_4h, 26)
+        ema12 = compute_ema(closes_1h, 12)
+        ema26 = compute_ema(closes_1h, 26)
         macd_line = ema12 - ema26
         signal_line = compute_ema(macd_line, 9)
         histogram = macd_line - signal_line
@@ -138,18 +139,19 @@ def get_technical_scores(symbol):
             elif hist_now < 0:
                 macd_score = -1
     else:
-        if not df_1h.empty and len(df_1h) >= 50:
-            closes_1h = df_1h['close']
-            ema50_1h = compute_ema(closes_1h, 50)
-            current_price = closes_1h.iloc[-1]
-            if current_price > ema50_1h.iloc[-1]:
+        # fallback to 15m
+        if not df_15m.empty and len(df_15m) >= 50:
+            closes_15m = df_15m['close']
+            ema50_15m = compute_ema(closes_15m, 50)
+            current_price = closes_15m.iloc[-1]
+            if current_price > ema50_15m.iloc[-1]:
                 trend_score = 1
             else:
                 trend_score = -1
-            rsi_1h = compute_rsi(closes_1h, 14)
-            if rsi_1h < 30:
+            rsi_15m = compute_rsi(closes_15m, 14)
+            if rsi_15m < 30:
                 momentum_score = 2
-            elif rsi_1h > 70:
+            elif rsi_15m > 70:
                 momentum_score = -2
             else:
                 momentum_score = 0
@@ -160,9 +162,9 @@ def get_technical_scores(symbol):
         "macd_score": macd_score
     }
 
-# ---------- ATR (4h) ----------
-def get_4h_atr(symbol, current_price):
-    df = get_klines_df(symbol, '4h', limit=50)
+# ---------- ATR (1h) ----------
+def get_1h_atr(symbol, current_price):
+    df = get_klines_df(symbol, '1h', limit=50)
     if not df.empty and len(df) >= 14:
         high = df['high']
         low = df['low']
@@ -173,7 +175,7 @@ def get_4h_atr(symbol, current_price):
         atr = tr.rolling(14).mean().iloc[-1]
         if not pd.isna(atr):
             return atr
-    return current_price * 0.02
+    return current_price * 0.02   # 2% fallback
 
 # ---------- ORDER BOOK IMBALANCE ----------
 def get_imbalance(symbol, fallback_price):
@@ -209,7 +211,7 @@ def get_macro_data():
         return {"total2": total2, "total3": total3, "btc_d": btc_d, "usdt_d": usdt_d}
     return None
 
-# ---------- COIN SCORING (with technicals) ----------
+# ---------- COIN SCORING (with 1h technicals) ----------
 def score_coin(symbol, bid, ask, vol, change24):
     score = 0.0
 
@@ -254,7 +256,7 @@ def score_coin(symbol, bid, ask, vol, change24):
 # ---------- AI REASONING ----------
 def call_groq_reasoning(symbol, entry, atr, macro):
     prompt = (
-        f"Trade signal for {symbol} at {entry}. 4h ATR: {atr:.4f}. "
+        f"Trade signal for {symbol} at {entry}. 1h ATR: {atr:.4f}. "
         f"Macro: {json.dumps(macro)}. Provide a short reasoning and confidence 1-10.\n"
         "Format: CONFIDENCE: 7 | REASONING: [text]"
     )
@@ -318,7 +320,7 @@ def generate_signal():
         bid = coin["price"] * 0.999
         ask = coin["price"] * 1.001
         score = score_coin(sym, bid, ask, coin["volume"], coin["change"])
-        atr = get_4h_atr(sym, coin["price"])
+        atr = get_1h_atr(sym, coin["price"])
         coin["score"] = score
         coin["atr"] = atr
         coin["bid"] = bid
@@ -365,7 +367,7 @@ def generate_signal():
         "take_profit_6": tps[5],
         "confidence_score": conf,
         "reasoning": reason,
-        "conviction_score": best_score      # <-- added
+        "conviction_score": best_score
     }
 
 # ========== TELEGRAM ==========
@@ -388,7 +390,7 @@ def main():
             entry_price = dec.get('limit_price', 0)
             stop_price = dec.get('stop_loss', 0)
             confidence = dec.get('confidence_score', 0)
-            conviction = dec.get('conviction_score', 0)   # <-- added
+            conviction = dec.get('conviction_score', 0)
             tps = [
                 dec.get('take_profit_1', 0),
                 dec.get('take_profit_2', 0),
@@ -411,9 +413,7 @@ def main():
                 f"Stoploss 🛑 at breakeven when we hit our Second Target 🎯 ‼️"
             )
         else:
-            reason = dec.get('reasoning', 'No signal')
-            # Also show best score if available
-            msg = f"📊 HOLD\nReason: {reason}"
+            msg = f"📊 HOLD\nReason: {dec.get('reasoning', 'No signal')}"
 
         print(msg)
         send_telegram(msg)
