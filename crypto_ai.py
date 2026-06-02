@@ -17,7 +17,7 @@ portfolio = {
     "daily_loss_limit": -20
 }
 
-# ========== COIN MAPPING (CoinGecko id → Binance symbol) ==========
+# ========== COIN MAPPING ==========
 COIN_MAP = {
     "binancecoin": "BNBUSDT", "ripple": "XRPUSDT", "cardano": "ADAUSDT",
     "solana": "SOLUSDT", "dogecoin": "DOGEUSDT", "polkadot": "DOTUSDT",
@@ -86,7 +86,6 @@ def compute_ema(series, period):
     return series.ewm(span=period, adjust=False).mean()
 
 def get_4h_trend(symbol):
-    """Return 'up', 'down', or 'neutral' based on 4H EMA50 vs EMA200."""
     df = get_klines_df(symbol, '4h', limit=200)
     if df.empty or len(df) < 200:
         return 'neutral'
@@ -209,7 +208,7 @@ def get_funding(symbol):
         return float(data["lastFundingRate"]) * 100
     return 0.01
 
-# ---------- MACRO DATA ----------
+# ---------- MACRO ----------
 def get_macro_data():
     data = fetch_coingecko("https://api.coingecko.com/api/v3/global")
     if data:
@@ -223,8 +222,20 @@ def get_macro_data():
         return {"total2": total2, "total3": total3, "btc_d": btc_d, "usdt_d": usdt_d}
     return None
 
-# ---------- COIN SCORING (balanced for long/short) ----------
-def score_coin(symbol, bid, ask, vol, change24):
+# ---------- 1‑HOUR CHANGE HELPER ----------
+def get_1h_change(symbol):
+    """Return percent change over the last hour using 1‑H klines."""
+    df = get_klines_df(symbol, '1h', limit=2)
+    if df.empty or len(df) < 2:
+        return 0.0
+    prev_close = df['close'].iloc[-2]
+    current_close = df['close'].iloc[-1]
+    if prev_close == 0:
+        return 0.0
+    return ((current_close - prev_close) / prev_close) * 100.0
+
+# ---------- SCORING ----------
+def score_coin(symbol, bid, ask, vol, change1h):
     score = 0.0
 
     # 1. Technicals (30%)
@@ -234,17 +245,16 @@ def score_coin(symbol, bid, ask, vol, change24):
                      tech["macd_score"] * 0.2) / 3
     score += 0.30 * tech_combined
 
-    # 2. Order flow (15%) – moderate only if strong
+    # 2. Order flow (15%)
     imbalance = get_imbalance(symbol, bid)
     if abs(imbalance) > 0.5:
         score += 0.15 * (imbalance * 3)
     elif abs(imbalance) > 0.2:
         score += 0.15 * (imbalance * 3) * 0.5
-    # else no contribution
 
-    # 3. Volume/momentum (10%) – cap 24h change contribution
+    # 3. Volume/momentum (10%) – now uses 1‑hour change
     if vol > 1_000_000:
-        momentum = max(min(change24 / 10, 3), -3)
+        momentum = max(min(change1h, 3), -3)      # 1‑h change capped at ±3
         score += 0.10 * momentum
 
     # 4. Funding (10%)
@@ -254,21 +264,21 @@ def score_coin(symbol, bid, ask, vol, change24):
     elif abs(funding) < 0.1:
         score += 0.10 * 1
 
-    # 5. Macro (20%) – only add if aligned with 4H trend
+    # 5. Macro (20%) – aligned with 4H trend
     macro = get_macro_data()
     trend_4h = get_4h_trend(symbol)
     if macro and trend_4h != 'neutral':
         btc_d = macro["btc_d"]
         if trend_4h == 'up':
             if btc_d < 55:
-                score += 0.20 * 2   # bullish macro + uptrend → strong long
+                score += 0.20 * 2
             elif btc_d < 60:
                 score += 0.20 * 1
-        else:  # trend_4h == 'down'
+        else:   # trend_4h == 'down'
             if btc_d > 55:
-                score += 0.20 * (-1)  # risk-off + downtrend → bearish
+                score += 0.20 * (-1)
             else:
-                score += 0.20 * (-2)  # strong risk-on but trend down → still bearish
+                score += 0.20 * (-2)
 
     # 6. Trending (5%)
     try:
@@ -327,15 +337,16 @@ def generate_signal():
         sym = COIN_MAP[coin["id"]]
         price = coin.get("current_price", 0)
         volume = coin.get("total_volume", 0)
-        change = coin.get("price_change_percentage_24h", 0)
         if price == 0:
             price = get_binance_last_price(sym)
+        # Get 1‑hour change for this coin
+        change1h = get_1h_change(sym)
         if price > 0 and volume > 0:
             candidates.append({
                 "symbol": sym,
                 "price": price,
                 "volume": volume,
-                "change": change
+                "change1h": change1h
             })
     candidates.sort(key=lambda x: x["volume"], reverse=True)
     candidates = candidates[:30]
@@ -350,7 +361,7 @@ def generate_signal():
         sym = coin["symbol"]
         bid = coin["price"] * 0.999
         ask = coin["price"] * 1.001
-        score = score_coin(sym, bid, ask, coin["volume"], coin["change"])
+        score = score_coin(sym, bid, ask, coin["volume"], coin["change1h"])
         atr = get_1h_atr(sym, coin["price"])
         coin["score"] = score
         coin["atr"] = atr
@@ -366,7 +377,7 @@ def generate_signal():
 
     direction = "LONG" if best_score >= 0 else "SHORT"
 
-    # 4H trend filter – reject if counter-trend
+    # 4H trend filter
     trend_4h = get_4h_trend(best["symbol"])
     if (direction == "LONG" and trend_4h == "down") or (direction == "SHORT" and trend_4h == "up"):
         return {"action": "HOLD", "reasoning": f"Signal {direction} contradicts 4H trend ({trend_4h}). Best score: {best_score:.2f}"}
