@@ -17,7 +17,7 @@ portfolio = {
     "daily_loss_limit": -20
 }
 
-# ========== COIN MAPPING ==========
+# ========== COIN MAPPING (CoinGecko id -> Binance symbol) ==========
 COIN_MAP = {
     "binancecoin": "BNBUSDT", "ripple": "XRPUSDT", "cardano": "ADAUSDT",
     "solana": "SOLUSDT", "dogecoin": "DOGEUSDT", "polkadot": "DOTUSDT",
@@ -61,7 +61,6 @@ def get_binance_last_price(symbol):
 
 # ---------- TECHNICAL INDICATORS (from Binance klines) ----------
 def get_klines_df(symbol, interval, limit=100):
-    """Fetch klines and return a DataFrame with OHLCV columns."""
     endpoint = f"/fapi/v1/klines?symbol={symbol}&interval={interval}&limit={limit}"
     data = fetch_binance(endpoint)
     if not data or "error" in data:
@@ -87,11 +86,6 @@ def compute_ema(series, period):
     return series.ewm(span=period, adjust=False).mean()
 
 def get_technical_scores(symbol):
-    """
-    Returns a dict with technical sub-scores (each -3 to +3).
-    If data is insufficient, returns neutral scores.
-    """
-    # Fetch 4h and 1h data
     df_4h = get_klines_df(symbol, '4h', limit=100)
     df_1h = get_klines_df(symbol, '1h', limit=100)
 
@@ -99,13 +93,11 @@ def get_technical_scores(symbol):
     momentum_score = 0
     macd_score = 0
 
-    # ---- 4H indicators ----
     if not df_4h.empty and len(df_4h) >= 50:
         closes_4h = df_4h['close']
         ema50_4h = compute_ema(closes_4h, 50)
         ema200_4h = compute_ema(closes_4h, 200) if len(closes_4h) >= 200 else ema50_4h
 
-        # EMA cross trend: price vs EMA50, and EMA50 vs EMA200
         current_price = closes_4h.iloc[-1]
         if current_price > ema50_4h.iloc[-1]:
             trend_score += 1.5
@@ -115,15 +107,13 @@ def get_technical_scores(symbol):
             trend_score += 1.5
         else:
             trend_score -= 1.5
-        # Cap trend_score to -3..3
         trend_score = max(-3, min(3, trend_score))
 
-        # RSI on 4h
         rsi_4h = compute_rsi(closes_4h, 14)
         if rsi_4h < 30:
-            momentum_score = 2  # oversold, potential long
+            momentum_score = 2
         elif rsi_4h > 70:
-            momentum_score = -2 # overbought, potential short
+            momentum_score = -2
         elif rsi_4h > 60:
             momentum_score = 1
         elif rsi_4h < 40:
@@ -131,7 +121,6 @@ def get_technical_scores(symbol):
         else:
             momentum_score = 0
 
-        # MACD (12,26,9) on 4h
         ema12 = compute_ema(closes_4h, 12)
         ema26 = compute_ema(closes_4h, 26)
         macd_line = ema12 - ema26
@@ -141,15 +130,15 @@ def get_technical_scores(symbol):
             hist_now = histogram.iloc[-1]
             hist_prev = histogram.iloc[-2]
             if hist_now > 0 and hist_prev <= 0:
-                macd_score = 2  # bullish cross
+                macd_score = 2
             elif hist_now < 0 and hist_prev >= 0:
-                macd_score = -2 # bearish cross
+                macd_score = -2
             elif hist_now > 0:
                 macd_score = 1
             elif hist_now < 0:
                 macd_score = -1
     else:
-        # fallback to 1h if 4h fails
+        # fallback to 1h
         if not df_1h.empty and len(df_1h) >= 50:
             closes_1h = df_1h['close']
             ema50_1h = compute_ema(closes_1h, 50)
@@ -167,9 +156,9 @@ def get_technical_scores(symbol):
                 momentum_score = 0
 
     return {
-        "trend_score": trend_score,      # -3..3
-        "momentum_score": momentum_score, # -3..3
-        "macd_score": macd_score          # -3..3
+        "trend_score": trend_score,
+        "momentum_score": momentum_score,
+        "macd_score": macd_score
     }
 
 # ---------- ATR (4h) ----------
@@ -185,7 +174,7 @@ def get_4h_atr(symbol, current_price):
         atr = tr.rolling(14).mean().iloc[-1]
         if not pd.isna(atr):
             return atr
-    return current_price * 0.02   # 2% fallback
+    return current_price * 0.02
 
 # ---------- ORDER BOOK IMBALANCE ----------
 def get_imbalance(symbol, fallback_price):
@@ -225,12 +214,11 @@ def get_macro_data():
 def score_coin(symbol, bid, ask, vol, change24):
     score = 0.0
 
-    # 1. Technical analysis (30% weight, split into sub-parts)
+    # 1. Technical analysis (30% weight)
     tech = get_technical_scores(symbol)
-    # Normalize sub-scores (each -3..3) and combine with equal weight inside technicals
     tech_combined = (tech["trend_score"] * 0.5 +
                      tech["momentum_score"] * 0.3 +
-                     tech["macd_score"] * 0.2) / 3   # average scaled to -3..3
+                     tech["macd_score"] * 0.2) / 3
     score += 0.30 * tech_combined
 
     # 2. Order flow (15%)
@@ -300,8 +288,8 @@ def call_groq_reasoning(symbol, entry, atr, macro):
 
 # ========== MAIN SIGNAL GENERATION ==========
 def generate_signal():
-    # Get top 10 altcoins from CoinGecko
-    url = "https://api.coingecko.com/api/v3/coins/markets?vs_currency=usd&order=volume_desc&per_page=50&page=1"
+    # Fetch top 100 coins from CoinGecko, filter to our universe, take top 30 by volume
+    url = "https://api.coingecko.com/api/v3/coins/markets?vs_currency=usd&order=volume_desc&per_page=100&page=1"
     coins_data = fetch_coingecko(url)
     if not coins_data:
         return {"action": "HOLD", "reasoning": "CoinGecko API unavailable."}
@@ -324,8 +312,9 @@ def generate_signal():
                 "volume": volume,
                 "change": change
             })
-        if len(candidates) >= 10:
-            break
+    # Sort by volume descending and keep the top 30
+    candidates.sort(key=lambda x: x["volume"], reverse=True)
+    candidates = candidates[:30]
 
     if not candidates:
         return {"action": "HOLD", "reasoning": "No liquid altcoins found."}
