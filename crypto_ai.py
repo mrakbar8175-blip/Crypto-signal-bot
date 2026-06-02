@@ -59,7 +59,7 @@ def get_binance_last_price(symbol):
         return float(ticker["price"])
     return 0
 
-# ---------- TECHNICAL INDICATORS (now using 1‑hour data) ----------
+# ---------- TECHNICAL INDICATORS (1‑hour data) ----------
 def get_klines_df(symbol, interval, limit=100):
     endpoint = f"/fapi/v1/klines?symbol={symbol}&interval={interval}&limit={limit}"
     data = fetch_binance(endpoint)
@@ -86,7 +86,6 @@ def compute_ema(series, period):
     return series.ewm(span=period, adjust=False).mean()
 
 def get_technical_scores(symbol):
-    # Use 1‑hour data for main analysis, fallback to 15m if insufficient
     df_1h = get_klines_df(symbol, '1h', limit=100)
     df_15m = get_klines_df(symbol, '15m', limit=100)
 
@@ -139,7 +138,6 @@ def get_technical_scores(symbol):
             elif hist_now < 0:
                 macd_score = -1
     else:
-        # fallback to 15m
         if not df_15m.empty and len(df_15m) >= 50:
             closes_15m = df_15m['close']
             ema50_15m = compute_ema(closes_15m, 50)
@@ -175,7 +173,7 @@ def get_1h_atr(symbol, current_price):
         atr = tr.rolling(14).mean().iloc[-1]
         if not pd.isna(atr):
             return atr
-    return current_price * 0.02   # 2% fallback
+    return current_price * 0.02
 
 # ---------- ORDER BOOK IMBALANCE ----------
 def get_imbalance(symbol, fallback_price):
@@ -391,6 +389,7 @@ def main():
             stop_price = dec.get('stop_loss', 0)
             confidence = dec.get('confidence_score', 0)
             conviction = dec.get('conviction_score', 0)
+            reasoning = dec.get('reasoning', '')
             tps = [
                 dec.get('take_profit_1', 0),
                 dec.get('take_profit_2', 0),
@@ -410,7 +409,8 @@ def main():
                 f"Targets 🎯\n"
                 f"{tp_lines}\n\n"
                 f"Conviction Score: {conviction:.2f} | Confidence: {confidence}/10\n\n"
-                f"Stoploss 🛑 at breakeven when we hit our Second Target 🎯 ‼️"
+                f"Stoploss 🛑 at breakeven when we hit our Second Target 🎯 ‼️\n\n"
+                f"Reason: {reasoning}"
             )
         else:
             msg = f"📊 HOLD\nReason: {dec.get('reasoning', 'No signal')}"
