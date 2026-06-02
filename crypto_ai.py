@@ -17,7 +17,7 @@ portfolio = {
     "daily_loss_limit": -20
 }
 
-# ========== COIN MAPPING (CoinGecko id -> Binance symbol) ==========
+# ========== COIN MAPPING (CoinGecko id → Binance symbol) ==========
 COIN_MAP = {
     "binancecoin": "BNBUSDT", "ripple": "XRPUSDT", "cardano": "ADAUSDT",
     "solana": "SOLUSDT", "dogecoin": "DOGEUSDT", "polkadot": "DOTUSDT",
@@ -138,7 +138,6 @@ def get_technical_scores(symbol):
             elif hist_now < 0:
                 macd_score = -1
     else:
-        # fallback to 1h
         if not df_1h.empty and len(df_1h) >= 50:
             closes_1h = df_1h['close']
             ema50_1h = compute_ema(closes_1h, 50)
@@ -214,29 +213,24 @@ def get_macro_data():
 def score_coin(symbol, bid, ask, vol, change24):
     score = 0.0
 
-    # 1. Technical analysis (30% weight)
     tech = get_technical_scores(symbol)
     tech_combined = (tech["trend_score"] * 0.5 +
                      tech["momentum_score"] * 0.3 +
                      tech["macd_score"] * 0.2) / 3
     score += 0.30 * tech_combined
 
-    # 2. Order flow (15%)
     imbalance = get_imbalance(symbol, bid)
     score += 0.15 * (imbalance * 3)
 
-    # 3. Volume/momentum (10%)
     if vol > 1_000_000:
         score += 0.10 * (min(change24/10, 3) if change24 > 0 else max(change24/10, -3))
 
-    # 4. Funding (10%)
     funding = get_funding(symbol)
     if abs(funding) < 0.05:
         score += 0.10 * 2
     elif abs(funding) < 0.1:
         score += 0.10 * 1
 
-    # 5. Macro (20%)
     macro = get_macro_data()
     if macro:
         if macro["btc_d"] < 55:
@@ -244,7 +238,6 @@ def score_coin(symbol, bid, ask, vol, change24):
         elif macro["btc_d"] < 60:
             score += 0.20 * 1
 
-    # 6. Trending (5%)
     try:
         trending = fetch_coingecko("https://api.coingecko.com/api/v3/search/trending")
         if trending:
@@ -288,7 +281,6 @@ def call_groq_reasoning(symbol, entry, atr, macro):
 
 # ========== MAIN SIGNAL GENERATION ==========
 def generate_signal():
-    # Fetch top 100 coins from CoinGecko, filter to our universe, take top 30 by volume
     url = "https://api.coingecko.com/api/v3/coins/markets?vs_currency=usd&order=volume_desc&per_page=100&page=1"
     coins_data = fetch_coingecko(url)
     if not coins_data:
@@ -312,14 +304,12 @@ def generate_signal():
                 "volume": volume,
                 "change": change
             })
-    # Sort by volume descending and keep the top 30
     candidates.sort(key=lambda x: x["volume"], reverse=True)
     candidates = candidates[:30]
 
     if not candidates:
         return {"action": "HOLD", "reasoning": "No liquid altcoins found."}
 
-    # Score each candidate
     macro = get_macro_data()
     best = None
     best_score = 0
@@ -337,10 +327,10 @@ def generate_signal():
             best = coin
             best_score = score
 
-    if best is None or abs(best_score) < 1.5:
+    if best is None or abs(best_score) < 0.4:
         return {"action": "HOLD", "reasoning": f"No strong conviction. Best score: {best_score:.2f} for {best['symbol'] if best else 'none'}."}
 
-    direction = "LONG" if best_score > 0 else "SHORT"
+    direction = "LONG" if best_score >= 0 else "SHORT"
     entry = best["bid"] if direction == "LONG" else best["ask"]
     atr = best["atr"]
     min_stop = max(1.5 * atr, entry * 0.02)
@@ -374,7 +364,8 @@ def generate_signal():
         "take_profit_5": tps[4],
         "take_profit_6": tps[5],
         "confidence_score": conf,
-        "reasoning": reason
+        "reasoning": reason,
+        "conviction_score": best_score      # <-- added
     }
 
 # ========== TELEGRAM ==========
@@ -390,14 +381,40 @@ def main():
         dec = generate_signal()
         action = dec.get('action', 'HOLD')
         if action in ["LONG", "SHORT"]:
-            msg = (f"📊 {action} {dec.get('symbol')}\n"
-                   f"Entry: MARKET @ {dec.get('limit_price','CMP')}\n"
-                   f"Stop: {dec.get('stop_loss')}\n"
-                   f"TPs: {dec.get('take_profit_1')} | {dec.get('take_profit_2')} | {dec.get('take_profit_3')} | {dec.get('take_profit_4')} | {dec.get('take_profit_5')} | {dec.get('take_profit_6')}\n"
-                   f"Qty: {dec.get('quantity')} | Confidence: {dec.get('confidence_score')}/10\n"
-                   f"Reason: {dec.get('reasoning')}")
+            raw_symbol = dec.get('symbol', '')
+            symbol = raw_symbol.replace("USDT", "/USDT") if raw_symbol else ""
+
+            direction_icon = "🟢" if action == "LONG" else "🛑"
+            entry_price = dec.get('limit_price', 0)
+            stop_price = dec.get('stop_loss', 0)
+            confidence = dec.get('confidence_score', 0)
+            conviction = dec.get('conviction_score', 0)   # <-- added
+            tps = [
+                dec.get('take_profit_1', 0),
+                dec.get('take_profit_2', 0),
+                dec.get('take_profit_3', 0),
+                dec.get('take_profit_4', 0),
+                dec.get('take_profit_5', 0),
+                dec.get('take_profit_6', 0),
+            ]
+
+            tp_lines = "\n".join([f"📌 ${tp:,.2f}" if tp else "📌 —" for tp in tps])
+
+            msg = (
+                f"{symbol} ‼️\n\n"
+                f"{action} {direction_icon}\n\n"
+                f"ENTRY ⛔ CMP — ${entry_price:,.2f}\n\n"
+                f"Stoploss 🛑 ${stop_price:,.2f}\n\n"
+                f"Targets 🎯\n"
+                f"{tp_lines}\n\n"
+                f"Conviction Score: {conviction:.2f} | Confidence: {confidence}/10\n\n"
+                f"Stoploss 🛑 at breakeven when we hit our Second Target 🎯 ‼️"
+            )
         else:
-            msg = f"📊 HOLD\nReason: {dec.get('reasoning','No signal')}"
+            reason = dec.get('reasoning', 'No signal')
+            # Also show best score if available
+            msg = f"📊 HOLD\nReason: {reason}"
+
         print(msg)
         send_telegram(msg)
     except Exception as e:
