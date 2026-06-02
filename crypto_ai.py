@@ -1,4 +1,6 @@
 import requests, json, os, traceback, time, re
+import pandas as pd
+import numpy as np
 
 # ========== ENVIRONMENT ==========
 TELEGRAM_TOKEN = os.environ["TELEGRAM_TOKEN"]
@@ -15,7 +17,7 @@ portfolio = {
     "daily_loss_limit": -20
 }
 
-# ========== COIN MAPPING (CoinGecko id → Binance symbol) ==========
+# ========== COIN MAPPING ==========
 COIN_MAP = {
     "binancecoin": "BNBUSDT", "ripple": "XRPUSDT", "cardano": "ADAUSDT",
     "solana": "SOLUSDT", "dogecoin": "DOGEUSDT", "polkadot": "DOTUSDT",
@@ -38,7 +40,6 @@ COIN_MAP = {
 
 # ========== DATA HELPERS ==========
 def fetch_binance(endpoint):
-    """Try Binance; return empty dict on failure."""
     try:
         r = requests.get("https://fapi.binance.com" + endpoint, timeout=10)
         return r.json()
@@ -46,7 +47,6 @@ def fetch_binance(endpoint):
         return {}
 
 def fetch_coingecko(url):
-    """Try CoinGecko; return empty dict on failure."""
     try:
         r = requests.get(url, timeout=15)
         return r.json() if r.status_code == 200 else {}
@@ -54,43 +54,141 @@ def fetch_coingecko(url):
         return {}
 
 def get_binance_last_price(symbol):
-    """Ultimate fallback price from Binance ticker."""
     ticker = fetch_binance(f"/fapi/v1/ticker/price?symbol={symbol}")
     if "price" in ticker:
         return float(ticker["price"])
     return 0
 
+# ---------- TECHNICAL INDICATORS (from Binance klines) ----------
+def get_klines_df(symbol, interval, limit=100):
+    """Fetch klines and return a DataFrame with OHLCV columns."""
+    endpoint = f"/fapi/v1/klines?symbol={symbol}&interval={interval}&limit={limit}"
+    data = fetch_binance(endpoint)
+    if not data or "error" in data:
+        return pd.DataFrame()
+    df = pd.DataFrame(data, columns=['open_time', 'open', 'high', 'low', 'close', 'volume',
+                                     'close_time', 'quote_vol', 'trades', 'taker_buy_base',
+                                     'taker_buy_quote', 'ignore'])
+    df['close'] = df['close'].astype(float)
+    df['high'] = df['high'].astype(float)
+    df['low'] = df['low'].astype(float)
+    df['volume'] = df['volume'].astype(float)
+    return df
+
+def compute_rsi(series, period=14):
+    delta = series.diff()
+    gain = (delta.where(delta > 0, 0)).rolling(period).mean()
+    loss = (-delta.where(delta < 0, 0)).rolling(period).mean()
+    rs = gain / loss
+    rsi = 100 - (100 / (1 + rs))
+    return rsi.iloc[-1] if not rsi.empty else 50
+
+def compute_ema(series, period):
+    return series.ewm(span=period, adjust=False).mean()
+
+def get_technical_scores(symbol):
+    """
+    Returns a dict with technical sub-scores (each -3 to +3).
+    If data is insufficient, returns neutral scores.
+    """
+    # Fetch 4h and 1h data
+    df_4h = get_klines_df(symbol, '4h', limit=100)
+    df_1h = get_klines_df(symbol, '1h', limit=100)
+
+    trend_score = 0
+    momentum_score = 0
+    macd_score = 0
+
+    # ---- 4H indicators ----
+    if not df_4h.empty and len(df_4h) >= 50:
+        closes_4h = df_4h['close']
+        ema50_4h = compute_ema(closes_4h, 50)
+        ema200_4h = compute_ema(closes_4h, 200) if len(closes_4h) >= 200 else ema50_4h
+
+        # EMA cross trend: price vs EMA50, and EMA50 vs EMA200
+        current_price = closes_4h.iloc[-1]
+        if current_price > ema50_4h.iloc[-1]:
+            trend_score += 1.5
+        else:
+            trend_score -= 1.5
+        if ema50_4h.iloc[-1] > ema200_4h.iloc[-1]:
+            trend_score += 1.5
+        else:
+            trend_score -= 1.5
+        # Cap trend_score to -3..3
+        trend_score = max(-3, min(3, trend_score))
+
+        # RSI on 4h
+        rsi_4h = compute_rsi(closes_4h, 14)
+        if rsi_4h < 30:
+            momentum_score = 2  # oversold, potential long
+        elif rsi_4h > 70:
+            momentum_score = -2 # overbought, potential short
+        elif rsi_4h > 60:
+            momentum_score = 1
+        elif rsi_4h < 40:
+            momentum_score = -1
+        else:
+            momentum_score = 0
+
+        # MACD (12,26,9) on 4h
+        ema12 = compute_ema(closes_4h, 12)
+        ema26 = compute_ema(closes_4h, 26)
+        macd_line = ema12 - ema26
+        signal_line = compute_ema(macd_line, 9)
+        histogram = macd_line - signal_line
+        if len(histogram) > 2:
+            hist_now = histogram.iloc[-1]
+            hist_prev = histogram.iloc[-2]
+            if hist_now > 0 and hist_prev <= 0:
+                macd_score = 2  # bullish cross
+            elif hist_now < 0 and hist_prev >= 0:
+                macd_score = -2 # bearish cross
+            elif hist_now > 0:
+                macd_score = 1
+            elif hist_now < 0:
+                macd_score = -1
+    else:
+        # fallback to 1h if 4h fails
+        if not df_1h.empty and len(df_1h) >= 50:
+            closes_1h = df_1h['close']
+            ema50_1h = compute_ema(closes_1h, 50)
+            current_price = closes_1h.iloc[-1]
+            if current_price > ema50_1h.iloc[-1]:
+                trend_score = 1
+            else:
+                trend_score = -1
+            rsi_1h = compute_rsi(closes_1h, 14)
+            if rsi_1h < 30:
+                momentum_score = 2
+            elif rsi_1h > 70:
+                momentum_score = -2
+            else:
+                momentum_score = 0
+
+    return {
+        "trend_score": trend_score,      # -3..3
+        "momentum_score": momentum_score, # -3..3
+        "macd_score": macd_score          # -3..3
+    }
+
 # ---------- ATR (4h) ----------
 def get_4h_atr(symbol, current_price):
-    """Try Binance 4h ATR; fallback to 2% of current price."""
-    klines = fetch_binance(f"/fapi/v1/klines?symbol={symbol}&interval=4h&limit=50")
-    if isinstance(klines, list) and len(klines) >= 14:
-        highs = [float(k[2]) for k in klines]
-        lows = [float(k[3]) for k in klines]
-        closes = [float(k[4]) for k in klines]
-        trs = []
-        for i in range(1, len(klines)):
-            h, l, prev_c = highs[i], lows[i], closes[i-1]
-            tr = max(h - l, abs(h - prev_c), abs(l - prev_c))
-            trs.append(tr)
-        return sum(trs[-14:]) / 14
-    return current_price * 0.02
-
-# ---------- TREND SIGNAL (24h change) ----------
-def get_trend_signal(symbol):
-    """1 = up, -1 = down, 0 = neutral based on 24h change."""
-    ticker = fetch_binance(f"/fapi/v1/ticker/24hr?symbol={symbol}")
-    if "priceChangePercent" in ticker:
-        change = float(ticker["priceChangePercent"])
-        if change > 1:
-            return 1
-        elif change < -1:
-            return -1
-    return 0
+    df = get_klines_df(symbol, '4h', limit=50)
+    if not df.empty and len(df) >= 14:
+        high = df['high']
+        low = df['low']
+        close = df['close']
+        tr = pd.concat([high - low,
+                        (high - close.shift()).abs(),
+                        (low - close.shift()).abs()], axis=1).max(axis=1)
+        atr = tr.rolling(14).mean().iloc[-1]
+        if not pd.isna(atr):
+            return atr
+    return current_price * 0.02   # 2% fallback
 
 # ---------- ORDER BOOK IMBALANCE ----------
 def get_imbalance(symbol, fallback_price):
-    """Get order book imbalance from Binance; 0 if unavailable."""
     depth = fetch_binance(f"/fapi/v1/depth?symbol={symbol}&limit=10")
     if "bids" in depth and "asks" in depth:
         bids = depth["bids"]
@@ -104,13 +202,12 @@ def get_imbalance(symbol, fallback_price):
 
 # ---------- FUNDING ----------
 def get_funding(symbol):
-    """Fetch funding rate from Binance; 0.01% default."""
     data = fetch_binance(f"/fapi/v1/premiumIndex?symbol={symbol}")
     if "lastFundingRate" in data:
         return float(data["lastFundingRate"]) * 100
     return 0.01
 
-# ---------- MACRO DATA (CoinGecko global) ----------
+# ---------- MACRO DATA ----------
 def get_macro_data():
     data = fetch_coingecko("https://api.coingecko.com/api/v3/global")
     if data:
@@ -124,20 +221,23 @@ def get_macro_data():
         return {"total2": total2, "total3": total3, "btc_d": btc_d, "usdt_d": usdt_d}
     return None
 
-# ---------- SCORING (multi-factor) ----------
+# ---------- COIN SCORING (with technicals) ----------
 def score_coin(symbol, bid, ask, vol, change24):
-    """Return conviction score from -3 to +3."""
     score = 0.0
 
-    # 1. Trend (25%)
-    trend = get_trend_signal(symbol)
-    score += 0.25 * trend * 3
+    # 1. Technical analysis (30% weight, split into sub-parts)
+    tech = get_technical_scores(symbol)
+    # Normalize sub-scores (each -3..3) and combine with equal weight inside technicals
+    tech_combined = (tech["trend_score"] * 0.5 +
+                     tech["momentum_score"] * 0.3 +
+                     tech["macd_score"] * 0.2) / 3   # average scaled to -3..3
+    score += 0.30 * tech_combined
 
-    # 2. Order book (15%)
+    # 2. Order flow (15%)
     imbalance = get_imbalance(symbol, bid)
     score += 0.15 * (imbalance * 3)
 
-    # 3. Volume & Momentum (10%)
+    # 3. Volume/momentum (10%)
     if vol > 1_000_000:
         score += 0.10 * (min(change24/10, 3) if change24 > 0 else max(change24/10, -3))
 
@@ -170,7 +270,7 @@ def score_coin(symbol, bid, ask, vol, change24):
 
     return max(-3, min(3, score))
 
-# ---------- AI REASONING (Groq, fallback 6) ----------
+# ---------- AI REASONING ----------
 def call_groq_reasoning(symbol, entry, atr, macro):
     prompt = (
         f"Trade signal for {symbol} at {entry}. 4h ATR: {atr:.4f}. "
@@ -196,11 +296,11 @@ def call_groq_reasoning(symbol, entry, atr, macro):
             return conf, reason
     except:
         pass
-    return 6, "Signal based on multi-factor model."
+    return 6, "Multi-factor model signal."
 
 # ========== MAIN SIGNAL GENERATION ==========
 def generate_signal():
-    # 1. Get top 10 altcoins from CoinGecko (with current price & volume)
+    # Get top 10 altcoins from CoinGecko
     url = "https://api.coingecko.com/api/v3/coins/markets?vs_currency=usd&order=volume_desc&per_page=50&page=1"
     coins_data = fetch_coingecko(url)
     if not coins_data:
@@ -215,12 +315,9 @@ def generate_signal():
         price = coin.get("current_price", 0)
         volume = coin.get("total_volume", 0)
         change = coin.get("price_change_percentage_24h", 0)
+        if price == 0:
+            price = get_binance_last_price(sym)
         if price > 0 and volume > 0:
-            # Use CoinGecko price as base; fallback to Binance if zero
-            if price == 0:
-                price = get_binance_last_price(sym)
-            if price == 0:
-                continue
             candidates.append({
                 "symbol": sym,
                 "price": price,
@@ -233,13 +330,12 @@ def generate_signal():
     if not candidates:
         return {"action": "HOLD", "reasoning": "No liquid altcoins found."}
 
-    # 2. Score each candidate
+    # Score each candidate
     macro = get_macro_data()
     best = None
-    best_score = 0   # reset to 0, first coin will become new best
+    best_score = 0
     for coin in candidates:
         sym = coin["symbol"]
-        # bid/ask derived from CoinGecko price
         bid = coin["price"] * 0.999
         ask = coin["price"] * 1.001
         score = score_coin(sym, bid, ask, coin["volume"], coin["change"])
@@ -255,7 +351,6 @@ def generate_signal():
     if best is None or abs(best_score) < 1.5:
         return {"action": "HOLD", "reasoning": f"No strong conviction. Best score: {best_score:.2f} for {best['symbol'] if best else 'none'}."}
 
-    # 3. Determine trade parameters
     direction = "LONG" if best_score > 0 else "SHORT"
     entry = best["bid"] if direction == "LONG" else best["ask"]
     atr = best["atr"]
@@ -272,7 +367,6 @@ def generate_signal():
         else:
             tps.append(round(entry - mult * risk, 6))
 
-    # 4. Get AI reasoning (or fallback)
     conf, reason = call_groq_reasoning(best["symbol"], entry, atr, macro)
     if conf < 6:
         return {"action": "HOLD", "reasoning": f"AI confidence too low ({conf}/10). {reason}"}
@@ -294,7 +388,7 @@ def generate_signal():
         "reasoning": reason
     }
 
-# ========== TELEGRAM SENDER ==========
+# ========== TELEGRAM ==========
 def send_telegram(text):
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     try:
@@ -302,7 +396,6 @@ def send_telegram(text):
     except Exception as e:
         print("Telegram fail:", e)
 
-# ========== MAIN ==========
 def main():
     try:
         dec = generate_signal()
