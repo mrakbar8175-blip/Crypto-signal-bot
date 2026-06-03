@@ -74,7 +74,6 @@ def get_technicals(symbol_usdt):
         return {"trend": 0, "momentum": 0, "macd": 0}
 
     closes = df['Close']
-    # EMA trend (1H only)
     ema50 = closes.ewm(span=50, adjust=False).mean()
     ema200 = closes.ewm(span=200, adjust=False).mean() if len(closes) >= 200 else ema50
     current = closes.iloc[-1]
@@ -89,7 +88,6 @@ def get_technicals(symbol_usdt):
         trend -= 1.5
     trend = max(-3, min(3, trend))
 
-    # RSI momentum
     delta = closes.diff()
     gain = (delta.where(delta > 0, 0)).rolling(14).mean()
     loss = (-delta.where(delta < 0, 0)).rolling(14).mean()
@@ -106,7 +104,6 @@ def get_technicals(symbol_usdt):
     else:
         momentum = 0
 
-    # MACD
     ema12 = closes.ewm(span=12, adjust=False).mean()
     ema26 = closes.ewm(span=26, adjust=False).mean()
     macd_line = ema12 - ema26
@@ -146,18 +143,18 @@ def get_buying_pressure(symbol_usdt):
     total = buy_vol + sell_vol
     if total == 0:
         return 0.0
-    return (buy_vol - sell_vol) / total   # -1 to 1
+    return (buy_vol - sell_vol) / total
 
 # ========== LAYER 3: VOLATILITY (Yahoo) – weight 10% ==========
 def get_volatility_score(symbol_usdt, current_price):
     atr = get_1h_atr(symbol_usdt, current_price)
     atr_pct = atr / current_price * 100
     if atr_pct < 1:
-        return -1   # too quiet
+        return -1
     elif atr_pct > 8:
-        return -1   # too wild
+        return -1
     else:
-        return 1    # sweet spot
+        return 1
 
 # ========== LAYER 4: MACRO (CoinGecko + DXY) – weight 25% ==========
 def get_macro():
@@ -221,30 +218,23 @@ def sentiment_score(symbol_usdt):
         score += 1
     return max(-3, min(3, score))
 
-# ========== SCORING ENGINE (improved weights) ==========
+# ========== SCORING ENGINE ==========
 def score_coin(symbol, price, volume_24h, change1h):
-    # Technicals (15%)
     tech = get_technicals(symbol)
     tech_combined = (tech["trend"] * 0.5 + tech["momentum"] * 0.3 + tech["macd"] * 0.2) / 3
-    tech_score = tech_combined   # already -3..3
 
-    # Buying pressure (30%)
-    buying = get_buying_pressure(symbol)   # -1..1
-    buying_score = buying * 3              # scale to -3..3
+    buying = get_buying_pressure(symbol)
+    buying_score = buying * 3
 
-    # Volatility (10%)
-    vol_score = get_volatility_score(symbol, price)   # -1 or 1
+    vol_score = get_volatility_score(symbol, price)
 
-    # Macro (25%)
     macro = get_macro()
-    macro_s = macro_score(macro)   # -3..3
+    macro_s = macro_score(macro)
 
-    # Sentiment (20%)
-    sent_s = sentiment_score(symbol)   # -3..3
+    sent_s = sentiment_score(symbol)
 
-    # Weighted sum
     total = (
-        0.15 * tech_score +
+        0.15 * tech_combined +
         0.30 * buying_score +
         0.10 * vol_score +
         0.25 * macro_s +
@@ -252,7 +242,7 @@ def score_coin(symbol, price, volume_24h, change1h):
     )
 
     layers = {
-        "tech": tech_score,
+        "tech": tech_combined,
         "buying_press": buying_score,
         "volatility": vol_score,
         "macro": macro_s,
@@ -287,13 +277,12 @@ def call_groq_reasoning(symbol, entry, atr, macro, layers):
             conf = int(conf_match.group(1)) if conf_match else 6
             reason = reason_match.group(1).strip() if reason_match else "Automated signal."
             return conf, reason
-    except Exception as e:
-        print(f"Groq error: {e}")
+    except:
+        pass
     return 6, "Multi-factor model (AI unavailable)."
 
-# ========== MAIN SIGNAL GENERATION (NO 4H TREND GATE) ==========
+# ========== MAIN SIGNAL GENERATION ==========
 def generate_signal():
-    # 1. Universe screening (top 30 by CoinGecko volume)
     cg_url = "https://api.coingecko.com/api/v3/coins/markets?vs_currency=usd&order=volume_desc&per_page=100&page=1"
     coins_data = fetch_coingecko(cg_url)
     if not coins_data:
@@ -326,18 +315,7 @@ def generate_signal():
         price = coin["price"]
         volume = coin["volume"]
 
-        # 1h change (safe scalar) – only needed for ATR fallback, no longer in scoring
-        df_1h = get_yahoo_klines(sym, interval='1h', days=2)
-        change1h = 0.0   # no longer used in scoring, but we keep for potential future use
-        if not df_1h.empty and len(df_1h) >= 2:
-            closes = df_1h['Close']
-            if len(closes) >= 2:
-                prev = float(closes.iloc[-2])
-                curr = float(closes.iloc[-1])
-                if prev > 0:
-                    change1h = ((curr - prev) / prev) * 100.0
-
-        total_score, layers = score_coin(sym, price, volume, change1h)
+        total_score, layers = score_coin(sym, price, volume, 0)
         atr = get_1h_atr(sym, price)
         coin["score"] = total_score
         coin["atr"] = atr
@@ -350,7 +328,6 @@ def generate_signal():
             best_score = total_score
             best_layers = layers
 
-    # ----- HOLD with detailed layer breakdown -----
     if best is None or abs(best_score) < 1.49:
         best_sym = best["symbol"] if best else "none"
         layer_str = "; ".join([f"{k}={v:.2f}" for k,v in best_layers.items()])
@@ -358,8 +335,6 @@ def generate_signal():
         return {"action": "HOLD", "reasoning": reason}
 
     direction = "LONG" if best_score >= 0 else "SHORT"
-    # (4H trend gate removed – bot now trades purely on 1H conviction)
-
     entry = best["bid"] if direction == "LONG" else best["ask"]
     atr = best["atr"]
     min_stop = max(1.5 * atr, entry * 0.02)
@@ -368,8 +343,10 @@ def generate_signal():
     risk = abs(entry - stop)
     qty = round(10 / risk, 4)
 
+    # 5 targets: 0.4R, 0.8R, 1.2R, 1.6R, 2.0R+
+    mults = [0.4, 0.8, 1.2, 1.6, 2.0]
     tps = []
-    for mult in [0.2, 0.4, 0.8, 1.2, 1.6, 2.5]:
+    for mult in mults:
         if direction == "LONG":
             tps.append(round(entry + mult * risk, 6))
         else:
@@ -385,15 +362,9 @@ def generate_signal():
         "action": direction,
         "symbol": best["symbol"],
         "quantity": qty,
-        "order_type": "LIMIT",
         "limit_price": entry,
         "stop_loss": stop,
-        "take_profit_1": tps[0],
-        "take_profit_2": tps[1],
-        "take_profit_3": tps[2],
-        "take_profit_4": tps[3],
-        "take_profit_5": tps[4],
-        "take_profit_6": tps[5],
+        "take_profits": tps,   # list of 5 prices
         "confidence_score": conf,
         "reasoning": reason,
         "conviction_score": best_score,
@@ -419,23 +390,26 @@ def main():
             entry_price = dec.get('limit_price', 0)
             stop_price = dec.get('stop_loss', 0)
             confidence = dec.get('confidence_score', 0)
-            conviction = dec.get('conviction_score', 0)
             reasoning = dec.get('reasoning', '')
-            tps = [dec.get(f'take_profit_{i}', 0) for i in range(1,7)]
-            tp_lines = "\n".join([f"📌 ${tp:,.2f}" if tp else "📌 —" for tp in tps])
+            tps = dec.get('take_profits', [])
+
+            # Build TP lines (5 targets)
+            tp_lines = "\n".join([f"📌 ${tp:,.4f}" for tp in tps])
+
             msg = (
                 f"{symbol} ‼️\n\n"
                 f"{action} {direction_icon}\n\n"
-                f"ENTRY ⛔ LIMIT ${entry_price:,.2f}\n\n"
-                f"Stoploss 🛑 ${stop_price:,.2f}\n\n"
+                f"ENTRY ⛔ CMP — ${entry_price:,.4f}\n\n"
+                f"Stoploss 🛑 ${stop_price:,.4f}\n\n"
                 f"Targets 🎯\n"
                 f"{tp_lines}\n\n"
-                f"Conviction Score: {conviction:.2f} | Confidence: {confidence}/10\n\n"
-                f"Stoploss 🛑 at breakeven when we hit our Second Target 🎯 ‼️\n\n"
+                f"Confidence: {confidence}/10\n\n"
+                f"Stoploss 🛑 at breakeven when we hit our First Target 🎯 ‼️\n\n"
                 f"Reason: {reasoning}"
             )
         else:
             msg = f"📊 HOLD\nReason: {dec.get('reasoning', 'No signal')}"
+
         print(msg)
         send_telegram(msg)
     except Exception as e:
