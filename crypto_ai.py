@@ -351,11 +351,11 @@ def generate_signal():
             best_layers = layers
 
     # ----- HOLD with detailed layer breakdown -----
-    if best is None or abs(best_score) < 1.5:
-        best_sym = best["symbol"] if best else "none"
-        layer_str = "; ".join([f"{k}={v:.2f}" for k,v in best_layers.items()])
-        reason = f"No strong conviction. Best score: {best_score:.2f} for {best_sym}. Layers: {layer_str}"
-        return {"action": "HOLD", "reasoning": reason}
+    if best is None or abs(best_score) < 1.49:
+    best_sym = best["symbol"] if best else "none"
+    layer_str = "; ".join([f"{k}={v:.2f}" for k,v in best_layers.items()])
+    reason = f"No strong conviction. Best score: {best_score:.2f} for {best_sym}. Layers: {layer_str}"
+    return {"action": "HOLD", "reasoning": reason}
 
     direction = "LONG" if best_score >= 0 else "SHORT"
     # 4H trend gate
