@@ -343,7 +343,6 @@ def generate_signal():
     risk = abs(entry - stop)
     qty = round(10 / risk, 4)
 
-    # 5 targets: 0.4R, 0.8R, 1.2R, 1.6R, 2.0R+
     mults = [0.4, 0.8, 1.2, 1.6, 2.0]
     tps = []
     for mult in mults:
@@ -364,7 +363,7 @@ def generate_signal():
         "quantity": qty,
         "limit_price": entry,
         "stop_loss": stop,
-        "take_profits": tps,   # list of 5 prices
+        "take_profits": tps,
         "confidence_score": conf,
         "reasoning": reason,
         "conviction_score": best_score,
@@ -393,7 +392,6 @@ def main():
             reasoning = dec.get('reasoning', '')
             tps = dec.get('take_profits', [])
 
-            # Build TP lines (5 targets)
             tp_lines = "\n".join([f"📌 ${tp:,.4f}" for tp in tps])
 
             msg = (
@@ -405,7 +403,8 @@ def main():
                 f"{tp_lines}\n\n"
                 f"Confidence: {confidence}/10\n\n"
                 f"Stoploss 🛑 at breakeven when we hit our First Target 🎯 ‼️\n\n"
-                f"Reason: {reasoning}"
+                f"🧠 Why: {reasoning}\n\n"
+                f"NFA | DYOR | Manage your risk"
             )
         else:
             msg = f"📊 HOLD\nReason: {dec.get('reasoning', 'No signal')}"
