@@ -1,4 +1,4 @@
-import requests, json, os, traceback, time, re
+import requests, json, os, traceback, re
 import pandas as pd
 import numpy as np
 import yfinance as yf
@@ -56,7 +56,6 @@ def fetch_coingecko(url, retries=2):
     return {}
 
 def get_yahoo_klines(symbol_usdt, interval='1h', days=7):
-    """Return DataFrame with OHLCV data. Empty DataFrame on failure."""
     yahoo_symbol = symbol_usdt.replace("USDT", "-USD")
     end = datetime.now()
     start = end - timedelta(days=days)
@@ -64,11 +63,14 @@ def get_yahoo_klines(symbol_usdt, interval='1h', days=7):
         df = yf.download(yahoo_symbol, start=start, end=end, interval=interval, progress=False)
         if df.empty:
             return pd.DataFrame()
+        # Flatten MultiIndex columns if present
+        if isinstance(df.columns, pd.MultiIndex):
+            df.columns = df.columns.get_level_values(0)
         return df
     except:
         return pd.DataFrame()
 
-# ---------- TECHNICAL INDICATORS (fallback to neutral) ----------
+# ---------- TECHNICALS (fallbacks return neutral) ----------
 def compute_rsi(series, period=14):
     if len(series) < period + 1:
         return 50
@@ -85,7 +87,6 @@ def compute_ema(series, period):
     return series.ewm(span=period, adjust=False).mean()
 
 def get_4h_trend_from_yahoo(symbol_usdt):
-    """Return 'up', 'down', or 'neutral' using resampled 4H data from 1H yfinance."""
     df_1h = get_yahoo_klines(symbol_usdt, interval='1h', days=30)
     if df_1h.empty or len(df_1h) < 50:
         return 'neutral'
@@ -102,7 +103,6 @@ def get_4h_trend_from_yahoo(symbol_usdt):
     return 'neutral'
 
 def get_technical_scores_from_yahoo(symbol_usdt):
-    """Return trend, momentum, macd scores using 1H data. All zero if unavailable."""
     df = get_yahoo_klines(symbol_usdt, interval='1h', days=7)
     if df.empty or len(df) < 50:
         return {"trend_score": 0, "momentum_score": 0, "macd_score": 0}
@@ -121,7 +121,7 @@ def get_technical_scores_from_yahoo(symbol_usdt):
     else:
         trend_score -= 1.5
     trend_score = max(-3, min(3, trend_score))
-    # RSI momentum
+    # RSI
     rsi = compute_rsi(closes, 14)
     if rsi < 30:
         momentum_score = 2
@@ -169,7 +169,7 @@ def get_1h_atr_from_yahoo(symbol_usdt, current_price):
     atr = tr.rolling(14).mean().iloc[-1]
     return atr if not pd.isna(atr) else current_price * 0.02
 
-# ---------- MACRO & SENTIMENT ----------
+# ---------- MACRO & TRENDING ----------
 def get_macro_data():
     data = fetch_coingecko("https://api.coingecko.com/api/v3/global")
     if data:
@@ -199,19 +199,16 @@ def is_trending(symbol_usdt):
 # ---------- SCORING ----------
 def score_coin(symbol, price, volume_24h, change1h):
     score = 0.0
-
     # 1. Technicals (45%)
     tech = get_technical_scores_from_yahoo(symbol)
     tech_combined = (tech["trend_score"] * 0.5 +
                      tech["momentum_score"] * 0.3 +
                      tech["macd_score"] * 0.2) / 3
     score += 0.45 * tech_combined
-
     # 2. Volume & Momentum (15%)
     if volume_24h > 1_000_000:
         momentum = max(min(change1h, 3), -3)
         score += 0.15 * momentum
-
     # 3. Macro (35%)
     macro = get_macro_data()
     trend_4h = get_4h_trend_from_yahoo(symbol)
@@ -227,11 +224,9 @@ def score_coin(symbol, price, volume_24h, change1h):
                 score += 0.35 * (-1)
             else:
                 score += 0.35 * (-2)
-
     # 4. Trending (5%)
     if is_trending(symbol):
         score += 0.05 * 2
-
     return max(-3, min(3, score))
 
 # ---------- AI REASONING ----------
@@ -264,7 +259,7 @@ def call_groq_reasoning(symbol, entry, atr, macro):
 
 # ========== MAIN SIGNAL GENERATION ==========
 def generate_signal():
-    # 1. Get CoinGecko prices and volumes
+    # 1. CoinGecko prices & volumes
     cg_url = "https://api.coingecko.com/api/v3/coins/markets?vs_currency=usd&order=volume_desc&per_page=100&page=1"
     coins_data = fetch_coingecko(cg_url)
     if not coins_data:
@@ -284,14 +279,21 @@ def generate_signal():
         if sym not in cg_map:
             continue
         info = cg_map[sym]
-        # 1‑hour change from Yahoo
+        # 1‑hour change (safe scalar extraction)
         df_1h = get_yahoo_klines(sym, interval='1h', days=2)
-        if df_1h.empty or len(df_1h) < 2:
-            change1h = 0.0
-        else:
-            prev_close = df_1h['Close'].iloc[-2]
-            curr_close = df_1h['Close'].iloc[-1]
-            change1h = ((curr_close - prev_close) / prev_close) * 100 if prev_close > 0 else 0.0
+        change1h = 0.0
+        if not df_1h.empty and len(df_1h) >= 2:
+            close_col = df_1h['Close']
+            if len(close_col) >= 2:
+                prev = close_col.iloc[-2]
+                curr = close_col.iloc[-1]
+                # Ensure scalars
+                if isinstance(prev, (pd.Series, np.ndarray)):
+                    prev = prev.item() if hasattr(prev, 'item') else float(prev)
+                if isinstance(curr, (pd.Series, np.ndarray)):
+                    curr = curr.item() if hasattr(curr, 'item') else float(curr)
+                if prev > 0:
+                    change1h = ((curr - prev) / prev) * 100.0
         candidates.append({
             "symbol": sym,
             "price": info["price"],
@@ -320,12 +322,13 @@ def generate_signal():
             best_score = score
 
     if best is None or abs(best_score) < 1.5:
-        return {"action": "HOLD", "reasoning": f"No strong conviction. Best score: {best_score:.2f} for {best['symbol'] if best else 'none'}."}
+        best_sym = best["symbol"] if best else "none"
+        return {"action": "HOLD", "reasoning": f"No strong conviction. Best score: {best_score:.2f} for {best_sym}."}
 
     direction = "LONG" if best_score >= 0 else "SHORT"
     trend_4h = get_4h_trend_from_yahoo(best["symbol"])
     if (direction == "LONG" and trend_4h == "down") or (direction == "SHORT" and trend_4h == "up"):
-        return {"action": "HOLD", "reasoning": f"Signal {direction} contradicts 4H trend ({trend_4h}). Best score: {best_score:.2f}"}
+        return {"action": "HOLD", "reasoning": f"Signal {direction} contradicts 4H trend ({trend_4h}). Best score: {best_score:.2f} for {best['symbol']}."}
 
     entry = best["bid"] if direction == "LONG" else best["ask"]
     atr = best["atr"]
@@ -344,7 +347,7 @@ def generate_signal():
 
     conf, reason = call_groq_reasoning(best["symbol"], entry, atr, macro)
     if conf < 6:
-        return {"action": "HOLD", "reasoning": f"AI confidence too low ({conf}/10). {reason}"}
+        return {"action": "HOLD", "reasoning": f"AI confidence too low ({conf}/10). Best score: {best_score:.2f} for {best['symbol']}. {reason}"}
 
     return {
         "action": direction,
@@ -399,7 +402,8 @@ def main():
                 f"Reason: {reasoning}"
             )
         else:
-            msg = f"📊 HOLD\nReason: {dec.get('reasoning', 'No signal')}"
+            reason = dec.get('reasoning', 'No signal generated.')
+            msg = f"📊 HOLD\nReason: {reason}"
         print(msg)
         send_telegram(msg)
     except Exception as e:
