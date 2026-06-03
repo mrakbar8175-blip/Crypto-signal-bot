@@ -67,7 +67,7 @@ def get_yahoo_klines(symbol_usdt, interval='1h', days=7):
     except:
         return pd.DataFrame()
 
-# ========== LAYER 1: TECHNICALS (Yahoo 1h) ==========
+# ========== LAYER 1: TECHNICALS (Yahoo 1h) – weight 15% ==========
 def get_technicals(symbol_usdt):
     df = get_yahoo_klines(symbol_usdt, interval='1h', days=7)
     if df.empty or len(df) < 50:
@@ -135,14 +135,12 @@ def get_1h_atr(symbol_usdt, current_price):
     atr = tr.rolling(14).mean().iloc[-1]
     return atr if not pd.isna(atr) else current_price * 0.02
 
-# ========== LAYER 2: ORDER FLOW / BUYING PRESSURE (Yahoo) ==========
+# ========== LAYER 2: BUYING PRESSURE (Yahoo) – weight 30% ==========
 def get_buying_pressure(symbol_usdt):
-    """Approximate order flow with volume‑weighted price direction over the last 24 candles."""
     df = get_yahoo_klines(symbol_usdt, interval='1h', days=2)
     if df.empty or len(df) < 24:
         return 0.0
     df = df.tail(24)
-    # For each hour, if close > open, consider it buy volume; else sell volume
     buy_vol = df.loc[df['Close'] > df['Open'], 'Volume'].sum()
     sell_vol = df.loc[df['Close'] <= df['Open'], 'Volume'].sum()
     total = buy_vol + sell_vol
@@ -150,7 +148,7 @@ def get_buying_pressure(symbol_usdt):
         return 0.0
     return (buy_vol - sell_vol) / total   # -1 to 1
 
-# ========== LAYER 3: VOLATILITY (Yahoo ATR%) ==========
+# ========== LAYER 3: VOLATILITY (Yahoo) – weight 10% ==========
 def get_volatility_score(symbol_usdt, current_price):
     atr = get_1h_atr(symbol_usdt, current_price)
     atr_pct = atr / current_price * 100
@@ -161,49 +159,37 @@ def get_volatility_score(symbol_usdt, current_price):
     else:
         return 1    # sweet spot
 
-# ========== LAYER 4: MACRO (CoinGecko + DXY via Yahoo) ==========
+# ========== LAYER 4: MACRO (CoinGecko + DXY) – weight 25% ==========
 def get_macro():
-    # CoinGecko global
     cg = fetch_coingecko("https://api.coingecko.com/api/v3/global")
     btc_d = None
-    total2 = None
-    total3 = None
-    if cg:
-        total_mcap = cg["data"]["total_market_cap"]["usd"]
-        btc_d = cg["data"]["market_cap_percentage"]["btc"]
-        others = cg["data"]["market_cap_percentage"].get("others", 10)
-        total2 = total_mcap * (1 - btc_d/100)
-        total3 = total_mcap * (others/100)
-    # DXY
     dxy = None
+    if cg:
+        btc_d = cg["data"]["market_cap_percentage"]["btc"]
     try:
         df = yf.download("DX-Y.NYB", period="5d", interval="1h", progress=False)
         if not df.empty:
             val = df['Close'].iloc[-1]
-            if hasattr(val, 'item'):
-                dxy = float(val.item())
-            else:
-                dxy = float(val)
+            dxy = float(val.item()) if hasattr(val, 'item') else float(val)
     except:
         pass
-    return {"btc_d": btc_d, "total2": total2, "total3": total3, "dxy": dxy}
+    return {"btc_d": btc_d, "dxy": dxy}
 
 def macro_score(macro):
-    """Return a score from -3 to 3 based on macro conditions."""
-    if not macro["btc_d"] or macro["dxy"] is None:
+    if macro["btc_d"] is None or macro["dxy"] is None:
         return 0
     score = 0
     if macro["btc_d"] < 55:
-        score += 2   # alt season
+        score += 2
     elif macro["btc_d"] > 60:
-        score -= 1   # BTC heavy
+        score -= 1
     if macro["dxy"] < 100:
-        score += 1   # risk‑on
+        score += 1
     else:
         score -= 1
     return max(-3, min(3, score))
 
-# ========== LAYER 5: SENTIMENT (Fear & Greed + CoinGecko Trending) ==========
+# ========== LAYER 5: SENTIMENT (Fear & Greed + Trending) – weight 20% ==========
 def get_fear_greed():
     try:
         r = requests.get("https://api.alternative.me/fng/?limit=1", timeout=5)
@@ -227,7 +213,6 @@ def sentiment_score(symbol_usdt):
     fg_value, _ = get_fear_greed()
     trending = is_trending(symbol_usdt)
     score = 0
-    # Fear & Greed: <30 fear (contrarian long), >70 greed (contrarian short)
     if fg_value < 30:
         score += 2
     elif fg_value > 70:
@@ -236,66 +221,42 @@ def sentiment_score(symbol_usdt):
         score += 1
     return max(-3, min(3, score))
 
-# ========== LAYER 6: VOLUME / MOMENTUM ==========
-def volume_momentum_score(volume_24h, change1h):
-    score = 0
-    if volume_24h > 1_000_000:
-        # change1h capped at ±3
-        momentum = max(min(change1h, 3), -3)
-        score = momentum
-    return max(-3, min(3, score))
-
-# ========== LAYER 7: ON‑CHAIN PROXY ==========
-# We don't have on‑chain, so we use a composite of volatility + trending
-def onchain_proxy_score(symbol_usdt, current_price):
-    # ATR% already computed, but we can reuse volatility_score
-    vol_score = get_volatility_score(symbol_usdt, current_price)
-    trending = is_trending(symbol_usdt)
-    return (vol_score + (1 if trending else 0)) / 2
-
-# ========== SCORING ENGINE ==========
+# ========== SCORING ENGINE (improved weights) ==========
 def score_coin(symbol, price, volume_24h, change1h):
+    # Technicals (15%)
     tech = get_technicals(symbol)
     tech_combined = (tech["trend"] * 0.5 + tech["momentum"] * 0.3 + tech["macd"] * 0.2) / 3
+    tech_score = tech_combined   # already -3..3
 
-    buying = get_buying_pressure(symbol)
-    vol_mom = volume_momentum_score(volume_24h, change1h)
-    vol_score = get_volatility_score(symbol, price)
+    # Buying pressure (30%)
+    buying = get_buying_pressure(symbol)   # -1..1
+    buying_score = buying * 3              # scale to -3..3
+
+    # Volatility (10%)
+    vol_score = get_volatility_score(symbol, price)   # -1 or 1
+
+    # Macro (25%)
     macro = get_macro()
-    macro_s = macro_score(macro)
-    sent_s = sentiment_score(symbol)
-    onchain_s = onchain_proxy_score(symbol, price)
+    macro_s = macro_score(macro)   # -3..3
 
-    # Weights (sum to 1.0)
+    # Sentiment (20%)
+    sent_s = sentiment_score(symbol)   # -3..3
+
+    # Weighted sum
     total = (
-        0.20 * tech_combined +
-        0.15 * buying * 3 +
-        0.10 * vol_mom +
+        0.15 * tech_score +
+        0.30 * buying_score +
         0.10 * vol_score +
-        0.20 * macro_s / 3 * 3 +   # scale macro_s to -3..3 (already is)
-        0.10 * sent_s / 3 * 3 +
-        0.05 * onchain_s * 3 +
-        0.10 * (0.0)  # reserved
-    )
-    # Actually, we need to ensure all components are -3..3 scale. Adjust:
-    total = (
-        0.20 * tech_combined +
-        0.15 * max(min(buying * 3, 3), -3) +
-        0.10 * vol_mom +
-        0.10 * vol_score +
-        0.20 * macro_s +
-        0.10 * sent_s +
-        0.05 * onchain_s * 3
+        0.25 * macro_s +
+        0.20 * sent_s
     )
 
     layers = {
-        "tech": tech_combined,
-        "buying_press": buying * 3,
-        "vol_mom": vol_mom,
+        "tech": tech_score,
+        "buying_press": buying_score,
         "volatility": vol_score,
         "macro": macro_s,
         "sentiment": sent_s,
-        "onchain_proxy": onchain_s * 3,
     }
     return max(-3, min(3, total)), layers
 
@@ -365,9 +326,9 @@ def generate_signal():
         price = coin["price"]
         volume = coin["volume"]
 
-        # 1h change (safe scalar)
+        # 1h change (safe scalar) – only needed for ATR fallback, no longer in scoring
         df_1h = get_yahoo_klines(sym, interval='1h', days=2)
-        change1h = 0.0
+        change1h = 0.0   # no longer used in scoring, but we keep for potential future use
         if not df_1h.empty and len(df_1h) >= 2:
             closes = df_1h['Close']
             if len(closes) >= 2:
