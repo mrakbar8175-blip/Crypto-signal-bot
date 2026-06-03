@@ -74,7 +74,7 @@ def get_technicals(symbol_usdt):
         return {"trend": 0, "momentum": 0, "macd": 0}
 
     closes = df['Close']
-    # EMA trend
+    # EMA trend (1H only)
     ema50 = closes.ewm(span=50, adjust=False).mean()
     ema200 = closes.ewm(span=200, adjust=False).mean() if len(closes) >= 200 else ema50
     current = closes.iloc[-1]
@@ -291,7 +291,7 @@ def call_groq_reasoning(symbol, entry, atr, macro, layers):
         print(f"Groq error: {e}")
     return 6, "Multi-factor model (AI unavailable)."
 
-# ========== MAIN SIGNAL GENERATION ==========
+# ========== MAIN SIGNAL GENERATION (NO 4H TREND GATE) ==========
 def generate_signal():
     # 1. Universe screening (top 30 by CoinGecko volume)
     cg_url = "https://api.coingecko.com/api/v3/coins/markets?vs_currency=usd&order=volume_desc&per_page=100&page=1"
@@ -351,7 +351,6 @@ def generate_signal():
             best_layers = layers
 
     # ----- HOLD with detailed layer breakdown -----
-    # Threshold lowered to 1.49 so that 1.50 (displayed) definitely passes
     if best is None or abs(best_score) < 1.49:
         best_sym = best["symbol"] if best else "none"
         layer_str = "; ".join([f"{k}={v:.2f}" for k,v in best_layers.items()])
@@ -359,23 +358,7 @@ def generate_signal():
         return {"action": "HOLD", "reasoning": reason}
 
     direction = "LONG" if best_score >= 0 else "SHORT"
-    # 4H trend gate
-    trend_4h = 'neutral'
-    df_4h = get_yahoo_klines(best["symbol"], interval='1h', days=30)
-    if not df_4h.empty and len(df_4h) >= 50:
-        df_4h_res = df_4h.resample('4h').agg({'Open':'first','High':'max','Low':'min','Close':'last','Volume':'sum'}).dropna()
-        if len(df_4h_res) >= 50:
-            closes_4h = df_4h_res['Close']
-            ema50 = closes_4h.ewm(50).mean()
-            ema200 = closes_4h.ewm(200).mean() if len(closes_4h)>=200 else ema50
-            if ema50.iloc[-1] > ema200.iloc[-1]:
-                trend_4h = 'up'
-            else:
-                trend_4h = 'down'
-    if (direction == "LONG" and trend_4h == "down") or (direction == "SHORT" and trend_4h == "up"):
-        layer_str = "; ".join([f"{k}={v:.2f}" for k,v in best_layers.items()])
-        reason = f"Signal {direction} contradicts 4H trend ({trend_4h}). Best score: {best_score:.2f}. Layers: {layer_str}"
-        return {"action": "HOLD", "reasoning": reason}
+    # (4H trend gate removed – bot now trades purely on 1H conviction)
 
     entry = best["bid"] if direction == "LONG" else best["ask"]
     atr = best["atr"]
