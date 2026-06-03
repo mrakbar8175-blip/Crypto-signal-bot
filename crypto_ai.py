@@ -17,6 +17,31 @@ portfolio = {
     "daily_loss_limit": -20
 }
 
+# ========== STATIC 99‑COIN LIST (no BTC, ETH, LINK, LTC, MATIC, XRP) ==========
+COIN_LIST = [
+    "SOLUSDT", "DOGEUSDT", "AVAXUSDT", "DOTUSDT",
+    "UNIUSDT", "NEARUSDT", "ATOMUSDT", "ETCUSDT",
+    "STXUSDT", "FILUSDT", "APTUSDT", "ARBUSDT", "OPUSDT",
+    "INJUSDT", "TIAUSDT", "SEIUSDT", "SUIUSDT", "RUNEUSDT",
+    "GRTUSDT", "AAVEUSDT", "ALGOUSDT", "SANDUSDT", "MANAUSDT",
+    "THETAUSDT", "FTMUSDT", "EOSUSDT", "MKRUSDT", "LDOUSDT",
+    "IMXUSDT", "FLOWUSDT", "XTZUSDT", "NEOUSDT", "KSMUSDT",
+    "ZECUSDT", "DASHUSDT", "EGLDUSDT", "MINAUSDT", "GALAUSDT",
+    "HNTUSDT", "CFXUSDT", "ARUSDT", "FETUSDT", "AGIXUSDT",
+    "OCEANUSDT", "1INCHUSDT", "CRVUSDT",
+    "AXSUSDT", "CHZUSDT", "ENJUSDT", "BATUSDT", "SNXUSDT",
+    "COMPUSDT", "YFIUSDT", "SUSHIUSDT", "ZRXUSDT", "RENUSDT",
+    "CELOUSDT", "LRCUSDT", "ANKRUSDT", "STORJUSDT", "COTIUSDT",
+    "KAVAUSDT", "ICXUSDT", "ONTUSDT", "ZILUSDT", "WAVESUSDT",
+    "QTUMUSDT", "OMGUSDT", "BANDUSDT", "DENTUSDT", "HOTUSDT",
+    "IOSTUSDT", "RVNUSDT", "SCUSDT", "ZENUSDT", "CKBUSDT",
+    "SKLUSDT", "CTSIUSDT", "CTKUSDT", "LINAUSDT", "TRBUSDT",
+    "BALUSDT", "PERPUSDT", "BNTUSDT", "RSRUSDT", "TOMOUSDT",
+    "DGBUSDT", "DUSKUSDT", "REEFUSDT", "ALPHAUSDT", "FORTHUSDT",
+    "POLSUSDT", "C98USDT", "RAREUSDT", "ATAUSDT", "IDEXUSDT",
+    "MLNUSDT",
+]
+
 # ========== DATA HELPERS ==========
 def fetch_binance(endpoint):
     try:
@@ -253,17 +278,6 @@ def score_coin(symbol, bid, ask, vol, change1h):
             else:
                 score += 0.20 * (-2)
 
-    try:
-        trending = fetch_coingecko("https://api.coingecko.com/api/v3/search/trending")
-        if trending:
-            coin_id = symbol.lower()
-            for item in trending.get("coins", []):
-                if item["item"]["symbol"].upper() == symbol:
-                    score += 0.05 * 2
-                    break
-    except:
-        pass
-
     return max(-3, min(3, score))
 
 # ---------- AI REASONING ----------
@@ -296,38 +310,22 @@ def call_groq_reasoning(symbol, entry, atr, macro):
 
 # ========== MAIN SIGNAL GENERATION ==========
 def generate_signal():
-    # Fetch top 100 from CoinGecko
-    url = "https://api.coingecko.com/api/v3/coins/markets?vs_currency=usd&order=volume_desc&per_page=100&page=1"
-    coins_data = fetch_coingecko(url)
-    if not coins_data:
-        return {"action": "HOLD", "reasoning": "CoinGecko API unavailable."}
-
-    # Excluded symbols (stablecoins, wrapped, and your specified ones)
-    excluded_symbols = {"usdt", "usdc", "busd", "dai", "wbtc", "weth", "steth", "btcb", "wbnb",
-                        "btc", "eth", "link", "ltc", "matic"}
-
     candidates = []
-    for coin in coins_data:
-        symbol = coin.get("symbol", "").upper()
-        if symbol in excluded_symbols or len(symbol) > 10:
-            continue
-        binance_symbol = symbol + "USDT"
-        price = get_binance_last_price(binance_symbol)
+    for sym in COIN_LIST:
+        price = get_binance_last_price(sym)
         if price <= 0:
             continue
-        vol = coin.get("total_volume", 0)
-        change1h = get_1h_change(binance_symbol)
+        vol = 1_000_000   # assume liquid; Binance 24h volume could be added but optional
+        change1h = get_1h_change(sym)
         candidates.append({
-            "symbol": binance_symbol,
+            "symbol": sym,
             "price": price,
             "volume": vol,
             "change1h": change1h
         })
-        if len(candidates) >= 50:
-            break
 
     if not candidates:
-        return {"action": "HOLD", "reasoning": "No liquid perp markets found."}
+        return {"action": "HOLD", "reasoning": "No coins with valid prices found."}
 
     macro = get_macro_data()
     best = None
