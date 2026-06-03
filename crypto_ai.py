@@ -17,27 +17,6 @@ portfolio = {
     "daily_loss_limit": -20
 }
 
-# ========== COIN MAPPING ==========
-COIN_MAP = {
-    "binancecoin": "BNBUSDT", "ripple": "XRPUSDT", "cardano": "ADAUSDT",
-    "solana": "SOLUSDT", "dogecoin": "DOGEUSDT", "polkadot": "DOTUSDT",
-    "uniswap": "UNIUSDT", "avalanche-2": "AVAXUSDT", "near": "NEARUSDT",
-    "cosmos": "ATOMUSDT", "ethereum-classic": "ETCUSDT", "stellar": "XLMUSDT",
-    "vechain": "VETUSDT", "filecoin": "FILUSDT", "aptos": "APTUSDT",
-    "arbitrum": "ARBUSDT", "optimism": "OPUSDT", "injective-protocol": "INJUSDT",
-    "celestia": "TIAUSDT", "sei-network": "SEIUSDT", "sui": "SUIUSDT",
-    "thorchain": "RUNEUSDT", "the-graph": "GRTUSDT", "aave": "AAVEUSDT",
-    "algorand": "ALGOUSDT", "the-sandbox": "SANDUSDT", "decentraland": "MANAUSDT",
-    "theta-token": "THETAUSDT", "fantom": "FTMUSDT", "eos": "EOSUSDT",
-    "maker": "MKRUSDT", "lido-dao": "LDOUSDT", "immutable-x": "IMXUSDT",
-    "flow": "FLOWUSDT", "tezos": "XTZUSDT", "neo": "NEOUSDT",
-    "kusama": "KSMUSDT", "zcash": "ZECUSDT", "dash": "DASHUSDT",
-    "elrond-erd-2": "EGLDUSDT", "mina-protocol": "MINAUSDT", "gala": "GALAUSDT",
-    "helium": "HNTUSDT", "conflux-token": "CFXUSDT", "arweave": "ARUSDT",
-    "fetch-ai": "FETUSDT", "singularitynet": "AGIXUSDT", "ocean-protocol": "OCEANUSDT",
-    "1inch": "1INCHUSDT", "curve-dao-token": "CRVUSDT",
-}
-
 # ========== DATA HELPERS ==========
 def fetch_binance(endpoint):
     try:
@@ -222,9 +201,8 @@ def get_macro_data():
         return {"total2": total2, "total3": total3, "btc_d": btc_d, "usdt_d": usdt_d}
     return None
 
-# ---------- 1‑HOUR CHANGE HELPER ----------
+# ---------- 1‑HOUR CHANGE ----------
 def get_1h_change(symbol):
-    """Return percent change over the last hour using 1‑H klines."""
     df = get_klines_df(symbol, '1h', limit=2)
     if df.empty or len(df) < 2:
         return 0.0
@@ -238,33 +216,28 @@ def get_1h_change(symbol):
 def score_coin(symbol, bid, ask, vol, change1h):
     score = 0.0
 
-    # 1. Technicals (30%)
     tech = get_technical_scores(symbol)
     tech_combined = (tech["trend_score"] * 0.5 +
                      tech["momentum_score"] * 0.3 +
                      tech["macd_score"] * 0.2) / 3
     score += 0.30 * tech_combined
 
-    # 2. Order flow (15%)
     imbalance = get_imbalance(symbol, bid)
     if abs(imbalance) > 0.5:
         score += 0.15 * (imbalance * 3)
     elif abs(imbalance) > 0.2:
         score += 0.15 * (imbalance * 3) * 0.5
 
-    # 3. Volume/momentum (10%) – now uses 1‑hour change
     if vol > 1_000_000:
-        momentum = max(min(change1h, 3), -3)      # 1‑h change capped at ±3
+        momentum = max(min(change1h, 3), -3)
         score += 0.10 * momentum
 
-    # 4. Funding (10%)
     funding = get_funding(symbol)
     if abs(funding) < 0.05:
         score += 0.10 * 2
     elif abs(funding) < 0.1:
         score += 0.10 * 1
 
-    # 5. Macro (20%) – aligned with 4H trend
     macro = get_macro_data()
     trend_4h = get_4h_trend(symbol)
     if macro and trend_4h != 'neutral':
@@ -274,19 +247,18 @@ def score_coin(symbol, bid, ask, vol, change1h):
                 score += 0.20 * 2
             elif btc_d < 60:
                 score += 0.20 * 1
-        else:   # trend_4h == 'down'
+        else:
             if btc_d > 55:
                 score += 0.20 * (-1)
             else:
                 score += 0.20 * (-2)
 
-    # 6. Trending (5%)
     try:
         trending = fetch_coingecko("https://api.coingecko.com/api/v3/search/trending")
         if trending:
-            coin_id = [k for k, v in COIN_MAP.items() if v == symbol][0]
+            coin_id = symbol.lower()
             for item in trending.get("coins", []):
-                if item["item"]["id"] == coin_id:
+                if item["item"]["symbol"].upper() == symbol:
                     score += 0.05 * 2
                     break
     except:
@@ -324,35 +296,38 @@ def call_groq_reasoning(symbol, entry, atr, macro):
 
 # ========== MAIN SIGNAL GENERATION ==========
 def generate_signal():
+    # Fetch top 100 from CoinGecko
     url = "https://api.coingecko.com/api/v3/coins/markets?vs_currency=usd&order=volume_desc&per_page=100&page=1"
     coins_data = fetch_coingecko(url)
     if not coins_data:
         return {"action": "HOLD", "reasoning": "CoinGecko API unavailable."}
 
-    excluded_ids = {"bitcoin", "ethereum", "chainlink", "litecoin", "matic-network"}
+    # Excluded symbols (stablecoins, wrapped, and your specified ones)
+    excluded_symbols = {"usdt", "usdc", "busd", "dai", "wbtc", "weth", "steth", "btcb", "wbnb",
+                        "btc", "eth", "link", "ltc", "matic"}
+
     candidates = []
     for coin in coins_data:
-        if coin["id"] in excluded_ids or coin["id"] not in COIN_MAP:
+        symbol = coin.get("symbol", "").upper()
+        if symbol in excluded_symbols or len(symbol) > 10:
             continue
-        sym = COIN_MAP[coin["id"]]
-        price = coin.get("current_price", 0)
-        volume = coin.get("total_volume", 0)
-        if price == 0:
-            price = get_binance_last_price(sym)
-        # Get 1‑hour change for this coin
-        change1h = get_1h_change(sym)
-        if price > 0 and volume > 0:
-            candidates.append({
-                "symbol": sym,
-                "price": price,
-                "volume": volume,
-                "change1h": change1h
-            })
-    candidates.sort(key=lambda x: x["volume"], reverse=True)
-    candidates = candidates[:30]
+        binance_symbol = symbol + "USDT"
+        price = get_binance_last_price(binance_symbol)
+        if price <= 0:
+            continue
+        vol = coin.get("total_volume", 0)
+        change1h = get_1h_change(binance_symbol)
+        candidates.append({
+            "symbol": binance_symbol,
+            "price": price,
+            "volume": vol,
+            "change1h": change1h
+        })
+        if len(candidates) >= 50:
+            break
 
     if not candidates:
-        return {"action": "HOLD", "reasoning": "No liquid altcoins found."}
+        return {"action": "HOLD", "reasoning": "No liquid perp markets found."}
 
     macro = get_macro_data()
     best = None
@@ -371,13 +346,11 @@ def generate_signal():
             best = coin
             best_score = score
 
-    # Conviction threshold ≥ 1.5
     if best is None or abs(best_score) < 1.5:
         return {"action": "HOLD", "reasoning": f"No strong conviction. Best score: {best_score:.2f} for {best['symbol'] if best else 'none'}."}
 
     direction = "LONG" if best_score >= 0 else "SHORT"
 
-    # 4H trend filter
     trend_4h = get_4h_trend(best["symbol"])
     if (direction == "LONG" and trend_4h == "down") or (direction == "SHORT" and trend_4h == "up"):
         return {"action": "HOLD", "reasoning": f"Signal {direction} contradicts 4H trend ({trend_4h}). Best score: {best_score:.2f}"}
