@@ -235,9 +235,15 @@ def get_macro_data():
 def get_dxy():
     try:
         df = yf.download("DX-Y.NYB", period="5d", interval="1h", progress=False)
-        if not df.empty:
-            return df['Close'].iloc[-1], "OK"
-        return None, "no data"
+        if df.empty:
+            return None, "no data"
+        # Force scalar: take the last Close value and convert to float
+        last_close = df['Close'].iloc[-1]
+        if hasattr(last_close, 'item'):
+            dxy_value = float(last_close.item())
+        else:
+            dxy_value = float(last_close)
+        return dxy_value, "OK"
     except Exception as e:
         return None, f"error: {e}"
 
