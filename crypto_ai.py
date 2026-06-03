@@ -1,6 +1,8 @@
 import requests, json, os, traceback, time, re
 import pandas as pd
 import numpy as np
+import yfinance as yf
+from datetime import datetime, timedelta
 
 # ========== ENVIRONMENT ==========
 TELEGRAM_TOKEN = os.environ["TELEGRAM_TOKEN"]
@@ -43,42 +45,33 @@ COIN_LIST = [
 ]
 
 # ========== DATA HELPERS ==========
-def fetch_binance(endpoint):
+def fetch_coingecko(url, retries=2):
+    for _ in range(retries):
+        try:
+            r = requests.get(url, timeout=15)
+            if r.status_code == 200:
+                return r.json()
+        except:
+            pass
+    return {}
+
+def get_yahoo_klines(symbol_usdt, interval='1h', days=7):
+    """Return DataFrame with OHLCV data. Empty DataFrame on failure."""
+    yahoo_symbol = symbol_usdt.replace("USDT", "-USD")
+    end = datetime.now()
+    start = end - timedelta(days=days)
     try:
-        r = requests.get("https://fapi.binance.com" + endpoint, timeout=10)
-        return r.json()
+        df = yf.download(yahoo_symbol, start=start, end=end, interval=interval, progress=False)
+        if df.empty:
+            return pd.DataFrame()
+        return df
     except:
-        return {}
-
-def fetch_coingecko(url):
-    try:
-        r = requests.get(url, timeout=15)
-        return r.json() if r.status_code == 200 else {}
-    except:
-        return {}
-
-def get_binance_last_price(symbol):
-    ticker = fetch_binance(f"/fapi/v1/ticker/price?symbol={symbol}")
-    if "price" in ticker:
-        return float(ticker["price"])
-    return 0
-
-# ---------- TECHNICAL INDICATORS ----------
-def get_klines_df(symbol, interval, limit=100):
-    endpoint = f"/fapi/v1/klines?symbol={symbol}&interval={interval}&limit={limit}"
-    data = fetch_binance(endpoint)
-    if not data or "error" in data:
         return pd.DataFrame()
-    df = pd.DataFrame(data, columns=['open_time', 'open', 'high', 'low', 'close', 'volume',
-                                     'close_time', 'quote_vol', 'trades', 'taker_buy_base',
-                                     'taker_buy_quote', 'ignore'])
-    df['close'] = df['close'].astype(float)
-    df['high'] = df['high'].astype(float)
-    df['low'] = df['low'].astype(float)
-    df['volume'] = df['volume'].astype(float)
-    return df
 
+# ---------- TECHNICAL INDICATORS (fallback to neutral) ----------
 def compute_rsi(series, period=14):
+    if len(series) < period + 1:
+        return 50
     delta = series.diff()
     gain = (delta.where(delta > 0, 0)).rolling(period).mean()
     loss = (-delta.where(delta < 0, 0)).rolling(period).mean()
@@ -87,196 +80,157 @@ def compute_rsi(series, period=14):
     return rsi.iloc[-1] if not rsi.empty else 50
 
 def compute_ema(series, period):
+    if len(series) < period:
+        return series.iloc[-1] if len(series) > 0 else 0
     return series.ewm(span=period, adjust=False).mean()
 
-def get_4h_trend(symbol):
-    df = get_klines_df(symbol, '4h', limit=200)
-    if df.empty or len(df) < 200:
+def get_4h_trend_from_yahoo(symbol_usdt):
+    """Return 'up', 'down', or 'neutral' using resampled 4H data from 1H yfinance."""
+    df_1h = get_yahoo_klines(symbol_usdt, interval='1h', days=30)
+    if df_1h.empty or len(df_1h) < 50:
         return 'neutral'
-    closes = df['close']
+    df_4h = df_1h.resample('4H').agg({'Open':'first','High':'max','Low':'min','Close':'last','Volume':'sum'}).dropna()
+    if len(df_4h) < 50:
+        return 'neutral'
+    closes = df_4h['Close']
     ema50 = compute_ema(closes, 50)
-    ema200 = compute_ema(closes, 200)
+    ema200 = compute_ema(closes, 200) if len(closes) >= 200 else ema50
     if ema50.iloc[-1] > ema200.iloc[-1]:
         return 'up'
     elif ema50.iloc[-1] < ema200.iloc[-1]:
         return 'down'
     return 'neutral'
 
-def get_technical_scores(symbol):
-    df_1h = get_klines_df(symbol, '1h', limit=100)
-    df_15m = get_klines_df(symbol, '15m', limit=100)
-
+def get_technical_scores_from_yahoo(symbol_usdt):
+    """Return trend, momentum, macd scores using 1H data. All zero if unavailable."""
+    df = get_yahoo_klines(symbol_usdt, interval='1h', days=7)
+    if df.empty or len(df) < 50:
+        return {"trend_score": 0, "momentum_score": 0, "macd_score": 0}
+    closes = df['Close']
+    # EMA trend
+    ema50 = compute_ema(closes, 50) if len(closes) >= 50 else closes.iloc[-1]
+    ema200 = compute_ema(closes, 200) if len(closes) >= 200 else ema50
+    current = closes.iloc[-1]
     trend_score = 0
-    momentum_score = 0
-    macd_score = 0
-
-    if not df_1h.empty and len(df_1h) >= 50:
-        closes_1h = df_1h['close']
-        ema50_1h = compute_ema(closes_1h, 50)
-        ema200_1h = compute_ema(closes_1h, 200) if len(closes_1h) >= 200 else ema50_1h
-
-        current_price = closes_1h.iloc[-1]
-        if current_price > ema50_1h.iloc[-1]:
-            trend_score += 1.5
-        else:
-            trend_score -= 1.5
-        if ema50_1h.iloc[-1] > ema200_1h.iloc[-1]:
-            trend_score += 1.5
-        else:
-            trend_score -= 1.5
-        trend_score = max(-3, min(3, trend_score))
-
-        rsi_1h = compute_rsi(closes_1h, 14)
-        if rsi_1h < 30:
-            momentum_score = 2
-        elif rsi_1h > 70:
-            momentum_score = -2
-        elif rsi_1h > 60:
-            momentum_score = 1
-        elif rsi_1h < 40:
-            momentum_score = -1
-        else:
-            momentum_score = 0
-
-        ema12 = compute_ema(closes_1h, 12)
-        ema26 = compute_ema(closes_1h, 26)
-        macd_line = ema12 - ema26
-        signal_line = compute_ema(macd_line, 9)
-        histogram = macd_line - signal_line
-        if len(histogram) > 2:
-            hist_now = histogram.iloc[-1]
-            hist_prev = histogram.iloc[-2]
-            if hist_now > 0 and hist_prev <= 0:
-                macd_score = 2
-            elif hist_now < 0 and hist_prev >= 0:
-                macd_score = -2
-            elif hist_now > 0:
-                macd_score = 1
-            elif hist_now < 0:
-                macd_score = -1
+    if current > ema50.iloc[-1]:
+        trend_score += 1.5
     else:
-        if not df_15m.empty and len(df_15m) >= 50:
-            closes_15m = df_15m['close']
-            ema50_15m = compute_ema(closes_15m, 50)
-            current_price = closes_15m.iloc[-1]
-            if current_price > ema50_15m.iloc[-1]:
-                trend_score = 1
-            else:
-                trend_score = -1
-            rsi_15m = compute_rsi(closes_15m, 14)
-            if rsi_15m < 30:
-                momentum_score = 2
-            elif rsi_15m > 70:
-                momentum_score = -2
-            else:
-                momentum_score = 0
+        trend_score -= 1.5
+    if ema50.iloc[-1] > ema200.iloc[-1]:
+        trend_score += 1.5
+    else:
+        trend_score -= 1.5
+    trend_score = max(-3, min(3, trend_score))
+    # RSI momentum
+    rsi = compute_rsi(closes, 14)
+    if rsi < 30:
+        momentum_score = 2
+    elif rsi > 70:
+        momentum_score = -2
+    elif rsi > 60:
+        momentum_score = 1
+    elif rsi < 40:
+        momentum_score = -1
+    else:
+        momentum_score = 0
+    # MACD
+    ema12 = compute_ema(closes, 12)
+    ema26 = compute_ema(closes, 26)
+    macd_line = ema12 - ema26
+    signal_line = compute_ema(macd_line, 9)
+    histogram = macd_line - signal_line
+    if len(histogram) >= 2:
+        hist_now = histogram.iloc[-1]
+        hist_prev = histogram.iloc[-2]
+        if hist_now > 0 and hist_prev <= 0:
+            macd_score = 2
+        elif hist_now < 0 and hist_prev >= 0:
+            macd_score = -2
+        elif hist_now > 0:
+            macd_score = 1
+        elif hist_now < 0:
+            macd_score = -1
+        else:
+            macd_score = 0
+    else:
+        macd_score = 0
+    return {"trend_score": trend_score, "momentum_score": momentum_score, "macd_score": macd_score}
 
-    return {
-        "trend_score": trend_score,
-        "momentum_score": momentum_score,
-        "macd_score": macd_score
-    }
+def get_1h_atr_from_yahoo(symbol_usdt, current_price):
+    df = get_yahoo_klines(symbol_usdt, interval='1h', days=7)
+    if df.empty or len(df) < 14:
+        return current_price * 0.02
+    high = df['High']
+    low = df['Low']
+    close = df['Close']
+    tr = pd.concat([high - low,
+                    (high - close.shift()).abs(),
+                    (low - close.shift()).abs()], axis=1).max(axis=1)
+    atr = tr.rolling(14).mean().iloc[-1]
+    return atr if not pd.isna(atr) else current_price * 0.02
 
-# ---------- ATR (1h) ----------
-def get_1h_atr(symbol, current_price):
-    df = get_klines_df(symbol, '1h', limit=50)
-    if not df.empty and len(df) >= 14:
-        high = df['high']
-        low = df['low']
-        close = df['close']
-        tr = pd.concat([high - low,
-                        (high - close.shift()).abs(),
-                        (low - close.shift()).abs()], axis=1).max(axis=1)
-        atr = tr.rolling(14).mean().iloc[-1]
-        if not pd.isna(atr):
-            return atr
-    return current_price * 0.02
-
-# ---------- ORDER BOOK IMBALANCE ----------
-def get_imbalance(symbol, fallback_price):
-    depth = fetch_binance(f"/fapi/v1/depth?symbol={symbol}&limit=10")
-    if "bids" in depth and "asks" in depth:
-        bids = depth["bids"]
-        asks = depth["asks"]
-        bid_vol = sum(float(b[1]) for b in bids[:10])
-        ask_vol = sum(float(a[1]) for a in asks[:10])
-        total = bid_vol + ask_vol
-        if total:
-            return (bid_vol - ask_vol) / total
-    return 0.0
-
-# ---------- FUNDING ----------
-def get_funding(symbol):
-    data = fetch_binance(f"/fapi/v1/premiumIndex?symbol={symbol}")
-    if "lastFundingRate" in data:
-        return float(data["lastFundingRate"]) * 100
-    return 0.01
-
-# ---------- MACRO ----------
+# ---------- MACRO & SENTIMENT ----------
 def get_macro_data():
     data = fetch_coingecko("https://api.coingecko.com/api/v3/global")
     if data:
         total_mcap = data["data"]["total_market_cap"]["usd"]
         btc_mcap = data["data"]["market_cap_percentage"]["btc"]
         others = data["data"]["market_cap_percentage"].get("others", 10)
-        total2 = total_mcap * (1 - btc_mcap/100)
-        total3 = total_mcap * (others/100)
-        btc_d = btc_mcap
-        usdt_d = data["data"]["market_cap_percentage"].get("usdt", 3)
-        return {"total2": total2, "total3": total3, "btc_d": btc_d, "usdt_d": usdt_d}
+        return {
+            "total2": total_mcap * (1 - btc_mcap/100),
+            "total3": total_mcap * (others/100),
+            "btc_d": btc_mcap,
+            "usdt_d": data["data"]["market_cap_percentage"].get("usdt", 3)
+        }
     return None
 
-# ---------- 1‑HOUR CHANGE ----------
-def get_1h_change(symbol):
-    df = get_klines_df(symbol, '1h', limit=2)
-    if df.empty or len(df) < 2:
-        return 0.0
-    prev_close = df['close'].iloc[-2]
-    current_close = df['close'].iloc[-1]
-    if prev_close == 0:
-        return 0.0
-    return ((current_close - prev_close) / prev_close) * 100.0
+def is_trending(symbol_usdt):
+    try:
+        trending = fetch_coingecko("https://api.coingecko.com/api/v3/search/trending")
+        if trending:
+            base = symbol_usdt.replace("USDT", "")
+            for item in trending.get("coins", []):
+                if item["item"]["symbol"].upper() == base.upper():
+                    return True
+    except:
+        pass
+    return False
 
 # ---------- SCORING ----------
-def score_coin(symbol, bid, ask, vol, change1h):
+def score_coin(symbol, price, volume_24h, change1h):
     score = 0.0
 
-    tech = get_technical_scores(symbol)
+    # 1. Technicals (45%)
+    tech = get_technical_scores_from_yahoo(symbol)
     tech_combined = (tech["trend_score"] * 0.5 +
                      tech["momentum_score"] * 0.3 +
                      tech["macd_score"] * 0.2) / 3
-    score += 0.30 * tech_combined
+    score += 0.45 * tech_combined
 
-    imbalance = get_imbalance(symbol, bid)
-    if abs(imbalance) > 0.5:
-        score += 0.15 * (imbalance * 3)
-    elif abs(imbalance) > 0.2:
-        score += 0.15 * (imbalance * 3) * 0.5
-
-    if vol > 1_000_000:
+    # 2. Volume & Momentum (15%)
+    if volume_24h > 1_000_000:
         momentum = max(min(change1h, 3), -3)
-        score += 0.10 * momentum
+        score += 0.15 * momentum
 
-    funding = get_funding(symbol)
-    if abs(funding) < 0.05:
-        score += 0.10 * 2
-    elif abs(funding) < 0.1:
-        score += 0.10 * 1
-
+    # 3. Macro (35%)
     macro = get_macro_data()
-    trend_4h = get_4h_trend(symbol)
+    trend_4h = get_4h_trend_from_yahoo(symbol)
     if macro and trend_4h != 'neutral':
         btc_d = macro["btc_d"]
         if trend_4h == 'up':
             if btc_d < 55:
-                score += 0.20 * 2
+                score += 0.35 * 2
             elif btc_d < 60:
-                score += 0.20 * 1
-        else:
+                score += 0.35 * 1
+        else:  # down
             if btc_d > 55:
-                score += 0.20 * (-1)
+                score += 0.35 * (-1)
             else:
-                score += 0.20 * (-2)
+                score += 0.35 * (-2)
+
+    # 4. Trending (5%)
+    if is_trending(symbol):
+        score += 0.05 * 2
 
     return max(-3, min(3, score))
 
@@ -310,22 +264,43 @@ def call_groq_reasoning(symbol, entry, atr, macro):
 
 # ========== MAIN SIGNAL GENERATION ==========
 def generate_signal():
+    # 1. Get CoinGecko prices and volumes
+    cg_url = "https://api.coingecko.com/api/v3/coins/markets?vs_currency=usd&order=volume_desc&per_page=100&page=1"
+    coins_data = fetch_coingecko(cg_url)
+    if not coins_data:
+        return {"action": "HOLD", "reasoning": "CoinGecko market data unavailable."}
+
+    cg_map = {}
+    for coin in coins_data:
+        sym = coin.get("symbol", "").upper() + "USDT"
+        if coin.get("current_price", 0) > 0:
+            cg_map[sym] = {
+                "price": coin["current_price"],
+                "volume": coin.get("total_volume", 0)
+            }
+
     candidates = []
     for sym in COIN_LIST:
-        price = get_binance_last_price(sym)
-        if price <= 0:
+        if sym not in cg_map:
             continue
-        vol = 1_000_000   # assume liquid; Binance 24h volume could be added but optional
-        change1h = get_1h_change(sym)
+        info = cg_map[sym]
+        # 1‑hour change from Yahoo
+        df_1h = get_yahoo_klines(sym, interval='1h', days=2)
+        if df_1h.empty or len(df_1h) < 2:
+            change1h = 0.0
+        else:
+            prev_close = df_1h['Close'].iloc[-2]
+            curr_close = df_1h['Close'].iloc[-1]
+            change1h = ((curr_close - prev_close) / prev_close) * 100 if prev_close > 0 else 0.0
         candidates.append({
             "symbol": sym,
-            "price": price,
-            "volume": vol,
+            "price": info["price"],
+            "volume": info["volume"],
             "change1h": change1h
         })
 
     if not candidates:
-        return {"action": "HOLD", "reasoning": "No coins with valid prices found."}
+        return {"action": "HOLD", "reasoning": "No coin with valid price found in the predefined list."}
 
     macro = get_macro_data()
     best = None
@@ -334,8 +309,8 @@ def generate_signal():
         sym = coin["symbol"]
         bid = coin["price"] * 0.999
         ask = coin["price"] * 1.001
-        score = score_coin(sym, bid, ask, coin["volume"], coin["change1h"])
-        atr = get_1h_atr(sym, coin["price"])
+        score = score_coin(sym, coin["price"], coin["volume"], coin["change1h"])
+        atr = get_1h_atr_from_yahoo(sym, coin["price"])
         coin["score"] = score
         coin["atr"] = atr
         coin["bid"] = bid
@@ -348,8 +323,7 @@ def generate_signal():
         return {"action": "HOLD", "reasoning": f"No strong conviction. Best score: {best_score:.2f} for {best['symbol'] if best else 'none'}."}
 
     direction = "LONG" if best_score >= 0 else "SHORT"
-
-    trend_4h = get_4h_trend(best["symbol"])
+    trend_4h = get_4h_trend_from_yahoo(best["symbol"])
     if (direction == "LONG" and trend_4h == "down") or (direction == "SHORT" and trend_4h == "up"):
         return {"action": "HOLD", "reasoning": f"Signal {direction} contradicts 4H trend ({trend_4h}). Best score: {best_score:.2f}"}
 
@@ -396,7 +370,7 @@ def send_telegram(text):
     try:
         requests.post(url, data={"chat_id": CHAT_ID, "text": text}, timeout=10)
     except Exception as e:
-        print("Telegram fail:", e)
+        print("Telegram send failed:", e)
 
 def main():
     try:
@@ -405,24 +379,14 @@ def main():
         if action in ["LONG", "SHORT"]:
             raw_symbol = dec.get('symbol', '')
             symbol = raw_symbol.replace("USDT", "/USDT") if raw_symbol else ""
-
             direction_icon = "🟢" if action == "LONG" else "🛑"
             entry_price = dec.get('limit_price', 0)
             stop_price = dec.get('stop_loss', 0)
             confidence = dec.get('confidence_score', 0)
             conviction = dec.get('conviction_score', 0)
             reasoning = dec.get('reasoning', '')
-            tps = [
-                dec.get('take_profit_1', 0),
-                dec.get('take_profit_2', 0),
-                dec.get('take_profit_3', 0),
-                dec.get('take_profit_4', 0),
-                dec.get('take_profit_5', 0),
-                dec.get('take_profit_6', 0),
-            ]
-
+            tps = [dec.get(f'take_profit_{i}', 0) for i in range(1,7)]
             tp_lines = "\n".join([f"📌 ${tp:,.2f}" if tp else "📌 —" for tp in tps])
-
             msg = (
                 f"{symbol} ‼️\n\n"
                 f"{action} {direction_icon}\n\n"
@@ -436,11 +400,10 @@ def main():
             )
         else:
             msg = f"📊 HOLD\nReason: {dec.get('reasoning', 'No signal')}"
-
         print(msg)
         send_telegram(msg)
     except Exception as e:
-        err_msg = f"Fatal: {traceback.format_exc()}"
+        err_msg = f"Bot crashed: {traceback.format_exc()}"
         print(err_msg)
         send_telegram(err_msg[:500])
 
