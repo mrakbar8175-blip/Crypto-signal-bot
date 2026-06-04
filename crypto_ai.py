@@ -229,13 +229,18 @@ def get_volatility_score(symbol_usdt, current_price):
     else:
         return 1
 
-# ========== LAYER 4: MACRO (CoinGecko + DXY) – weight 20% ==========
+# ========== LAYER 4: MACRO (hardened, with fallback) – weight 20% ==========
+_last_macro = {"btc_d": 55.0, "dxy": 100.0}   # sensible default
+
 def get_macro():
-    cg = fetch_coingecko("https://api.coingecko.com/api/v3/global")
+    global _last_macro
+    # Try CoinGecko first
+    cg = fetch_coingecko("https://api.coingecko.com/api/v3/global", retries=3)
     btc_d = None
     dxy = None
     if cg:
         btc_d = cg["data"]["market_cap_percentage"]["btc"]
+    # Try DXY
     try:
         df = yf.download("DX-Y.NYB", period="5d", interval="1h", progress=False)
         if not df.empty:
@@ -243,11 +248,19 @@ def get_macro():
             dxy = float(val.item()) if hasattr(val, 'item') else float(val)
     except:
         pass
+
+    # If any part failed, use the last known good values
+    if btc_d is None:
+        btc_d = _last_macro["btc_d"]
+    if dxy is None:
+        dxy = _last_macro["dxy"]
+
+    # Update stored values for next run
+    _last_macro = {"btc_d": btc_d, "dxy": dxy}
     return {"btc_d": btc_d, "dxy": dxy}
 
 def macro_score(macro):
-    if macro["btc_d"] is None or macro["dxy"] is None:
-        return 0
+    # Now guaranteed to have valid numbers
     score = 0
     if macro["btc_d"] < 55:
         score += 2
@@ -272,21 +285,22 @@ def btc_trend_score():
     else:
         return -2
 
-# ========== LAYER 6: VOLUME SPIKE – weight 5% ==========
-def volume_spike_score(symbol_usdt):
-    df = get_yahoo_klines(symbol_usdt, interval='1h', days=4)
-    if df.empty or len(df) < 24:
+# ========== LAYER 6: VOLUME TREND (replaces spike) – weight 5% ==========
+def volume_trend_score(symbol_usdt):
+    """Returns +2 if volume has been rising over the last 6 hours, -2 if falling."""
+    df = get_yahoo_klines(symbol_usdt, interval='1h', days=2)
+    if df.empty or len(df) < 12:
         return 0
-    avg_vol = df['Volume'].tail(20).mean()
-    last_vol = df['Volume'].iloc[-1]
-    if avg_vol > 0 and last_vol > 1.5 * avg_vol:
-        if df['Close'].iloc[-1] > df['Open'].iloc[-1]:
-            return 2
-        else:
-            return -2
+    recent = df['Volume'].tail(6)
+    first_half = recent[:3].mean()
+    second_half = recent[3:].mean()
+    if second_half > first_half * 1.1:
+        return 2   # rising volume
+    elif second_half < first_half * 0.9:
+        return -2  # falling volume
     return 0
 
-# ========== SCORING ENGINE (no sentiment, weights sum to 1.0) ==========
+# ========== SCORING ENGINE (weights sum to 1.0) ==========
 def score_coin(symbol, price, volume_24h, change1h):
     tech = get_technicals(symbol)
     tech_combined = tech["combined"]
@@ -301,7 +315,7 @@ def score_coin(symbol, price, volume_24h, change1h):
     macro_s = macro_score(macro)
 
     intermarket_s = btc_trend_score()
-    volume_spike_s = volume_spike_score(symbol)
+    vol_trend_s = volume_trend_score(symbol)
 
     total = (
         0.15 * tech_combined +
@@ -309,7 +323,7 @@ def score_coin(symbol, price, volume_24h, change1h):
         0.05 * vol_score +
         0.20 * macro_s +
         0.20 * intermarket_s +
-        0.05 * volume_spike_s
+        0.05 * vol_trend_s
     )
 
     layers = {
@@ -318,7 +332,7 @@ def score_coin(symbol, price, volume_24h, change1h):
         "volatility": vol_score,
         "macro": macro_s,
         "intermarket": intermarket_s,
-        "volume_spike": volume_spike_s,
+        "volume_trend": vol_trend_s,
     }
     return max(-3, min(3, total)), layers, ema50_distance
 
