@@ -19,7 +19,7 @@ portfolio = {
     "daily_loss_limit": -20
 }
 
-# ========== COIN UNIVERSE ==========
+# ========== COIN UNIVERSE (99 altcoins) ==========
 COIN_LIST = [
     "SOLUSDT", "DOGEUSDT", "AVAXUSDT", "DOTUSDT", "NEARUSDT",
     "ATOMUSDT", "ETCUSDT", "STXUSDT", "FILUSDT", "ARBUSDT",
@@ -54,7 +54,6 @@ def fetch_coingecko(url, retries=2):
     return None
 
 def get_yahoo_klines(symbol_usdt, interval='4h', days=60):
-    """Fetch 4‑hour candles by default; fallback to 1h if needed."""
     yahoo_symbol = symbol_usdt.replace("USDT", "-USD")
     end = datetime.now()
     start = end - timedelta(days=days)
@@ -68,7 +67,7 @@ def get_yahoo_klines(symbol_usdt, interval='4h', days=60):
     except:
         return pd.DataFrame()
 
-# ========== LAYER 1: TECHNICALS (4h chart) – weight 15% ==========
+# ========== LAYER 1: TECHNICALS (4h) – weight 15% ==========
 def get_technicals(symbol_usdt):
     df = get_yahoo_klines(symbol_usdt, interval='4h', days=60)
     if df.empty or len(df) < 50:
@@ -78,7 +77,7 @@ def get_technicals(symbol_usdt):
     highs  = df['High']
     lows   = df['Low']
 
-    # ---------- EMA trend ----------
+    # EMA trend
     ema50 = closes.ewm(span=50, adjust=False).mean()
     ema200 = closes.ewm(span=200, adjust=False).mean() if len(closes) >= 200 else ema50
     current = closes.iloc[-1]
@@ -93,7 +92,7 @@ def get_technicals(symbol_usdt):
         trend -= 1.5
     trend = max(-3, min(3, trend))
 
-    # ---------- ADX (trend strength) ----------
+    # ADX
     def calc_adx(high, low, close, period=14):
         dm_plus = high.diff()
         dm_minus = -low.diff()
@@ -126,7 +125,7 @@ def get_technicals(symbol_usdt):
         else:
             adx_score = -1.0
 
-    # ---------- MACD ----------
+    # MACD
     ema12 = closes.ewm(span=12, adjust=False).mean()
     ema26 = closes.ewm(span=26, adjust=False).mean()
     macd_line = ema12 - ema26
@@ -140,7 +139,7 @@ def get_technicals(symbol_usdt):
     else:
         macd_score = 0
 
-    # ---------- PRICE ACTION (stricter structure, window=7 on 4h) ----------
+    # PRICE ACTION (stricter structure)
     window = 7
     lookback = min(50, len(highs))
     recent_highs = highs.iloc[-lookback:]
@@ -180,7 +179,6 @@ def get_technicals(symbol_usdt):
                 structure_score = -2.0
     structure_score = max(-3, min(3, structure_score))
 
-    # ---------- Combine with new weights ----------
     combined = (
         trend * 0.25 +
         adx_score * 0.25 +
@@ -207,10 +205,10 @@ def get_4h_atr(symbol_usdt, current_price):
 
 # ========== LAYER 2: BUYING PRESSURE (4h volume) – weight 30% ==========
 def get_buying_pressure(symbol_usdt):
-    df = get_yahoo_klines(symbol_usdt, interval='4h', days=10)   # 10 days = ~60 4h candles
+    df = get_yahoo_klines(symbol_usdt, interval='4h', days=10)
     if df.empty or len(df) < 24:
         return 0.0
-    df = df.tail(24)   # last 24 4‑hour candles = 4 days
+    df = df.tail(24)
     buy_vol = df.loc[df['Close'] > df['Open'], 'Volume'].sum()
     sell_vol = df.loc[df['Close'] <= df['Open'], 'Volume'].sum()
     total = buy_vol + sell_vol
@@ -224,7 +222,7 @@ def get_volatility_score(symbol_usdt, current_price):
     atr_pct = atr / current_price * 100
     if atr_pct < 1:
         return -1
-    elif atr_pct > 12:   # wider range for 4h
+    elif atr_pct > 12:
         return -1
     else:
         return 1
@@ -280,7 +278,6 @@ def is_trending(symbol_usdt):
     return False
 
 def get_4h_trend_direction(symbol_usdt):
-    """Return 'up', 'down', or 'neutral' based on 4H EMA50 vs EMA200."""
     df = get_yahoo_klines(symbol_usdt, interval='4h', days=60)
     if df.empty or len(df) < 50:
         return 'neutral'
@@ -341,14 +338,15 @@ def score_coin(symbol, price, volume_24h, change1h):
     }
     return max(-3, min(3, total)), layers
 
-# ========== AI REASONING ==========
+# ========== AI REASONING (richer breakdown) ==========
 def call_groq_reasoning(symbol, entry, atr, macro, layers):
     layer_str = "; ".join([f"{k}={v:.2f}" for k,v in layers.items()])
     prompt = (
         f"Trade signal for {symbol} at {entry}. 4h ATR: {atr:.4f}. "
         f"Macro: BTC.D {macro.get('btc_d')}, DXY {macro.get('dxy')}. "
         f"Layer scores: {layer_str}. "
-        "Provide a short reasoning and confidence 1-10.\n"
+        "Provide a detailed reasoning (2-3 sentences) covering chart setup, macro environment, and trade management. "
+        "Also give a confidence 1-10.\n"
         "Format: CONFIDENCE: 7 | REASONING: [text]"
     )
     url = "https://api.groq.com/openai/v1/chat/completions"
@@ -357,7 +355,7 @@ def call_groq_reasoning(symbol, entry, atr, macro, layers):
         "model": "llama-3.3-70b-versatile",
         "messages": [{"role": "user", "content": prompt}],
         "temperature": 0.3,
-        "max_tokens": 150
+        "max_tokens": 300
     }
     try:
         resp = requests.post(url, headers=headers, json=payload, timeout=30)
@@ -461,7 +459,7 @@ def generate_signal():
         "layers": best_layers
     }
 
-# ========== TELEGRAM ==========
+# ========== TELEGRAM (final format) ==========
 def send_telegram(text):
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     try:
@@ -477,6 +475,7 @@ def main():
             raw_symbol = dec.get('symbol', '')
             symbol = raw_symbol.replace("USDT", "/USDT") if raw_symbol else ""
             direction_icon = "🟢" if action == "LONG" else "🛑"
+            setup_icon = "📈" if action == "LONG" else "📉"
             entry_price = dec.get('limit_price', 0)
             stop_price = dec.get('stop_loss', 0)
             confidence = dec.get('confidence_score', 0)
@@ -484,20 +483,28 @@ def main():
             reasoning = dec.get('reasoning', '')
             tps = dec.get('take_profits', [])
 
-            tp_lines = "\n".join([f"📌 ${tp:,.4f}" for tp in tps])
+            entry_low  = round(entry_price * 0.995, 4)
+            entry_high = round(entry_price * 1.005, 4)
+
+            tp_lines = f"📌 TP1: ${tps[0]:,.4f} (Book partials + Move SL to Break-Even)\n"
+            for i in range(1, len(tps)):
+                tp_lines += f"📌 TP{i+1}: ${tps[i]:,.4f}\n"
+            tp_lines = tp_lines.strip()
 
             msg = (
-                f"{symbol} ‼️\n\n"
-                f"{action} {direction_icon}\n\n"
-                f"⛔ ENTRY: CMP — ${entry_price:,.4f}\n\n"
-                f"🛑 STOP LOSS: ${stop_price:,.4f}\n\n"
-                f"🎯 TARGETS:\n"
+                f"🚨 {symbol} Trade Setup! Full Trade Plan Inside!\n\n"
+                f"Position: {action} {direction_icon}\n"
+                f"Setup Type: Swing Trade {setup_icon}\n\n"
+                f"⛔ ENTRY: CMP — ${entry_price:,.4f} (or within ${entry_low:,.4f} - ${entry_high:,.4f})\n\n"
+                f"🛑 STOP LOSS: ${stop_price:,.4f} (Invalidation level)\n\n"
+                f"🎯 TAKE-PROFIT TARGETS:\n"
                 f"{tp_lines}\n\n"
                 f"📊 CONVICTION: {conviction:.2f}  |  🤖 AI CONFIDENCE: {confidence}/10\n\n"
-                f"🔄 After TP1 is hit, move stop loss to breakeven & book partial profits.\n"
-                f"💰 Let the remaining position run for higher targets.\n\n"
-                f"🧠 WHY: {reasoning}\n\n"
-                f"⚠️ NFA | DYOR | Manage your risk"
+                f"🧠 TECHNICAL & MACRO BREAKDOWN:\n"
+                f"{reasoning}\n\n"
+                f"Trade Management: Once TP1 hits, secure partial profits and move stop-loss to entry. "
+                f"Let the rest run risk-free.\n\n"
+                f"⚠️ Disclaimer: NFA (Not Financial Advice) | DYOR (Do Your Own Research) | Manage your risk"
             )
         else:
             msg = f"📊 HOLD\nReason: {dec.get('reasoning', 'No signal')}"
