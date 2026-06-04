@@ -207,7 +207,6 @@ def is_trending(symbol_usdt):
     return False
 
 def get_1h_trend_direction(symbol_usdt):
-    """Return 'up', 'down', or 'neutral' based on 1H EMA50 vs EMA200."""
     df = get_yahoo_klines(symbol_usdt, interval='1h', days=7)
     if df.empty or len(df) < 50:
         return 'neutral'
@@ -226,17 +225,13 @@ def sentiment_score(symbol_usdt):
     trend_dir = get_1h_trend_direction(symbol_usdt)
 
     score = 0
-    # Only apply contrarian fear/greed if the 1h trend aligns with the contrarian play
-    # Fear (<30) contrarian long only if trend is already up (or at least not down)
-    # Greed (>70) contrarian short only if trend is already down (or at least not up)
     if fg_value < 30 and trend_dir != 'down':
-        score += 2   # contrarian long only when trend isn't bearish
+        score += 2
     elif fg_value > 70 and trend_dir != 'up':
-        score -= 2   # contrarian short only when trend isn't bullish
-    # otherwise, fg is neutral (30-70) or trend blocks contrarian
+        score -= 2
 
     if trending:
-        score += 1   # small boost if trending, regardless of direction
+        score += 1
 
     return max(-3, min(3, score))
 
@@ -411,6 +406,7 @@ def main():
             entry_price = dec.get('limit_price', 0)
             stop_price = dec.get('stop_loss', 0)
             confidence = dec.get('confidence_score', 0)
+            conviction = dec.get('conviction_score', 0)
             reasoning = dec.get('reasoning', '')
             tps = dec.get('take_profits', [])
 
@@ -419,14 +415,15 @@ def main():
             msg = (
                 f"{symbol} ‼️\n\n"
                 f"{action} {direction_icon}\n\n"
-                f"ENTRY ⛔ CMP — ${entry_price:,.4f}\n\n"
-                f"Stoploss 🛑 ${stop_price:,.4f}\n\n"
-                f"Targets 🎯\n"
+                f"⛔ ENTRY: CMP — ${entry_price:,.4f}\n\n"
+                f"🛑 STOP LOSS: ${stop_price:,.4f}\n\n"
+                f"🎯 TARGETS:\n"
                 f"{tp_lines}\n\n"
-                f"Confidence: {confidence}/10\n\n"
-                f"Stoploss 🛑 at breakeven when we hit our First Target 🎯 ‼️\n\n"
-                f"🧠 Why: {reasoning}\n\n"
-                f"NFA | DYOR | Manage your risk"
+                f"📊 CONVICTION: {conviction:.2f}  |  🤖 AI CONFIDENCE: {confidence}/10\n\n"
+                f"🔄 After TP1 is hit, move stop loss to breakeven & book partial profits.\n"
+                f"💰 Let the remaining position run for higher targets.\n\n"
+                f"🧠 WHY: {reasoning}\n\n"
+                f"⚠️ NFA | DYOR | Manage your risk"
             )
         else:
             msg = f"📊 HOLD\nReason: {dec.get('reasoning', 'No signal')}"
