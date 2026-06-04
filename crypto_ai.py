@@ -139,7 +139,7 @@ def get_technicals(symbol_usdt):
     else:
         macd_score = 0
 
-    # PRICE ACTION (stricter structure, window=7 on 1h)
+    # PRICE ACTION (structure, window=7 on 1h)
     window = 7
     lookback = min(50, len(highs))
     recent_highs = highs.iloc[-lookback:]
@@ -183,10 +183,9 @@ def get_technicals(symbol_usdt):
         trend * 0.25 +
         adx_score * 0.25 +
         macd_score * 0.10 +
-        structure_score * 0.40       # structure now leads
+        structure_score * 0.40
     )
 
-    # EMA50 distance (for chase protection)
     ema50_val = ema50.iloc[-1]
     distance_pct = abs(current - ema50_val) / current
 
@@ -208,12 +207,12 @@ def get_1h_atr(symbol_usdt, current_price):
     atr = tr.rolling(14).mean().iloc[-1]
     return atr if not pd.isna(atr) else current_price * 0.02
 
-# ========== LAYER 2: BUYING PRESSURE (1h volume, 48h lookback) – weight 30% ==========
+# ========== LAYER 2: BUYING PRESSURE (1h, 48h lookback) – weight 35% ==========
 def get_buying_pressure(symbol_usdt):
     df = get_yahoo_klines(symbol_usdt, interval='1h', days=3)
     if df.empty or len(df) < 48:
         return 0.0
-    df = df.tail(48)   # last 48 hours
+    df = df.tail(48)
     buy_vol = df.loc[df['Close'] > df['Open'], 'Volume'].sum()
     sell_vol = df.loc[df['Close'] <= df['Open'], 'Volume'].sum()
     total = buy_vol + sell_vol
@@ -225,7 +224,7 @@ def get_buying_pressure(symbol_usdt):
 def get_volatility_score(symbol_usdt, current_price):
     atr = get_1h_atr(symbol_usdt, current_price)
     atr_pct = atr / current_price * 100
-    if atr_pct < 1 or atr_pct > 5:   # >5% rejected (wild coins)
+    if atr_pct < 1 or atr_pct > 5:
         return -1
     else:
         return 1
@@ -251,65 +250,16 @@ def macro_score(macro):
         return 0
     score = 0
     if macro["btc_d"] < 55:
-        score += 2   # alt season
+        score += 2
     elif macro["btc_d"] > 60:
         score -= 1
     if macro["dxy"] < 100:
-        score += 1   # risk‑on
+        score += 1
     else:
         score -= 1
     return max(-3, min(3, score))
 
-# ========== LAYER 5: SENTIMENT (trend‑aware, 1h trend) – weight 15% ==========
-def get_fear_greed():
-    try:
-        r = requests.get("https://api.alternative.me/fng/?limit=1", timeout=5)
-        if r.status_code == 200:
-            data = r.json()
-            return int(data["data"][0]["value"]), data["data"][0]["value_classification"]
-    except:
-        pass
-    return 50, "neutral"
-
-def is_trending(symbol_usdt):
-    data = fetch_coingecko("https://api.coingecko.com/api/v3/search/trending")
-    if data:
-        base = symbol_usdt.replace("USDT", "")
-        for item in data.get("coins", []):
-            if item["item"]["symbol"].upper() == base.upper():
-                return True
-    return False
-
-def get_1h_trend_direction(symbol_usdt):
-    df = get_yahoo_klines(symbol_usdt, interval='1h', days=7)
-    if df.empty or len(df) < 50:
-        return 'neutral'
-    closes = df['Close']
-    ema50 = closes.ewm(span=50, adjust=False).mean()
-    ema200 = closes.ewm(span=200, adjust=False).mean() if len(closes) >= 200 else ema50
-    if ema50.iloc[-1] > ema200.iloc[-1]:
-        return 'up'
-    elif ema50.iloc[-1] < ema200.iloc[-1]:
-        return 'down'
-    return 'neutral'
-
-def sentiment_score(symbol_usdt):
-    fg_value, _ = get_fear_greed()
-    trending = is_trending(symbol_usdt)
-    trend_dir = get_1h_trend_direction(symbol_usdt)
-
-    score = 0
-    if fg_value < 30 and trend_dir != 'down':
-        score += 2
-    elif fg_value > 70 and trend_dir != 'up':
-        score -= 2
-
-    if trending:
-        score += 1
-
-    return max(-3, min(3, score))
-
-# ========== LAYER 6: INTERMARKET (BTC trend) – weight 10% ==========
+# ========== LAYER 5: INTERMARKET (BTC trend) – weight 20% ==========
 def btc_trend_score():
     df = get_yahoo_klines("BTCUSDT", interval='1h', days=7)
     if df.empty or len(df) < 50:
@@ -322,7 +272,7 @@ def btc_trend_score():
     else:
         return -2
 
-# ========== LAYER 7: VOLUME SPIKE (confirmation) – weight 5% ==========
+# ========== LAYER 6: VOLUME SPIKE – weight 5% ==========
 def volume_spike_score(symbol_usdt):
     df = get_yahoo_klines(symbol_usdt, interval='1h', days=4)
     if df.empty or len(df) < 24:
@@ -330,14 +280,13 @@ def volume_spike_score(symbol_usdt):
     avg_vol = df['Volume'].tail(20).mean()
     last_vol = df['Volume'].iloc[-1]
     if avg_vol > 0 and last_vol > 1.5 * avg_vol:
-        # Check direction of the candle
         if df['Close'].iloc[-1] > df['Open'].iloc[-1]:
-            return 2   # spike up
+            return 2
         else:
-            return -2  # spike down
+            return -2
     return 0
 
-# ========== SCORING ENGINE (weights sum to 1.0) ==========
+# ========== SCORING ENGINE (no sentiment, weights sum to 1.0) ==========
 def score_coin(symbol, price, volume_24h, change1h):
     tech = get_technicals(symbol)
     tech_combined = tech["combined"]
@@ -351,18 +300,15 @@ def score_coin(symbol, price, volume_24h, change1h):
     macro = get_macro()
     macro_s = macro_score(macro)
 
-    sent_s = sentiment_score(symbol)
-
     intermarket_s = btc_trend_score()
     volume_spike_s = volume_spike_score(symbol)
 
     total = (
         0.15 * tech_combined +
-        0.30 * buying_score +
+        0.35 * buying_score +
         0.05 * vol_score +
         0.20 * macro_s +
-        0.15 * sent_s +
-        0.10 * intermarket_s +
+        0.20 * intermarket_s +
         0.05 * volume_spike_s
     )
 
@@ -371,7 +317,6 @@ def score_coin(symbol, price, volume_24h, change1h):
         "buying_press": buying_score,
         "volatility": vol_score,
         "macro": macro_s,
-        "sentiment": sent_s,
         "intermarket": intermarket_s,
         "volume_spike": volume_spike_s,
     }
@@ -447,9 +392,8 @@ def generate_signal():
 
         total_score, layers, ema_dist = score_coin(sym, price, volume, 0)
         atr = get_1h_atr(sym, price)
-        # Volatility cap – reject coin if ATR > 5%
         if atr / price > 0.05:
-            total_score = 0.0   # disqualified, but still shown in summary
+            total_score = 0.0
         coin["score"] = total_score
         coin["atr"] = atr
         coin["bid"] = price * 0.999
@@ -465,7 +409,6 @@ def generate_signal():
             best_layers = layers
             best_ema_distance = ema_dist
 
-    # Build sorted summary of ALL 30 coins
     all_scored_sorted = sorted(all_scored, key=lambda x: abs(x["score"]), reverse=True)
     coin_summary_list = []
     for c in all_scored_sorted:
@@ -481,7 +424,6 @@ def generate_signal():
         return {"action": "HOLD", "reasoning": reason}
 
     direction = "LONG" if best_score >= 0 else "SHORT"
-    # Chase protection: reject if price too far from EMA50 (>2.5%)
     if best_ema_distance > 0.025:
         reason = (f"Trade rejected: price too far from 50‑EMA ({best_ema_distance*100:.1f}%). "
                   f"Best score: {best_score:.2f} for {best['symbol']}.")
