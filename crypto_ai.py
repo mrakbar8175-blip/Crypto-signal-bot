@@ -67,14 +67,14 @@ def get_yahoo_klines(symbol_usdt, interval='1h', days=60):
     except:
         return pd.DataFrame()
 
-# ========== LAYER 1: TECHNICALS (1h) – weight 15% ==========
+# ========== LAYER 1: TECHNICALS (1h, MACD‑free) – weight 20% ==========
 def get_technicals(symbol_usdt):
     df = get_yahoo_klines(symbol_usdt, interval='1h', days=7)
     error = None
     if df.empty or len(df) < 50:
         error = f"insufficient 1h data ({len(df)} candles)"
         return {
-            "trend": 0, "adx": 0, "macd": 0, "structure": 0,
+            "trend": 0, "adx": 0, "structure": 0,
             "combined": 0, "ema50_distance": 1.0, "error": error
         }
 
@@ -130,20 +130,6 @@ def get_technicals(symbol_usdt):
         else:
             adx_score = -1.0
 
-    # MACD
-    ema12 = closes.ewm(span=12, adjust=False).mean()
-    ema26 = closes.ewm(span=26, adjust=False).mean()
-    macd_line = ema12 - ema26
-    signal = macd_line.ewm(span=9, adjust=False).mean()
-    histogram = macd_line - signal
-    macd_now = histogram.iloc[-1]
-    if macd_now > 0:
-        macd_score = 1.5
-    elif macd_now < 0:
-        macd_score = -1.5
-    else:
-        macd_score = 0
-
     # PRICE ACTION (structure, window=7 on 1h)
     window = 7
     lookback = min(50, len(highs))
@@ -184,20 +170,19 @@ def get_technicals(symbol_usdt):
                 structure_score = -2.0
     structure_score = max(-3, min(3, structure_score))
 
+    # Combined (no MACD – weights redistributed to trend & structure)
     combined = (
-        trend * 0.25 +
+        trend * 0.35 +          # increased from 0.25
         adx_score * 0.25 +
-        macd_score * 0.10 +
-        structure_score * 0.40
+        structure_score * 0.40  # unchanged
     )
 
     ema50_val = ema50.iloc[-1]
     distance_pct = abs(current - ema50_val) / current
 
     return {
-        "trend": trend, "adx": adx_score, "macd": macd_score,
-        "structure": structure_score, "combined": combined,
-        "ema50_distance": distance_pct, "error": None
+        "trend": trend, "adx": adx_score, "structure": structure_score,
+        "combined": combined, "ema50_distance": distance_pct, "error": None
     }
 
 def get_1h_atr(symbol_usdt, current_price):
@@ -232,7 +217,7 @@ def get_volatility_score(symbol_usdt, current_price):
         return -1, atr_err
     return 1, None
 
-# ========== LAYER 4: INTERMARKET (BTC trend) – weight 35% ==========
+# ========== LAYER 4: INTERMARKET (BTC trend) – weight 30% ==========
 def btc_trend_score():
     df = get_yahoo_klines("BTCUSDT", interval='1h', days=7)
     if df.empty or len(df) < 50:
@@ -259,7 +244,7 @@ def volume_trend_score(symbol_usdt):
         return -2, None
     return 0, None
 
-# ========== SCORING ENGINE (macro removed, weights rebalanced) ==========
+# ========== SCORING ENGINE ==========
 def score_coin(symbol, price, volume_24h, change1h, btc_score, btc_error):
     errors = []
     tech = get_technicals(symbol)
@@ -286,10 +271,10 @@ def score_coin(symbol, price, volume_24h, change1h, btc_score, btc_error):
         errors.append(f"volume_trend({symbol}): {vt_err}")
 
     total = (
-        0.15 * tech_combined +
+        0.20 * tech_combined +
         0.40 * buying_score +
         0.05 * vol_score +
-        0.35 * intermarket_s +
+        0.30 * intermarket_s +
         0.05 * vol_trend_s
     )
 
