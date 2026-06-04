@@ -170,11 +170,11 @@ def get_technicals(symbol_usdt):
                 structure_score = -2.0
     structure_score = max(-3, min(3, structure_score))
 
-    # Combined (no MACD – weights redistributed to trend & structure)
+    # Combined (no MACD)
     combined = (
-        trend * 0.35 +          # increased from 0.25
+        trend * 0.35 +
         adx_score * 0.25 +
-        structure_score * 0.40  # unchanged
+        structure_score * 0.40
     )
 
     ema50_val = ema50.iloc[-1]
@@ -410,11 +410,7 @@ def generate_signal():
         return {"action": "HOLD", "reasoning": reason}
 
     direction = "LONG" if best_score >= 0 else "SHORT"
-    if best_ema_distance > 0.025:
-        scaled_best = internal_to_5(best_score)
-        reason = (f"Trade rejected: price too far from 50‑EMA ({best_ema_distance*100:.1f}%). "
-                  f"Best score: {scaled_best:+.1f}/5 for {best['symbol']}.")
-        return {"action": "HOLD", "reasoning": reason}
+    # Chase protection removed
 
     entry = best["bid"] if direction == "LONG" else best["ask"]
     atr = best["atr"]
