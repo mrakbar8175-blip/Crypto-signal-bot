@@ -232,7 +232,7 @@ def get_volatility_score(symbol_usdt, current_price):
         return -1, atr_err
     return 1, None
 
-# ========== LAYER 4: MACRO (hardened, with fallback) – weight 20% ==========
+# ========== LAYER 4: MACRO (hardened, with fallback) – weight 10% ==========
 _last_macro = {"btc_d": 55.0, "dxy": 100.0}
 
 def get_macro():
@@ -275,7 +275,7 @@ def macro_score(macro):
         score -= 1
     return max(-3, min(3, score))
 
-# ========== LAYER 5: INTERMARKET (BTC trend) – weight 20% ==========
+# ========== LAYER 5: INTERMARKET (BTC trend) – weight 30% ==========
 def btc_trend_score():
     df = get_yahoo_klines("BTCUSDT", interval='1h', days=7)
     if df.empty or len(df) < 50:
@@ -302,7 +302,7 @@ def volume_trend_score(symbol_usdt):
         return -2, None
     return 0, None
 
-# ========== SCORING ENGINE ==========
+# ========== SCORING ENGINE (updated weights) ==========
 def score_coin(symbol, price, volume_24h, change1h, btc_score, btc_error, macro, macro_error):
     errors = []
     tech = get_technicals(symbol)
@@ -334,8 +334,8 @@ def score_coin(symbol, price, volume_24h, change1h, btc_score, btc_error, macro,
         0.15 * tech_combined +
         0.35 * buying_score +
         0.05 * vol_score +
-        0.20 * macro_s +
-        0.20 * intermarket_s +
+        0.10 * macro_s +          # reduced from 20%
+        0.30 * intermarket_s +    # increased from 20%
         0.05 * vol_trend_s
     )
 
@@ -351,7 +351,6 @@ def score_coin(symbol, price, volume_24h, change1h, btc_score, btc_error, macro,
 
 # ========== HELPER: internal -3..+3 → -5..+5 ==========
 def internal_to_5(internal_score):
-    """Convert internal score (-3..+3) to display scale (-5..+5)."""
     scaled = internal_score * (5.0 / 3.0)
     return round(scaled, 1)
 
@@ -419,7 +418,7 @@ def generate_signal():
 
     all_scored = []
     best = None
-    best_score = 0      # internal -3..+3
+    best_score = 0
     best_layers = None
     best_ema_distance = 0.0
     best_errors = []
@@ -458,14 +457,12 @@ def generate_signal():
     if btc_error and "intermarket" not in " ".join(best_errors):
         best_errors.append(f"intermarket: {btc_error}")
 
-    # Build summary with internal scores
     all_scored_sorted = sorted(all_scored, key=lambda x: abs(x["score"]), reverse=True)
     coin_summary_list = []
     for c in all_scored_sorted:
         coin_summary_list.append(f"{c['symbol'].replace('USDT','')}: {c['score']:.2f}")
     coin_summary = " | ".join(coin_summary_list)
 
-    # Threshold check: internal abs >= 1.5 (displayed as ±2.5)
     if best is None or abs(best_score) < 1.49:
         best_sym = best["symbol"] if best else "none"
         layer_str = "; ".join([f"{k}={v:.2f}" for k,v in best_layers.items()])
@@ -524,7 +521,7 @@ def generate_signal():
         "take_profits": tps,
         "confidence_score": conf,
         "reasoning": reason,
-        "conviction_score": conviction_display,   # now -5..+5
+        "conviction_score": conviction_display,
         "layers": best_layers,
         "errors": best_errors
     }
@@ -549,7 +546,7 @@ def main():
             entry_price = dec.get('limit_price', 0)
             stop_price = dec.get('stop_loss', 0)
             confidence = dec.get('confidence_score', 0)
-            conviction = dec.get('conviction_score', 0)   # -5..+5
+            conviction = dec.get('conviction_score', 0)
             reasoning = dec.get('reasoning', '')
             errors = dec.get('errors', [])
             tps = dec.get('take_profits', [])
