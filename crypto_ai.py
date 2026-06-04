@@ -349,10 +349,10 @@ def score_coin(symbol, price, volume_24h, change1h, btc_score, btc_error, macro,
     }
     return max(-3, min(3, total)), layers, ema50_distance, errors
 
-# ========== HELPER: internal -3..3 → 0..10 ==========
-def internal_to_10(internal_score):
-    """Convert a score from -3..+3 to 0..10 (5 = neutral)."""
-    scaled = (internal_score + 3) * (10 / 6)
+# ========== HELPER: internal -3..+3 → -5..+5 ==========
+def internal_to_5(internal_score):
+    """Convert internal score (-3..+3) to display scale (-5..+5)."""
+    scaled = internal_score * (5.0 / 3.0)
     return round(scaled, 1)
 
 # ========== AI REASONING ==========
@@ -458,31 +458,31 @@ def generate_signal():
     if btc_error and "intermarket" not in " ".join(best_errors):
         best_errors.append(f"intermarket: {btc_error}")
 
-    # Build summary with internal scores (still display internal for debug in HOLD, but we'll show 0-10 in signal)
+    # Build summary with internal scores
     all_scored_sorted = sorted(all_scored, key=lambda x: abs(x["score"]), reverse=True)
     coin_summary_list = []
     for c in all_scored_sorted:
         coin_summary_list.append(f"{c['symbol'].replace('USDT','')}: {c['score']:.2f}")
     coin_summary = " | ".join(coin_summary_list)
 
+    # Threshold check: internal abs >= 1.5 (displayed as ±2.5)
     if best is None or abs(best_score) < 1.49:
         best_sym = best["symbol"] if best else "none"
         layer_str = "; ".join([f"{k}={v:.2f}" for k,v in best_layers.items()])
         err_str = ""
         if best_errors:
             err_str = " | Errors: " + "; ".join(best_errors)
-        # Convert best_score to 0-10 for display
-        scaled_best = internal_to_10(best_score)
-        reason = (f"No strong conviction. Best score: {scaled_best}/10 for {best_sym}.\n"
+        scaled_best = internal_to_5(best_score)
+        reason = (f"No strong conviction. Best score: {scaled_best:+.1f}/5 for {best_sym}.\n"
                   f"Layers: {layer_str}{err_str}\n"
                   f"All coins: {coin_summary}")
         return {"action": "HOLD", "reasoning": reason}
 
     direction = "LONG" if best_score >= 0 else "SHORT"
     if best_ema_distance > 0.025:
-        scaled_best = internal_to_10(best_score)
+        scaled_best = internal_to_5(best_score)
         reason = (f"Trade rejected: price too far from 50‑EMA ({best_ema_distance*100:.1f}%). "
-                  f"Best score: {scaled_best}/10 for {best['symbol']}.")
+                  f"Best score: {scaled_best:+.1f}/5 for {best['symbol']}.")
         return {"action": "HOLD", "reasoning": reason}
 
     entry = best["bid"] if direction == "LONG" else best["ask"]
@@ -507,14 +507,13 @@ def generate_signal():
         err_str = ""
         if best_errors:
             err_str = " | Errors: " + "; ".join(best_errors)
-        scaled_best = internal_to_10(best_score)
-        reason = (f"AI confidence too low ({conf}/10). Best score: {scaled_best}/10 for {best['symbol']}.\n"
+        scaled_best = internal_to_5(best_score)
+        reason = (f"AI confidence too low ({conf}/10). Best score: {scaled_best:+.1f}/5 for {best['symbol']}.\n"
                   f"Layers: {layer_str}{err_str}\n"
                   f"All coins: {coin_summary}\n{reason}")
         return {"action": "HOLD", "reasoning": reason}
 
-    # Convert conviction to 0-10
-    conviction_display = internal_to_10(best_score)
+    conviction_display = internal_to_5(best_score)
 
     return {
         "action": direction,
@@ -525,7 +524,7 @@ def generate_signal():
         "take_profits": tps,
         "confidence_score": conf,
         "reasoning": reason,
-        "conviction_score": conviction_display,   # now 0-10
+        "conviction_score": conviction_display,   # now -5..+5
         "layers": best_layers,
         "errors": best_errors
     }
@@ -550,7 +549,7 @@ def main():
             entry_price = dec.get('limit_price', 0)
             stop_price = dec.get('stop_loss', 0)
             confidence = dec.get('confidence_score', 0)
-            conviction = dec.get('conviction_score', 0)   # already 0-10
+            conviction = dec.get('conviction_score', 0)   # -5..+5
             reasoning = dec.get('reasoning', '')
             errors = dec.get('errors', [])
             tps = dec.get('take_profits', [])
@@ -575,7 +574,7 @@ def main():
                 f"🛑 STOP LOSS: ${stop_price:,.4f} (Invalidation level)\n\n"
                 f"🎯 TAKE-PROFIT TARGETS:\n"
                 f"{tp_lines}\n\n"
-                f"📊 CONVICTION: {conviction}/10  |  🤖 AI CONFIDENCE: {confidence}/10\n\n"
+                f"📊 CONVICTION: {conviction:+.1f}/5  |  🤖 AI CONFIDENCE: {confidence}/10\n\n"
                 f"🧠 TECHNICAL & MACRO BREAKDOWN:\n"
                 f"{reasoning}{err_str}\n\n"
                 f"Trade Management: Once TP1 hits, secure partial profits and move stop-loss to entry. "
