@@ -186,7 +186,7 @@ def macro_score(macro):
         score -= 1
     return max(-3, min(3, score))
 
-# ========== LAYER 5: SENTIMENT (Fear & Greed + Trending) – weight 20% ==========
+# ========== LAYER 5: SENTIMENT (trend‑aware) – weight 20% ==========
 def get_fear_greed():
     try:
         r = requests.get("https://api.alternative.me/fng/?limit=1", timeout=5)
@@ -206,16 +206,38 @@ def is_trending(symbol_usdt):
                 return True
     return False
 
+def get_1h_trend_direction(symbol_usdt):
+    """Return 'up', 'down', or 'neutral' based on 1H EMA50 vs EMA200."""
+    df = get_yahoo_klines(symbol_usdt, interval='1h', days=7)
+    if df.empty or len(df) < 50:
+        return 'neutral'
+    closes = df['Close']
+    ema50 = closes.ewm(span=50, adjust=False).mean()
+    ema200 = closes.ewm(span=200, adjust=False).mean() if len(closes) >= 200 else ema50
+    if ema50.iloc[-1] > ema200.iloc[-1]:
+        return 'up'
+    elif ema50.iloc[-1] < ema200.iloc[-1]:
+        return 'down'
+    return 'neutral'
+
 def sentiment_score(symbol_usdt):
     fg_value, _ = get_fear_greed()
     trending = is_trending(symbol_usdt)
+    trend_dir = get_1h_trend_direction(symbol_usdt)
+
     score = 0
-    if fg_value < 30:
-        score += 2
-    elif fg_value > 70:
-        score -= 2
+    # Only apply contrarian fear/greed if the 1h trend aligns with the contrarian play
+    # Fear (<30) contrarian long only if trend is already up (or at least not down)
+    # Greed (>70) contrarian short only if trend is already down (or at least not up)
+    if fg_value < 30 and trend_dir != 'down':
+        score += 2   # contrarian long only when trend isn't bearish
+    elif fg_value > 70 and trend_dir != 'up':
+        score -= 2   # contrarian short only when trend isn't bullish
+    # otherwise, fg is neutral (30-70) or trend blocks contrarian
+
     if trending:
-        score += 1
+        score += 1   # small boost if trending, regardless of direction
+
     return max(-3, min(3, score))
 
 # ========== SCORING ENGINE ==========
