@@ -233,13 +233,11 @@ def get_volatility_score(symbol_usdt, current_price):
     return 1, None
 
 # ========== LAYER 4: MACRO (hardened, with fallback) – weight 20% ==========
-_last_macro = {"btc_d": 55.0, "dxy": 100.0}   # sensible default
-_last_macro_error = None
+_last_macro = {"btc_d": 55.0, "dxy": 100.0}
 
 def get_macro():
-    global _last_macro, _last_macro_error
+    global _last_macro
     error_parts = []
-    # Try CoinGecko first
     cg = fetch_coingecko("https://api.coingecko.com/api/v3/global", retries=3)
     btc_d = None
     dxy = None
@@ -249,7 +247,6 @@ def get_macro():
         btc_d = _last_macro["btc_d"]
         error_parts.append("CoinGecko global unavailable, using last BTC.D")
 
-    # Try DXY
     try:
         df = yf.download("DX-Y.NYB", period="5d", interval="1h", progress=False)
         if not df.empty:
@@ -262,13 +259,11 @@ def get_macro():
         dxy = _last_macro["dxy"]
         error_parts.append("DXY fetch failed, using last")
 
-    # Update stored values
     _last_macro = {"btc_d": btc_d, "dxy": dxy}
-    _last_macro_error = "; ".join(error_parts) if error_parts else None
-    return _last_macro.copy(), _last_macro_error
+    macro_error = "; ".join(error_parts) if error_parts else None
+    return {"btc_d": btc_d, "dxy": dxy}, macro_error
 
 def macro_score(macro):
-    # macro now guaranteed to have numeric values
     score = 0
     if macro["btc_d"] < 55:
         score += 2
@@ -293,7 +288,7 @@ def btc_trend_score():
     else:
         return -2, None
 
-# ========== LAYER 6: VOLUME TREND (replaces spike) – weight 5% ==========
+# ========== LAYER 6: VOLUME TREND – weight 5% ==========
 def volume_trend_score(symbol_usdt):
     df = get_yahoo_klines(symbol_usdt, interval='1h', days=2)
     if df.empty or len(df) < 12:
@@ -307,36 +302,30 @@ def volume_trend_score(symbol_usdt):
         return -2, None
     return 0, None
 
-# ========== SCORING ENGINE (now with error collection) ==========
+# ========== SCORING ENGINE ==========
 def score_coin(symbol, price, volume_24h, change1h, btc_score, btc_error, macro, macro_error):
     errors = []
-    # Technicals
     tech = get_technicals(symbol)
     if tech.get("error"):
         errors.append(f"tech({symbol}): {tech['error']}")
     tech_combined = tech["combined"]
     ema50_distance = tech["ema50_distance"]
 
-    # Buying pressure
     buying, buy_err = get_buying_pressure(symbol)
     if buy_err:
         errors.append(f"buying_press({symbol}): {buy_err}")
     buying_score = buying * 3
 
-    # Volatility
     vol_score, vol_err = get_volatility_score(symbol, price)
     if vol_err:
         errors.append(f"volatility({symbol}): {vol_err}")
 
-    # Macro (global, error captured separately)
     macro_s = macro_score(macro)
 
-    # Intermarket
     intermarket_s = btc_score
     if btc_error:
         errors.append(f"intermarket: {btc_error}")
 
-    # Volume trend
     vol_trend_s, vt_err = volume_trend_score(symbol)
     if vt_err:
         errors.append(f"volume_trend({symbol}): {vt_err}")
@@ -359,6 +348,12 @@ def score_coin(symbol, price, volume_24h, change1h, btc_score, btc_error, macro,
         "volume_trend": vol_trend_s,
     }
     return max(-3, min(3, total)), layers, ema50_distance, errors
+
+# ========== HELPER: internal -3..3 → 0..10 ==========
+def internal_to_10(internal_score):
+    """Convert a score from -3..+3 to 0..10 (5 = neutral)."""
+    scaled = (internal_score + 3) * (10 / 6)
+    return round(scaled, 1)
 
 # ========== AI REASONING ==========
 def call_groq_reasoning(symbol, entry, atr, macro, layers, errors=None):
@@ -419,13 +414,12 @@ def generate_signal():
     if not candidates:
         return {"action": "HOLD", "reasoning": "No liquid coins in predefined list."}
 
-    # Fetch global macro and intermarket once
     macro, macro_error = get_macro()
     btc_score, btc_error = btc_trend_score()
 
     all_scored = []
     best = None
-    best_score = 0
+    best_score = 0      # internal -3..+3
     best_layers = None
     best_ema_distance = 0.0
     best_errors = []
@@ -459,12 +453,12 @@ def generate_signal():
             best_ema_distance = ema_dist
             best_errors = errors
 
-    # Include macro/intermarket errors in the best errors list if they weren't already added per coin
     if macro_error:
         best_errors.append(f"macro: {macro_error}")
     if btc_error and "intermarket" not in " ".join(best_errors):
         best_errors.append(f"intermarket: {btc_error}")
 
+    # Build summary with internal scores (still display internal for debug in HOLD, but we'll show 0-10 in signal)
     all_scored_sorted = sorted(all_scored, key=lambda x: abs(x["score"]), reverse=True)
     coin_summary_list = []
     for c in all_scored_sorted:
@@ -477,15 +471,18 @@ def generate_signal():
         err_str = ""
         if best_errors:
             err_str = " | Errors: " + "; ".join(best_errors)
-        reason = (f"No strong conviction. Best score: {best_score:.2f} for {best_sym}.\n"
+        # Convert best_score to 0-10 for display
+        scaled_best = internal_to_10(best_score)
+        reason = (f"No strong conviction. Best score: {scaled_best}/10 for {best_sym}.\n"
                   f"Layers: {layer_str}{err_str}\n"
                   f"All coins: {coin_summary}")
         return {"action": "HOLD", "reasoning": reason}
 
     direction = "LONG" if best_score >= 0 else "SHORT"
     if best_ema_distance > 0.025:
+        scaled_best = internal_to_10(best_score)
         reason = (f"Trade rejected: price too far from 50‑EMA ({best_ema_distance*100:.1f}%). "
-                  f"Best score: {best_score:.2f} for {best['symbol']}.")
+                  f"Best score: {scaled_best}/10 for {best['symbol']}.")
         return {"action": "HOLD", "reasoning": reason}
 
     entry = best["bid"] if direction == "LONG" else best["ask"]
@@ -510,10 +507,14 @@ def generate_signal():
         err_str = ""
         if best_errors:
             err_str = " | Errors: " + "; ".join(best_errors)
-        reason = (f"AI confidence too low ({conf}/10). Best score: {best_score:.2f} for {best['symbol']}.\n"
+        scaled_best = internal_to_10(best_score)
+        reason = (f"AI confidence too low ({conf}/10). Best score: {scaled_best}/10 for {best['symbol']}.\n"
                   f"Layers: {layer_str}{err_str}\n"
                   f"All coins: {coin_summary}\n{reason}")
         return {"action": "HOLD", "reasoning": reason}
+
+    # Convert conviction to 0-10
+    conviction_display = internal_to_10(best_score)
 
     return {
         "action": direction,
@@ -524,7 +525,7 @@ def generate_signal():
         "take_profits": tps,
         "confidence_score": conf,
         "reasoning": reason,
-        "conviction_score": best_score,
+        "conviction_score": conviction_display,   # now 0-10
         "layers": best_layers,
         "errors": best_errors
     }
@@ -549,7 +550,7 @@ def main():
             entry_price = dec.get('limit_price', 0)
             stop_price = dec.get('stop_loss', 0)
             confidence = dec.get('confidence_score', 0)
-            conviction = dec.get('conviction_score', 0)
+            conviction = dec.get('conviction_score', 0)   # already 0-10
             reasoning = dec.get('reasoning', '')
             errors = dec.get('errors', [])
             tps = dec.get('take_profits', [])
@@ -574,7 +575,7 @@ def main():
                 f"🛑 STOP LOSS: ${stop_price:,.4f} (Invalidation level)\n\n"
                 f"🎯 TAKE-PROFIT TARGETS:\n"
                 f"{tp_lines}\n\n"
-                f"📊 CONVICTION: {conviction:.2f}  |  🤖 AI CONFIDENCE: {confidence}/10\n\n"
+                f"📊 CONVICTION: {conviction}/10  |  🤖 AI CONFIDENCE: {confidence}/10\n\n"
                 f"🧠 TECHNICAL & MACRO BREAKDOWN:\n"
                 f"{reasoning}{err_str}\n\n"
                 f"Trade Management: Once TP1 hits, secure partial profits and move stop-loss to entry. "
