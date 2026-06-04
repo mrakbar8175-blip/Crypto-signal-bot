@@ -211,7 +211,7 @@ def get_1h_atr(symbol_usdt, current_price):
         return current_price * 0.02, "ATR calculation failed, using 2% fallback"
     return atr, None
 
-# ========== LAYER 2: BUYING PRESSURE (1h, 48h lookback) – weight 35% ==========
+# ========== LAYER 2: BUYING PRESSURE (1h, 48h lookback) – weight 40% ==========
 def get_buying_pressure(symbol_usdt):
     df = get_yahoo_klines(symbol_usdt, interval='1h', days=3)
     if df.empty or len(df) < 48:
@@ -232,50 +232,7 @@ def get_volatility_score(symbol_usdt, current_price):
         return -1, atr_err
     return 1, None
 
-# ========== LAYER 4: MACRO (hardened, with fallback) – weight 10% ==========
-_last_macro = {"btc_d": 55.0, "dxy": 100.0}
-
-def get_macro():
-    global _last_macro
-    error_parts = []
-    cg = fetch_coingecko("https://api.coingecko.com/api/v3/global", retries=3)
-    btc_d = None
-    dxy = None
-    if cg:
-        btc_d = cg["data"]["market_cap_percentage"]["btc"]
-    else:
-        btc_d = _last_macro["btc_d"]
-        error_parts.append("CoinGecko global unavailable, using last BTC.D")
-
-    try:
-        df = yf.download("DX-Y.NYB", period="5d", interval="1h", progress=False)
-        if not df.empty:
-            val = df['Close'].iloc[-1]
-            dxy = float(val.item()) if hasattr(val, 'item') else float(val)
-        else:
-            dxy = _last_macro["dxy"]
-            error_parts.append("DXY data empty, using last")
-    except:
-        dxy = _last_macro["dxy"]
-        error_parts.append("DXY fetch failed, using last")
-
-    _last_macro = {"btc_d": btc_d, "dxy": dxy}
-    macro_error = "; ".join(error_parts) if error_parts else None
-    return {"btc_d": btc_d, "dxy": dxy}, macro_error
-
-def macro_score(macro):
-    score = 0
-    if macro["btc_d"] < 55:
-        score += 2
-    elif macro["btc_d"] > 60:
-        score -= 1
-    if macro["dxy"] < 100:
-        score += 1
-    else:
-        score -= 1
-    return max(-3, min(3, score))
-
-# ========== LAYER 5: INTERMARKET (BTC trend) – weight 30% ==========
+# ========== LAYER 4: INTERMARKET (BTC trend) – weight 35% ==========
 def btc_trend_score():
     df = get_yahoo_klines("BTCUSDT", interval='1h', days=7)
     if df.empty or len(df) < 50:
@@ -288,7 +245,7 @@ def btc_trend_score():
     else:
         return -2, None
 
-# ========== LAYER 6: VOLUME TREND – weight 5% ==========
+# ========== LAYER 5: VOLUME TREND – weight 5% ==========
 def volume_trend_score(symbol_usdt):
     df = get_yahoo_klines(symbol_usdt, interval='1h', days=2)
     if df.empty or len(df) < 12:
@@ -302,8 +259,8 @@ def volume_trend_score(symbol_usdt):
         return -2, None
     return 0, None
 
-# ========== SCORING ENGINE (updated weights) ==========
-def score_coin(symbol, price, volume_24h, change1h, btc_score, btc_error, macro, macro_error):
+# ========== SCORING ENGINE (macro removed, weights rebalanced) ==========
+def score_coin(symbol, price, volume_24h, change1h, btc_score, btc_error):
     errors = []
     tech = get_technicals(symbol)
     if tech.get("error"):
@@ -320,8 +277,6 @@ def score_coin(symbol, price, volume_24h, change1h, btc_score, btc_error, macro,
     if vol_err:
         errors.append(f"volatility({symbol}): {vol_err}")
 
-    macro_s = macro_score(macro)
-
     intermarket_s = btc_score
     if btc_error:
         errors.append(f"intermarket: {btc_error}")
@@ -332,10 +287,9 @@ def score_coin(symbol, price, volume_24h, change1h, btc_score, btc_error, macro,
 
     total = (
         0.15 * tech_combined +
-        0.35 * buying_score +
+        0.40 * buying_score +
         0.05 * vol_score +
-        0.10 * macro_s +          # reduced from 20%
-        0.30 * intermarket_s +    # increased from 20%
+        0.35 * intermarket_s +
         0.05 * vol_trend_s
     )
 
@@ -343,7 +297,6 @@ def score_coin(symbol, price, volume_24h, change1h, btc_score, btc_error, macro,
         "tech": tech_combined,
         "buying_press": buying_score,
         "volatility": vol_score,
-        "macro": macro_s,
         "intermarket": intermarket_s,
         "volume_trend": vol_trend_s,
     }
@@ -355,16 +308,15 @@ def internal_to_5(internal_score):
     return round(scaled, 1)
 
 # ========== AI REASONING ==========
-def call_groq_reasoning(symbol, entry, atr, macro, layers, errors=None):
+def call_groq_reasoning(symbol, entry, atr, layers, errors=None):
     layer_str = "; ".join([f"{k}={v:.2f}" for k,v in layers.items()])
     err_str = ""
     if errors:
         err_str = " | Data issues: " + "; ".join(errors)
     prompt = (
         f"Trade signal for {symbol} at {entry}. 1h ATR: {atr:.4f}. "
-        f"Macro: BTC.D {macro.get('btc_d')}, DXY {macro.get('dxy')}. "
         f"Layer scores: {layer_str}{err_str}. "
-        "Provide a detailed reasoning (2-3 sentences) covering chart setup, macro environment, and trade management. "
+        "Provide a detailed reasoning (2-3 sentences) covering chart setup and trade management. "
         "Also give a confidence 1-10.\n"
         "Format: CONFIDENCE: 7 | REASONING: [text]"
     )
@@ -413,7 +365,6 @@ def generate_signal():
     if not candidates:
         return {"action": "HOLD", "reasoning": "No liquid coins in predefined list."}
 
-    macro, macro_error = get_macro()
     btc_score, btc_error = btc_trend_score()
 
     all_scored = []
@@ -429,7 +380,7 @@ def generate_signal():
         volume = coin["volume"]
 
         total_score, layers, ema_dist, errors = score_coin(
-            sym, price, volume, 0, btc_score, btc_error, macro, macro_error
+            sym, price, volume, 0, btc_score, btc_error
         )
         atr, _ = get_1h_atr(sym, price)
         if atr / price > 0.05:
@@ -452,9 +403,7 @@ def generate_signal():
             best_ema_distance = ema_dist
             best_errors = errors
 
-    if macro_error:
-        best_errors.append(f"macro: {macro_error}")
-    if btc_error and "intermarket" not in " ".join(best_errors):
+    if btc_error:
         best_errors.append(f"intermarket: {btc_error}")
 
     all_scored_sorted = sorted(all_scored, key=lambda x: abs(x["score"]), reverse=True)
@@ -498,7 +447,7 @@ def generate_signal():
         else:
             tps.append(round(entry - mult * risk, 6))
 
-    conf, reason = call_groq_reasoning(best["symbol"], entry, atr, macro, best_layers, best_errors)
+    conf, reason = call_groq_reasoning(best["symbol"], entry, atr, best_layers, best_errors)
     if conf < 6:
         layer_str = "; ".join([f"{k}={v:.2f}" for k,v in best_layers.items()])
         err_str = ""
@@ -572,7 +521,7 @@ def main():
                 f"🎯 TAKE-PROFIT TARGETS:\n"
                 f"{tp_lines}\n\n"
                 f"📊 CONVICTION: {conviction:+.1f}/5  |  🤖 AI CONFIDENCE: {confidence}/10\n\n"
-                f"🧠 TECHNICAL & MACRO BREAKDOWN:\n"
+                f"🧠 TECHNICAL BREAKDOWN:\n"
                 f"{reasoning}{err_str}\n\n"
                 f"Trade Management: Once TP1 hits, secure partial profits and move stop-loss to entry. "
                 f"Let the rest run risk-free.\n\n"
