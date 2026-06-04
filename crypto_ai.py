@@ -338,7 +338,7 @@ def score_coin(symbol, price, volume_24h, change1h):
     }
     return max(-3, min(3, total)), layers
 
-# ========== AI REASONING (richer breakdown) ==========
+# ========== AI REASONING ==========
 def call_groq_reasoning(symbol, entry, atr, macro, layers):
     layer_str = "; ".join([f"{k}={v:.2f}" for k,v in layers.items()])
     prompt = (
@@ -394,6 +394,7 @@ def generate_signal():
     if not candidates:
         return {"action": "HOLD", "reasoning": "No liquid coins in predefined list."}
 
+    all_scored = []
     best = None
     best_score = 0
     best_layers = None
@@ -412,15 +413,26 @@ def generate_signal():
         coin["ask"] = price * 1.001
         coin["layers"] = layers
 
+        all_scored.append(coin)
+
         if best is None or abs(total_score) > abs(best_score):
             best = coin
             best_score = total_score
             best_layers = layers
 
+    # Build a sorted summary of ALL 30 coins
+    all_scored_sorted = sorted(all_scored, key=lambda x: abs(x["score"]), reverse=True)
+    coin_summary_list = []
+    for c in all_scored_sorted:
+        coin_summary_list.append(f"{c['symbol'].replace('USDT','')}: {c['score']:.2f}")
+    coin_summary = " | ".join(coin_summary_list)
+
     if best is None or abs(best_score) < 1.49:
         best_sym = best["symbol"] if best else "none"
         layer_str = "; ".join([f"{k}={v:.2f}" for k,v in best_layers.items()])
-        reason = f"No strong conviction. Best score: {best_score:.2f} for {best_sym}. Layers: {layer_str}"
+        reason = (f"No strong conviction. Best score: {best_score:.2f} for {best_sym}.\n"
+                  f"Layers: {layer_str}\n"
+                  f"All coins: {coin_summary}")
         return {"action": "HOLD", "reasoning": reason}
 
     direction = "LONG" if best_score >= 0 else "SHORT"
@@ -443,7 +455,9 @@ def generate_signal():
     conf, reason = call_groq_reasoning(best["symbol"], entry, atr, macro, best_layers)
     if conf < 6:
         layer_str = "; ".join([f"{k}={v:.2f}" for k,v in best_layers.items()])
-        reason = f"AI confidence too low ({conf}/10). Best score: {best_score:.2f}. Layers: {layer_str}. {reason}"
+        reason = (f"AI confidence too low ({conf}/10). Best score: {best_score:.2f} for {best['symbol']}.\n"
+                  f"Layers: {layer_str}\n"
+                  f"All coins: {coin_summary}\n{reason}")
         return {"action": "HOLD", "reasoning": reason}
 
     return {
@@ -459,7 +473,7 @@ def generate_signal():
         "layers": best_layers
     }
 
-# ========== TELEGRAM (final format) ==========
+# ========== TELEGRAM ==========
 def send_telegram(text):
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     try:
