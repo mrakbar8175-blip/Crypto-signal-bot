@@ -53,7 +53,7 @@ def fetch_coingecko(url, retries=2):
             pass
     return None
 
-def get_yahoo_klines(symbol_usdt, interval='4h', days=60):
+def get_yahoo_klines(symbol_usdt, interval='1h', days=60):
     yahoo_symbol = symbol_usdt.replace("USDT", "-USD")
     end = datetime.now()
     start = end - timedelta(days=days)
@@ -67,9 +67,9 @@ def get_yahoo_klines(symbol_usdt, interval='4h', days=60):
     except:
         return pd.DataFrame()
 
-# ========== LAYER 1: TECHNICALS (4h) – weight 15% ==========
+# ========== LAYER 1: TECHNICALS (1h) – weight 15% ==========
 def get_technicals(symbol_usdt):
-    df = get_yahoo_klines(symbol_usdt, interval='4h', days=60)
+    df = get_yahoo_klines(symbol_usdt, interval='1h', days=7)   # 7 days of 1h data = up to 168 candles
     if df.empty or len(df) < 50:
         return {"trend": 0, "adx": 0, "macd": 0, "structure": 0, "combined": 0}
 
@@ -139,7 +139,7 @@ def get_technicals(symbol_usdt):
     else:
         macd_score = 0
 
-    # PRICE ACTION (stricter structure)
+    # PRICE ACTION (stricter structure, window=7 on 1h)
     window = 7
     lookback = min(50, len(highs))
     recent_highs = highs.iloc[-lookback:]
@@ -194,8 +194,8 @@ def get_technicals(symbol_usdt):
         "combined": combined
     }
 
-def get_4h_atr(symbol_usdt, current_price):
-    df = get_yahoo_klines(symbol_usdt, interval='4h', days=60)
+def get_1h_atr(symbol_usdt, current_price):
+    df = get_yahoo_klines(symbol_usdt, interval='1h', days=7)
     if df.empty or len(df) < 14:
         return current_price * 0.02
     high, low, close = df['High'], df['Low'], df['Close']
@@ -203,12 +203,12 @@ def get_4h_atr(symbol_usdt, current_price):
     atr = tr.rolling(14).mean().iloc[-1]
     return atr if not pd.isna(atr) else current_price * 0.02
 
-# ========== LAYER 2: BUYING PRESSURE (4h volume) – weight 30% ==========
+# ========== LAYER 2: BUYING PRESSURE (1h volume) – weight 30% ==========
 def get_buying_pressure(symbol_usdt):
-    df = get_yahoo_klines(symbol_usdt, interval='4h', days=10)
+    df = get_yahoo_klines(symbol_usdt, interval='1h', days=2)   # 2 days = 48 candles, we take last 24
     if df.empty or len(df) < 24:
         return 0.0
-    df = df.tail(24)
+    df = df.tail(24)   # last 24 hours
     buy_vol = df.loc[df['Close'] > df['Open'], 'Volume'].sum()
     sell_vol = df.loc[df['Close'] <= df['Open'], 'Volume'].sum()
     total = buy_vol + sell_vol
@@ -216,13 +216,13 @@ def get_buying_pressure(symbol_usdt):
         return 0.0
     return (buy_vol - sell_vol) / total
 
-# ========== LAYER 3: VOLATILITY (4h) – weight 10% ==========
+# ========== LAYER 3: VOLATILITY (1h) – weight 10% ==========
 def get_volatility_score(symbol_usdt, current_price):
-    atr = get_4h_atr(symbol_usdt, current_price)
+    atr = get_1h_atr(symbol_usdt, current_price)
     atr_pct = atr / current_price * 100
     if atr_pct < 1:
         return -1
-    elif atr_pct > 12:
+    elif atr_pct > 8:   # 1h moves are smaller, cap at 8%
         return -1
     else:
         return 1
@@ -257,7 +257,7 @@ def macro_score(macro):
         score -= 1
     return max(-3, min(3, score))
 
-# ========== LAYER 5: SENTIMENT (trend‑aware, 4h trend) – weight 20% ==========
+# ========== LAYER 5: SENTIMENT (trend‑aware, 1h trend) – weight 20% ==========
 def get_fear_greed():
     try:
         r = requests.get("https://api.alternative.me/fng/?limit=1", timeout=5)
@@ -277,8 +277,8 @@ def is_trending(symbol_usdt):
                 return True
     return False
 
-def get_4h_trend_direction(symbol_usdt):
-    df = get_yahoo_klines(symbol_usdt, interval='4h', days=60)
+def get_1h_trend_direction(symbol_usdt):
+    df = get_yahoo_klines(symbol_usdt, interval='1h', days=7)
     if df.empty or len(df) < 50:
         return 'neutral'
     closes = df['Close']
@@ -293,7 +293,7 @@ def get_4h_trend_direction(symbol_usdt):
 def sentiment_score(symbol_usdt):
     fg_value, _ = get_fear_greed()
     trending = is_trending(symbol_usdt)
-    trend_dir = get_4h_trend_direction(symbol_usdt)
+    trend_dir = get_1h_trend_direction(symbol_usdt)
 
     score = 0
     if fg_value < 30 and trend_dir != 'down':
@@ -342,7 +342,7 @@ def score_coin(symbol, price, volume_24h, change1h):
 def call_groq_reasoning(symbol, entry, atr, macro, layers):
     layer_str = "; ".join([f"{k}={v:.2f}" for k,v in layers.items()])
     prompt = (
-        f"Trade signal for {symbol} at {entry}. 4h ATR: {atr:.4f}. "
+        f"Trade signal for {symbol} at {entry}. 1h ATR: {atr:.4f}. "
         f"Macro: BTC.D {macro.get('btc_d')}, DXY {macro.get('dxy')}. "
         f"Layer scores: {layer_str}. "
         "Provide a detailed reasoning (2-3 sentences) covering chart setup, macro environment, and trade management. "
@@ -406,7 +406,7 @@ def generate_signal():
         volume = coin["volume"]
 
         total_score, layers = score_coin(sym, price, volume, 0)
-        atr = get_4h_atr(sym, price)
+        atr = get_1h_atr(sym, price)
         coin["score"] = total_score
         coin["atr"] = atr
         coin["bid"] = price * 0.999
