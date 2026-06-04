@@ -53,7 +53,8 @@ def fetch_coingecko(url, retries=2):
             pass
     return None
 
-def get_yahoo_klines(symbol_usdt, interval='1h', days=7):
+def get_yahoo_klines(symbol_usdt, interval='4h', days=60):
+    """Fetch 4‑hour candles by default; fallback to 1h if needed."""
     yahoo_symbol = symbol_usdt.replace("USDT", "-USD")
     end = datetime.now()
     start = end - timedelta(days=days)
@@ -67,17 +68,17 @@ def get_yahoo_klines(symbol_usdt, interval='1h', days=7):
     except:
         return pd.DataFrame()
 
-# ========== LAYER 1: TECHNICALS (upgraded) – weight 15% ==========
+# ========== LAYER 1: TECHNICALS (4h chart) – weight 15% ==========
 def get_technicals(symbol_usdt):
-    df = get_yahoo_klines(symbol_usdt, interval='1h', days=7)
+    df = get_yahoo_klines(symbol_usdt, interval='4h', days=60)
     if df.empty or len(df) < 50:
-        return {"trend": 0, "adx": 0, "macd": 0, "structure": 0}
+        return {"trend": 0, "adx": 0, "macd": 0, "structure": 0, "combined": 0}
 
     closes = df['Close']
     highs  = df['High']
     lows   = df['Low']
 
-    # ---------- EMA trend (simple, reliable) ----------
+    # ---------- EMA trend ----------
     ema50 = closes.ewm(span=50, adjust=False).mean()
     ema200 = closes.ewm(span=200, adjust=False).mean() if len(closes) >= 200 else ema50
     current = closes.iloc[-1]
@@ -92,7 +93,7 @@ def get_technicals(symbol_usdt):
         trend -= 1.5
     trend = max(-3, min(3, trend))
 
-    # ---------- ADX (trend strength, replaces RSI) ----------
+    # ---------- ADX (trend strength) ----------
     def calc_adx(high, low, close, period=14):
         dm_plus = high.diff()
         dm_minus = -low.diff()
@@ -113,21 +114,19 @@ def get_technicals(symbol_usdt):
     di_plus_now = di_plus.iloc[-1]
     di_minus_now = di_minus.iloc[-1]
 
-    # ADX scoring: only give points if trend is strong (ADX > 25)
     adx_score = 0
     if adx_now > 25:
         if di_plus_now > di_minus_now:
-            adx_score = 2.5   # strong uptrend
+            adx_score = 2.5
         else:
-            adx_score = -2.5  # strong downtrend
+            adx_score = -2.5
     elif adx_now > 20:
         if di_plus_now > di_minus_now:
             adx_score = 1.0
         else:
             adx_score = -1.0
-    # else stay 0 (ranging/no trend)
 
-    # ---------- MACD (simplified – just above/below zero) ----------
+    # ---------- MACD ----------
     ema12 = closes.ewm(span=12, adjust=False).mean()
     ema26 = closes.ewm(span=26, adjust=False).mean()
     macd_line = ema12 - ema26
@@ -141,7 +140,7 @@ def get_technicals(symbol_usdt):
     else:
         macd_score = 0
 
-    # ---------- PRICE ACTION (stricter structure, window=7) ----------
+    # ---------- PRICE ACTION (stricter structure, window=7 on 4h) ----------
     window = 7
     lookback = min(50, len(highs))
     recent_highs = highs.iloc[-lookback:]
@@ -159,9 +158,7 @@ def get_technicals(symbol_usdt):
     if len(swing_highs) >= 2 and len(swing_lows) >= 2:
         last_hh = swing_highs[-1][1] > swing_highs[-2][1]
         last_hl = swing_lows[-1][1] > swing_lows[-2][1]
-        # also require at least two consecutive higher highs and higher lows for a strong uptrend
         if last_hh and last_hl:
-            # check if the previous swing also was higher to confirm
             if len(swing_highs) >= 3 and len(swing_lows) >= 3:
                 prev_hh = swing_highs[-2][1] > swing_highs[-3][1]
                 prev_hl = swing_lows[-2][1] > swing_lows[-3][1]
@@ -172,7 +169,6 @@ def get_technicals(symbol_usdt):
             else:
                 structure_score = 2.0
         elif (not last_hh) and (not last_hl):
-            # potential downtrend
             if len(swing_highs) >= 3 and len(swing_lows) >= 3:
                 prev_lh = swing_highs[-2][1] < swing_highs[-3][1]
                 prev_ll = swing_lows[-2][1] < swing_lows[-3][1]
@@ -182,19 +178,15 @@ def get_technicals(symbol_usdt):
                     structure_score = -2.0
             else:
                 structure_score = -2.0
-        else:
-            structure_score = 0
     structure_score = max(-3, min(3, structure_score))
 
     # ---------- Combine with new weights ----------
-    # trend 25%, adx 25%, macd 15%, structure 35%
     combined = (
         trend * 0.25 +
         adx_score * 0.25 +
         macd_score * 0.15 +
         structure_score * 0.35
     )
-    # scale to roughly -3..3 (it already is)
 
     return {
         "trend": trend,
@@ -204,8 +196,8 @@ def get_technicals(symbol_usdt):
         "combined": combined
     }
 
-def get_1h_atr(symbol_usdt, current_price):
-    df = get_yahoo_klines(symbol_usdt, interval='1h', days=7)
+def get_4h_atr(symbol_usdt, current_price):
+    df = get_yahoo_klines(symbol_usdt, interval='4h', days=60)
     if df.empty or len(df) < 14:
         return current_price * 0.02
     high, low, close = df['High'], df['Low'], df['Close']
@@ -213,12 +205,12 @@ def get_1h_atr(symbol_usdt, current_price):
     atr = tr.rolling(14).mean().iloc[-1]
     return atr if not pd.isna(atr) else current_price * 0.02
 
-# ========== LAYER 2: BUYING PRESSURE (Yahoo) – weight 30% ==========
+# ========== LAYER 2: BUYING PRESSURE (4h volume) – weight 30% ==========
 def get_buying_pressure(symbol_usdt):
-    df = get_yahoo_klines(symbol_usdt, interval='1h', days=2)
+    df = get_yahoo_klines(symbol_usdt, interval='4h', days=10)   # 10 days = ~60 4h candles
     if df.empty or len(df) < 24:
         return 0.0
-    df = df.tail(24)
+    df = df.tail(24)   # last 24 4‑hour candles = 4 days
     buy_vol = df.loc[df['Close'] > df['Open'], 'Volume'].sum()
     sell_vol = df.loc[df['Close'] <= df['Open'], 'Volume'].sum()
     total = buy_vol + sell_vol
@@ -226,13 +218,13 @@ def get_buying_pressure(symbol_usdt):
         return 0.0
     return (buy_vol - sell_vol) / total
 
-# ========== LAYER 3: VOLATILITY (Yahoo) – weight 10% ==========
+# ========== LAYER 3: VOLATILITY (4h) – weight 10% ==========
 def get_volatility_score(symbol_usdt, current_price):
-    atr = get_1h_atr(symbol_usdt, current_price)
+    atr = get_4h_atr(symbol_usdt, current_price)
     atr_pct = atr / current_price * 100
     if atr_pct < 1:
         return -1
-    elif atr_pct > 8:
+    elif atr_pct > 12:   # wider range for 4h
         return -1
     else:
         return 1
@@ -267,7 +259,7 @@ def macro_score(macro):
         score -= 1
     return max(-3, min(3, score))
 
-# ========== LAYER 5: SENTIMENT (trend‑aware) – weight 20% ==========
+# ========== LAYER 5: SENTIMENT (trend‑aware, 4h trend) – weight 20% ==========
 def get_fear_greed():
     try:
         r = requests.get("https://api.alternative.me/fng/?limit=1", timeout=5)
@@ -287,8 +279,9 @@ def is_trending(symbol_usdt):
                 return True
     return False
 
-def get_1h_trend_direction(symbol_usdt):
-    df = get_yahoo_klines(symbol_usdt, interval='1h', days=7)
+def get_4h_trend_direction(symbol_usdt):
+    """Return 'up', 'down', or 'neutral' based on 4H EMA50 vs EMA200."""
+    df = get_yahoo_klines(symbol_usdt, interval='4h', days=60)
     if df.empty or len(df) < 50:
         return 'neutral'
     closes = df['Close']
@@ -303,7 +296,7 @@ def get_1h_trend_direction(symbol_usdt):
 def sentiment_score(symbol_usdt):
     fg_value, _ = get_fear_greed()
     trending = is_trending(symbol_usdt)
-    trend_dir = get_1h_trend_direction(symbol_usdt)
+    trend_dir = get_4h_trend_direction(symbol_usdt)
 
     score = 0
     if fg_value < 30 and trend_dir != 'down':
@@ -319,7 +312,7 @@ def sentiment_score(symbol_usdt):
 # ========== SCORING ENGINE ==========
 def score_coin(symbol, price, volume_24h, change1h):
     tech = get_technicals(symbol)
-    tech_combined = tech["combined"]   # already scaled
+    tech_combined = tech["combined"]
 
     buying = get_buying_pressure(symbol)
     buying_score = buying * 3
@@ -352,7 +345,7 @@ def score_coin(symbol, price, volume_24h, change1h):
 def call_groq_reasoning(symbol, entry, atr, macro, layers):
     layer_str = "; ".join([f"{k}={v:.2f}" for k,v in layers.items()])
     prompt = (
-        f"Trade signal for {symbol} at {entry}. 1h ATR: {atr:.4f}. "
+        f"Trade signal for {symbol} at {entry}. 4h ATR: {atr:.4f}. "
         f"Macro: BTC.D {macro.get('btc_d')}, DXY {macro.get('dxy')}. "
         f"Layer scores: {layer_str}. "
         "Provide a short reasoning and confidence 1-10.\n"
@@ -414,7 +407,7 @@ def generate_signal():
         volume = coin["volume"]
 
         total_score, layers = score_coin(sym, price, volume, 0)
-        atr = get_1h_atr(sym, price)
+        atr = get_4h_atr(sym, price)
         coin["score"] = total_score
         coin["atr"] = atr
         coin["bid"] = price * 0.999
