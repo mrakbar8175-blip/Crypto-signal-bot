@@ -67,13 +67,17 @@ def get_yahoo_klines(symbol_usdt, interval='1h', days=7):
     except:
         return pd.DataFrame()
 
-# ========== LAYER 1: TECHNICALS (Yahoo 1h) – weight 15% ==========
+# ========== LAYER 1: TECHNICALS (upgraded) – weight 15% ==========
 def get_technicals(symbol_usdt):
     df = get_yahoo_klines(symbol_usdt, interval='1h', days=7)
     if df.empty or len(df) < 50:
-        return {"trend": 0, "momentum": 0, "macd": 0}
+        return {"trend": 0, "adx": 0, "macd": 0, "structure": 0}
 
     closes = df['Close']
+    highs  = df['High']
+    lows   = df['Low']
+
+    # ---------- EMA trend (simple, reliable) ----------
     ema50 = closes.ewm(span=50, adjust=False).mean()
     ema200 = closes.ewm(span=200, adjust=False).mean() if len(closes) >= 200 else ema50
     current = closes.iloc[-1]
@@ -88,40 +92,117 @@ def get_technicals(symbol_usdt):
         trend -= 1.5
     trend = max(-3, min(3, trend))
 
-    delta = closes.diff()
-    gain = (delta.where(delta > 0, 0)).rolling(14).mean()
-    loss = (-delta.where(delta < 0, 0)).rolling(14).mean()
-    rs = gain / loss
-    rsi_val = 100 - (100 / (1 + rs)).iloc[-1] if not rs.empty else 50
-    if rsi_val < 30:
-        momentum = 2
-    elif rsi_val > 70:
-        momentum = -2
-    elif rsi_val > 60:
-        momentum = 1
-    elif rsi_val < 40:
-        momentum = -1
-    else:
-        momentum = 0
+    # ---------- ADX (trend strength, replaces RSI) ----------
+    def calc_adx(high, low, close, period=14):
+        dm_plus = high.diff()
+        dm_minus = -low.diff()
+        dm_plus[dm_plus < 0] = 0
+        dm_minus[dm_minus < 0] = 0
+        tr = pd.concat([high - low,
+                        (high - close.shift()).abs(),
+                        (low - close.shift()).abs()], axis=1).max(axis=1)
+        atr = tr.ewm(alpha=1/period, adjust=False).mean()
+        di_plus = 100 * (dm_plus.ewm(alpha=1/period, adjust=False).mean() / atr)
+        di_minus = 100 * (dm_minus.ewm(alpha=1/period, adjust=False).mean() / atr)
+        dx = 100 * (di_plus - di_minus).abs() / (di_plus + di_minus)
+        adx = dx.ewm(alpha=1/period, adjust=False).mean()
+        return adx, di_plus, di_minus
 
+    adx_series, di_plus, di_minus = calc_adx(highs, lows, closes, 14)
+    adx_now = adx_series.iloc[-1]
+    di_plus_now = di_plus.iloc[-1]
+    di_minus_now = di_minus.iloc[-1]
+
+    # ADX scoring: only give points if trend is strong (ADX > 25)
+    adx_score = 0
+    if adx_now > 25:
+        if di_plus_now > di_minus_now:
+            adx_score = 2.5   # strong uptrend
+        else:
+            adx_score = -2.5  # strong downtrend
+    elif adx_now > 20:
+        if di_plus_now > di_minus_now:
+            adx_score = 1.0
+        else:
+            adx_score = -1.0
+    # else stay 0 (ranging/no trend)
+
+    # ---------- MACD (simplified – just above/below zero) ----------
     ema12 = closes.ewm(span=12, adjust=False).mean()
     ema26 = closes.ewm(span=26, adjust=False).mean()
     macd_line = ema12 - ema26
     signal = macd_line.ewm(span=9, adjust=False).mean()
     histogram = macd_line - signal
-    macd = 0
-    if len(histogram) >= 2:
-        hist_now = histogram.iloc[-1]
-        hist_prev = histogram.iloc[-2]
-        if hist_now > 0 and hist_prev <= 0:
-            macd = 2
-        elif hist_now < 0 and hist_prev >= 0:
-            macd = -2
-        elif hist_now > 0:
-            macd = 1
-        elif hist_now < 0:
-            macd = -1
-    return {"trend": trend, "momentum": momentum, "macd": macd}
+    macd_now = histogram.iloc[-1]
+    if macd_now > 0:
+        macd_score = 1.5
+    elif macd_now < 0:
+        macd_score = -1.5
+    else:
+        macd_score = 0
+
+    # ---------- PRICE ACTION (stricter structure, window=7) ----------
+    window = 7
+    lookback = min(50, len(highs))
+    recent_highs = highs.iloc[-lookback:]
+    recent_lows  = lows.iloc[-lookback:]
+
+    swing_highs = []
+    swing_lows  = []
+    for i in range(window, len(recent_highs) - window):
+        if all(recent_highs.iloc[i] >= recent_highs.iloc[i-window:i+window+1]):
+            swing_highs.append((i, recent_highs.iloc[i]))
+        if all(recent_lows.iloc[i] <= recent_lows.iloc[i-window:i+window+1]):
+            swing_lows.append((i, recent_lows.iloc[i]))
+
+    structure_score = 0
+    if len(swing_highs) >= 2 and len(swing_lows) >= 2:
+        last_hh = swing_highs[-1][1] > swing_highs[-2][1]
+        last_hl = swing_lows[-1][1] > swing_lows[-2][1]
+        # also require at least two consecutive higher highs and higher lows for a strong uptrend
+        if last_hh and last_hl:
+            # check if the previous swing also was higher to confirm
+            if len(swing_highs) >= 3 and len(swing_lows) >= 3:
+                prev_hh = swing_highs[-2][1] > swing_highs[-3][1]
+                prev_hl = swing_lows[-2][1] > swing_lows[-3][1]
+                if prev_hh and prev_hl:
+                    structure_score = 3.0
+                else:
+                    structure_score = 2.0
+            else:
+                structure_score = 2.0
+        elif (not last_hh) and (not last_hl):
+            # potential downtrend
+            if len(swing_highs) >= 3 and len(swing_lows) >= 3:
+                prev_lh = swing_highs[-2][1] < swing_highs[-3][1]
+                prev_ll = swing_lows[-2][1] < swing_lows[-3][1]
+                if prev_lh and prev_ll:
+                    structure_score = -3.0
+                else:
+                    structure_score = -2.0
+            else:
+                structure_score = -2.0
+        else:
+            structure_score = 0
+    structure_score = max(-3, min(3, structure_score))
+
+    # ---------- Combine with new weights ----------
+    # trend 25%, adx 25%, macd 15%, structure 35%
+    combined = (
+        trend * 0.25 +
+        adx_score * 0.25 +
+        macd_score * 0.15 +
+        structure_score * 0.35
+    )
+    # scale to roughly -3..3 (it already is)
+
+    return {
+        "trend": trend,
+        "adx": adx_score,
+        "macd": macd_score,
+        "structure": structure_score,
+        "combined": combined
+    }
 
 def get_1h_atr(symbol_usdt, current_price):
     df = get_yahoo_klines(symbol_usdt, interval='1h', days=7)
@@ -238,7 +319,7 @@ def sentiment_score(symbol_usdt):
 # ========== SCORING ENGINE ==========
 def score_coin(symbol, price, volume_24h, change1h):
     tech = get_technicals(symbol)
-    tech_combined = (tech["trend"] * 0.5 + tech["momentum"] * 0.3 + tech["macd"] * 0.2) / 3
+    tech_combined = tech["combined"]   # already scaled
 
     buying = get_buying_pressure(symbol)
     buying_score = buying * 3
