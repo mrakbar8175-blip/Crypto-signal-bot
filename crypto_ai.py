@@ -53,7 +53,7 @@ def fetch_coingecko(url, retries=2):
             pass
     return None
 
-def get_yahoo_klines(symbol_usdt, interval='1h', days=60):
+def get_yahoo_klines(symbol_usdt, interval='4h', days=60):
     yahoo_symbol = symbol_usdt.replace("USDT", "-USD")
     end = datetime.now()
     start = end - timedelta(days=days)
@@ -67,12 +67,12 @@ def get_yahoo_klines(symbol_usdt, interval='1h', days=60):
     except:
         return pd.DataFrame()
 
-# ========== LAYER 1: TECHNICALS (1h, structure‑heavy, no MACD) – weight 20% ==========
+# ========== LAYER 1: TECHNICALS (4h, structure‑heavy, no MACD) – weight 20% ==========
 def get_technicals(symbol_usdt):
-    df = get_yahoo_klines(symbol_usdt, interval='1h', days=7)
+    df = get_yahoo_klines(symbol_usdt, interval='4h', days=14)   # 14 days = ~84 candles
     error = None
     if df.empty or len(df) < 50:
-        error = f"insufficient 1h data ({len(df)} candles)"
+        error = f"insufficient 4h data ({len(df)} candles)"
         return {
             "trend": 0, "adx": 0, "structure": 0,
             "combined": 0, "ema50_distance": 1.0, "error": error
@@ -130,7 +130,7 @@ def get_technicals(symbol_usdt):
         else:
             adx_score = -1.0
 
-    # PRICE ACTION (structure, window=7 on 1h)
+    # PRICE ACTION (structure, window=7 on 4h)
     window = 7
     lookback = min(50, len(highs))
     recent_highs = highs.iloc[-lookback:]
@@ -182,11 +182,12 @@ def get_technicals(symbol_usdt):
 
     return {
         "trend": trend, "adx": adx_score, "structure": structure_score,
-        "combined": combined, "ema50_distance": distance_pct, "error": None
+        "combined": combined, "ema50_distance": distance_pct,
+        "adx_value": adx_now, "error": None
     }
 
-def get_1h_atr(symbol_usdt, current_price):
-    df = get_yahoo_klines(symbol_usdt, interval='1h', days=7)
+def get_4h_atr(symbol_usdt, current_price):
+    df = get_yahoo_klines(symbol_usdt, interval='4h', days=14)
     if df.empty or len(df) < 14:
         return current_price * 0.02, "ATR data insufficient, using 2% fallback"
     high, low, close = df['High'], df['Low'], df['Close']
@@ -196,12 +197,12 @@ def get_1h_atr(symbol_usdt, current_price):
         return current_price * 0.02, "ATR calculation failed, using 2% fallback"
     return atr, None
 
-# ========== LAYER 2: BUYING PRESSURE (1h, 48h lookback) – weight 40% ==========
+# ========== LAYER 2: BUYING PRESSURE (4h, 48 candles lookback) – weight 45% ==========
 def get_buying_pressure(symbol_usdt):
-    df = get_yahoo_klines(symbol_usdt, interval='1h', days=3)
+    df = get_yahoo_klines(symbol_usdt, interval='4h', days=10)   # 10 days = ~60 candles
     if df.empty or len(df) < 48:
         return 0.0, f"insufficient volume data ({len(df)} candles)"
-    df = df.tail(48)
+    df = df.tail(48)   # last 48 4‑hour candles = 8 days
     buy_vol = df.loc[df['Close'] > df['Open'], 'Volume'].sum()
     sell_vol = df.loc[df['Close'] <= df['Open'], 'Volume'].sum()
     total = buy_vol + sell_vol
@@ -209,17 +210,17 @@ def get_buying_pressure(symbol_usdt):
         return 0.0, "zero total volume"
     return (buy_vol - sell_vol) / total, None
 
-# ========== LAYER 3: VOLATILITY (1h) – weight 5% ==========
+# ========== LAYER 3: VOLATILITY (4h) – weight 5% ==========
 def get_volatility_score(symbol_usdt, current_price):
-    atr, atr_err = get_1h_atr(symbol_usdt, current_price)
+    atr, atr_err = get_4h_atr(symbol_usdt, current_price)
     atr_pct = atr / current_price * 100
-    if atr_pct < 1 or atr_pct > 5:
+    if atr_pct < 2 or atr_pct > 10:   # 4h sweet spot: 2-10%
         return -1, atr_err
     return 1, None
 
-# ========== LAYER 4: INTERMARKET (BTC trend) – weight 30% ==========
+# ========== LAYER 4: INTERMARKET (BTC 4h trend) – weight 25% ==========
 def btc_trend_score():
-    df = get_yahoo_klines("BTCUSDT", interval='1h', days=7)
+    df = get_yahoo_klines("BTCUSDT", interval='4h', days=14)
     if df.empty or len(df) < 50:
         return 0, f"BTC data unavailable ({len(df)} candles)"
     closes = df['Close']
@@ -230,33 +231,40 @@ def btc_trend_score():
     else:
         return -2, None
 
-# ========== LAYER 5: VOLUME TREND – weight 5% ==========
+# ========== LAYER 5: VOLUME TREND (4h, 6 candles) – weight 5% ==========
 def volume_trend_score(symbol_usdt):
-    df = get_yahoo_klines(symbol_usdt, interval='1h', days=2)
+    df = get_yahoo_klines(symbol_usdt, interval='4h', days=5)   # 5 days = 30 candles
     if df.empty or len(df) < 12:
         return 0, f"volume data insufficient ({len(df)} candles)"
     recent = df['Volume'].tail(6)
     first_half = recent[:3].mean()
     second_half = recent[3:].mean()
-    if second_half > first_half * 1.1:
+    if second_half > first_half * 1.05:      # slightly more sensitive
         return 2, None
-    elif second_half < first_half * 0.9:
+    elif second_half < first_half * 0.95:
         return -2, None
     return 0, None
 
-# ========== MOMENTUM ALIGNMENT (last 1h candle direction) ==========
+# ========== MOMENTUM ALIGNMENT (last 4h candle direction) ==========
 def momentum_alignment_score(symbol_usdt, direction):
-    df = get_yahoo_klines(symbol_usdt, interval='1h', days=1)
+    df = get_yahoo_klines(symbol_usdt, interval='4h', days=2)
     if df.empty or len(df) < 2:
         return 0.0
     last = df.iloc[-1]
     if direction == "LONG" and last['Close'] > last['Open']:
-        return 0.15
+        return 0.20   # increased from 0.15
     elif direction == "SHORT" and last['Close'] < last['Open']:
-        return 0.15
+        return 0.20
     return 0.0
 
-# ========== SCORING ENGINE (with momentum bonus) ==========
+# ========== TREND STRENGTH BONUS (ADX > 30) ==========
+def trend_strength_bonus(adx_value, base_score):
+    """If ADX > 30 and the base score already points in a direction, add a small bonus."""
+    if adx_value > 30 and abs(base_score) > 0.5:
+        return 0.20 * (1 if base_score > 0 else -1)
+    return 0.0
+
+# ========== SCORING ENGINE ==========
 def score_coin(symbol, price, volume_24h, change1h, btc_score, btc_error):
     errors = []
     tech = get_technicals(symbol)
@@ -264,6 +272,7 @@ def score_coin(symbol, price, volume_24h, change1h, btc_score, btc_error):
         errors.append(f"tech({symbol}): {tech['error']}")
     tech_combined = tech["combined"]
     ema50_distance = tech["ema50_distance"]
+    adx_value = tech.get("adx_value", 0)
 
     buying, buy_err = get_buying_pressure(symbol)
     if buy_err:
@@ -282,11 +291,12 @@ def score_coin(symbol, price, volume_24h, change1h, btc_score, btc_error):
     if vt_err:
         errors.append(f"volume_trend({symbol}): {vt_err}")
 
+    # Base total from the five layers
     total = (
         0.20 * tech_combined +
-        0.40 * buying_score +
+        0.45 * buying_score +        # increased from 0.40
         0.05 * vol_score +
-        0.30 * intermarket_s +
+        0.25 * intermarket_s +       # decreased from 0.30
         0.05 * vol_trend_s
     )
 
@@ -297,9 +307,9 @@ def score_coin(symbol, price, volume_24h, change1h, btc_score, btc_error):
         "intermarket": intermarket_s,
         "volume_trend": vol_trend_s,
     }
-    return max(-3, min(3, total)), layers, ema50_distance, errors
+    return max(-3, min(3, total)), layers, ema50_distance, adx_value, errors
 
-# ========== AI REASONING (alignment‑aware) ==========
+# ========== AI REASONING ==========
 def call_groq_reasoning(symbol, entry, atr, layers, errors=None):
     layer_str = "; ".join([f"{k}={v:.2f}" for k,v in layers.items()])
     err_str = ""
@@ -312,7 +322,7 @@ def call_groq_reasoning(symbol, entry, atr, layers, errors=None):
     alignment_strength = max(bearish_count, bullish_count)
 
     prompt = (
-        f"Trade signal for {symbol} at {entry}. 1h ATR: {atr:.4f}. "
+        f"Trade signal for {symbol} at {entry}. 4h ATR: {atr:.4f}. "
         f"Layer scores: {layer_str}{err_str}. "
         f"All {alignment_strength} out of 4 directional layers are strongly aligned (bearish/bullish). "
         "Provide a concise, punchy reasoning (max 2 sentences) capturing why this trade sets up well. "
@@ -373,6 +383,7 @@ def generate_signal():
     best_score = 0
     best_layers = None
     best_ema_distance = 0.0
+    best_adx = 0
     best_errors = []
 
     for coin in candidates:
@@ -380,19 +391,20 @@ def generate_signal():
         price = coin["price"]
         volume = coin["volume"]
 
-        total_score, layers, ema_dist, errors = score_coin(
+        total_score, layers, ema_dist, adx_val, errors = score_coin(
             sym, price, volume, 0, btc_score, btc_error
         )
-        atr, _ = get_1h_atr(sym, price)
-        if atr / price > 0.05:
+        atr, _ = get_4h_atr(sym, price)
+        if atr / price > 0.10:   # 4h volatility cap at 10%
             total_score = 0.0
-            errors.append("volatility cap triggered (ATR>5%)")
+            errors.append("volatility cap triggered (ATR>10%)")
         coin["score"] = total_score
         coin["atr"] = atr
         coin["bid"] = price * 0.999
         coin["ask"] = price * 1.001
         coin["layers"] = layers
         coin["ema_distance"] = ema_dist
+        coin["adx_value"] = adx_val
         coin["errors"] = errors
 
         all_scored.append(coin)
@@ -402,6 +414,7 @@ def generate_signal():
             best_score = total_score
             best_layers = layers
             best_ema_distance = ema_dist
+            best_adx = adx_val
             best_errors = errors
 
     if btc_error:
@@ -428,10 +441,14 @@ def generate_signal():
 
     direction = "LONG" if best_score >= 0 else "SHORT"
 
+    # Apply trend strength bonus (ADX > 30)
+    best_score += trend_strength_bonus(best_adx, best_score)
+
     # Apply momentum alignment bonus AFTER selecting direction
     momentum_bonus = momentum_alignment_score(best["symbol"], direction)
     best_score += momentum_bonus
-    # Re-check threshold after bonus (still must be ≥1.5)
+
+    # Re-check threshold after bonuses (still must be ≥1.5)
     if abs(best_score) < 1.49:
         best_sym = best["symbol"]
         layer_str = "; ".join([f"{k}={v:.2f}" for k,v in best_layers.items()])
@@ -439,7 +456,7 @@ def generate_signal():
         if best_errors:
             err_str = " | Errors: " + "; ".join(best_errors)
         display_score = round(best_score, 2)
-        reason = (f"No strong conviction after momentum alignment. Best score: {display_score:+.2f}/3 for {best_sym}.\n"
+        reason = (f"No strong conviction after bonuses. Best score: {display_score:+.2f}/3 for {best_sym}.\n"
                   f"Layers: {layer_str}{err_str}\n"
                   f"All coins: {coin_summary}")
         return {"action": "HOLD", "reasoning": reason}
@@ -517,7 +534,6 @@ def main():
             entry_low  = round(entry_price * 0.995, 4)
             entry_high = round(entry_price * 1.005, 4)
 
-            # Minimalist TP lines – just prices with 📌
             tp_lines = "\n".join([f"📌 ${tp:,.4f}" for tp in tps])
 
             err_str = ""
