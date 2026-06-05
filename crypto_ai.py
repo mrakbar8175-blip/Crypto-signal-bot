@@ -287,17 +287,27 @@ def score_coin(symbol, price, volume_24h, change1h, btc_score, btc_error):
     }
     return max(-3, min(3, total)), layers, ema50_distance, errors
 
-# ========== AI REASONING ==========
+# ========== AI REASONING (confidence boosted for alignment) ==========
 def call_groq_reasoning(symbol, entry, atr, layers, errors=None):
     layer_str = "; ".join([f"{k}={v:.2f}" for k,v in layers.items()])
     err_str = ""
     if errors:
         err_str = " | Data issues: " + "; ".join(errors)
+
+    # Count how many directional layers agree on the side (all negative or all positive)
+    directional_scores = [layers["tech"], layers["buying_press"], layers["intermarket"], layers["volume_trend"]]
+    bearish_count = sum(1 for s in directional_scores if s < -0.5)
+    bullish_count = sum(1 for s in directional_scores if s > 0.5)
+    alignment_strength = max(bearish_count, bullish_count)
+
     prompt = (
         f"Trade signal for {symbol} at {entry}. 1h ATR: {atr:.4f}. "
         f"Layer scores: {layer_str}{err_str}. "
+        f"All {alignment_strength} out of 4 directional layers are strongly aligned (bearish/bullish). "
         "Provide a detailed reasoning (2-3 sentences) covering chart setup and trade management. "
-        "Also give a confidence 1-10.\n"
+        "Also give a confidence score 1-10. "
+        "**Confidence should reflect the number of aligned layers.** If 3 or more layers agree strongly, confidence should be at least 6. "
+        "If all 4 agree, confidence should be 7 or higher. Low ATR (1-5%) is a positive sign for risk management, not a caution. "
         "Format: CONFIDENCE: 7 | REASONING: [text]"
     )
     url = "https://api.groq.com/openai/v1/chat/completions"
@@ -405,7 +415,6 @@ def generate_signal():
         return {"action": "HOLD", "reasoning": reason}
 
     direction = "LONG" if best_score >= 0 else "SHORT"
-    # Chase protection removed
 
     entry = best["bid"] if direction == "LONG" else best["ask"]
     atr = best["atr"]
@@ -435,7 +444,7 @@ def generate_signal():
                   f"All coins: {coin_summary}\n{reason}")
         return {"action": "HOLD", "reasoning": reason}
 
-    conviction_display = round(best_score, 2)   # -3..+3
+    conviction_display = round(best_score, 2)
 
     return {
         "action": direction,
