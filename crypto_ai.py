@@ -67,7 +67,7 @@ def get_yahoo_klines(symbol_usdt, interval='1h', days=60):
     except:
         return pd.DataFrame()
 
-# ========== LAYER 1: TECHNICALS (1h, MACD‑free) – weight 20% ==========
+# ========== LAYER 1: TECHNICALS (1h, structure‑heavy, no MACD) – weight 20% ==========
 def get_technicals(symbol_usdt):
     df = get_yahoo_klines(symbol_usdt, interval='1h', days=7)
     error = None
@@ -170,11 +170,11 @@ def get_technicals(symbol_usdt):
                 structure_score = -2.0
     structure_score = max(-3, min(3, structure_score))
 
-    # Combined (no MACD)
+    # Combined (structure‑heavy, no MACD)
     combined = (
-        trend * 0.35 +
+        trend * 0.30 +
         adx_score * 0.25 +
-        structure_score * 0.40
+        structure_score * 0.45
     )
 
     ema50_val = ema50.iloc[-1]
@@ -244,7 +244,19 @@ def volume_trend_score(symbol_usdt):
         return -2, None
     return 0, None
 
-# ========== SCORING ENGINE ==========
+# ========== MOMENTUM ALIGNMENT (last 1h candle direction) ==========
+def momentum_alignment_score(symbol_usdt, direction):
+    df = get_yahoo_klines(symbol_usdt, interval='1h', days=1)
+    if df.empty or len(df) < 2:
+        return 0.0
+    last = df.iloc[-1]
+    if direction == "LONG" and last['Close'] > last['Open']:
+        return 0.15
+    elif direction == "SHORT" and last['Close'] < last['Open']:
+        return 0.15
+    return 0.0
+
+# ========== SCORING ENGINE (with momentum bonus) ==========
 def score_coin(symbol, price, volume_24h, change1h, btc_score, btc_error):
     errors = []
     tech = get_technicals(symbol)
@@ -287,14 +299,13 @@ def score_coin(symbol, price, volume_24h, change1h, btc_score, btc_error):
     }
     return max(-3, min(3, total)), layers, ema50_distance, errors
 
-# ========== AI REASONING (confidence boosted for alignment) ==========
+# ========== AI REASONING (alignment‑aware) ==========
 def call_groq_reasoning(symbol, entry, atr, layers, errors=None):
     layer_str = "; ".join([f"{k}={v:.2f}" for k,v in layers.items()])
     err_str = ""
     if errors:
         err_str = " | Data issues: " + "; ".join(errors)
 
-    # Count how many directional layers agree on the side (all negative or all positive)
     directional_scores = [layers["tech"], layers["buying_press"], layers["intermarket"], layers["volume_trend"]]
     bearish_count = sum(1 for s in directional_scores if s < -0.5)
     bullish_count = sum(1 for s in directional_scores if s > 0.5)
@@ -304,10 +315,10 @@ def call_groq_reasoning(symbol, entry, atr, layers, errors=None):
         f"Trade signal for {symbol} at {entry}. 1h ATR: {atr:.4f}. "
         f"Layer scores: {layer_str}{err_str}. "
         f"All {alignment_strength} out of 4 directional layers are strongly aligned (bearish/bullish). "
-        "Provide a detailed reasoning (2-3 sentences) covering chart setup and trade management. "
+        "Provide a concise, punchy reasoning (max 2 sentences) capturing why this trade sets up well. "
         "Also give a confidence score 1-10. "
-        "**Confidence should reflect the number of aligned layers.** If 3 or more layers agree strongly, confidence should be at least 6. "
-        "If all 4 agree, confidence should be 7 or higher. Low ATR (1-5%) is a positive sign for risk management, not a caution. "
+        "Confidence must reflect the number of aligned layers: at least 6 if 3 layers agree, 7+ if all 4 agree. "
+        "Low ATR is a positive sign for risk management, not a caution. "
         "Format: CONFIDENCE: 7 | REASONING: [text]"
     )
     url = "https://api.groq.com/openai/v1/chat/completions"
@@ -316,7 +327,7 @@ def call_groq_reasoning(symbol, entry, atr, layers, errors=None):
         "model": "llama-3.3-70b-versatile",
         "messages": [{"role": "user", "content": prompt}],
         "temperature": 0.3,
-        "max_tokens": 300
+        "max_tokens": 200
     }
     try:
         resp = requests.post(url, headers=headers, json=payload, timeout=30)
@@ -402,6 +413,7 @@ def generate_signal():
         coin_summary_list.append(f"{c['symbol'].replace('USDT','')}: {c['score']:.2f}")
     coin_summary = " | ".join(coin_summary_list)
 
+    # Strict conviction threshold (1.5)
     if best is None or abs(best_score) < 1.49:
         best_sym = best["symbol"] if best else "none"
         layer_str = "; ".join([f"{k}={v:.2f}" for k,v in best_layers.items()])
@@ -416,6 +428,22 @@ def generate_signal():
 
     direction = "LONG" if best_score >= 0 else "SHORT"
 
+    # Apply momentum alignment bonus AFTER selecting direction
+    momentum_bonus = momentum_alignment_score(best["symbol"], direction)
+    best_score += momentum_bonus
+    # Re-check threshold after bonus (still must be ≥1.5)
+    if abs(best_score) < 1.49:
+        best_sym = best["symbol"]
+        layer_str = "; ".join([f"{k}={v:.2f}" for k,v in best_layers.items()])
+        err_str = ""
+        if best_errors:
+            err_str = " | Errors: " + "; ".join(best_errors)
+        display_score = round(best_score, 2)
+        reason = (f"No strong conviction after momentum alignment. Best score: {display_score:+.2f}/3 for {best_sym}.\n"
+                  f"Layers: {layer_str}{err_str}\n"
+                  f"All coins: {coin_summary}")
+        return {"action": "HOLD", "reasoning": reason}
+
     entry = best["bid"] if direction == "LONG" else best["ask"]
     atr = best["atr"]
     min_stop = max(1.5 * atr, entry * 0.02)
@@ -424,6 +452,7 @@ def generate_signal():
     risk = abs(entry - stop)
     qty = round(10 / risk, 4)
 
+    # Original TP ladder (0.4, 0.8, 1.2, 1.6, 2.0)
     mults = [0.4, 0.8, 1.2, 1.6, 2.0]
     tps = []
     for mult in mults:
@@ -475,7 +504,7 @@ def main():
         if action in ["LONG", "SHORT"]:
             raw_symbol = dec.get('symbol', '')
             symbol = raw_symbol.replace("USDT", "/USDT") if raw_symbol else ""
-            direction_icon = "🟢" if action == "LONG" else "🛑"
+            direction_icon = "🟢" if action == "LONG" else "🔴"
             setup_icon = "📈" if action == "LONG" else "📉"
             entry_price = dec.get('limit_price', 0)
             stop_price = dec.get('stop_loss', 0)
@@ -488,29 +517,26 @@ def main():
             entry_low  = round(entry_price * 0.995, 4)
             entry_high = round(entry_price * 1.005, 4)
 
-            tp_lines = f"📌 TP1: ${tps[0]:,.4f} (Book partials + Move SL to Break-Even)\n"
-            for i in range(1, len(tps)):
-                tp_lines += f"📌 TP{i+1}: ${tps[i]:,.4f}\n"
-            tp_lines = tp_lines.strip()
+            # Minimalist TP lines – just prices with 📌
+            tp_lines = "\n".join([f"📌 ${tp:,.4f}" for tp in tps])
 
             err_str = ""
             if errors:
                 err_str = "\n⚠️ Data issues: " + "; ".join(errors)
 
             msg = (
-                f"🚨 {symbol} Trade Setup! Full Trade Plan Inside!\n\n"
-                f"Position: {action} {direction_icon}\n"
-                f"Setup Type: Swing Trade {setup_icon}\n\n"
-                f"⛔ ENTRY: CMP — ${entry_price:,.4f} (or within ${entry_low:,.4f} - ${entry_high:,.4f})\n\n"
-                f"🛑 STOP LOSS: ${stop_price:,.4f} (Invalidation level)\n\n"
-                f"🎯 TAKE-PROFIT TARGETS:\n"
+                f"🚨 {symbol} TRADE SETUP 🚨\n\n"
+                f"📊 Position: {action} {direction_icon}\n"
+                f"📈 Setup: Swing Trade {setup_icon}\n\n"
+                f"⛔ ENTRY: CMP — ${entry_price:,.4f}\n"
+                f"   (or within ${entry_low:,.4f} – ${entry_high:,.4f})\n\n"
+                f"🛑 STOP LOSS: ${stop_price:,.4f} (Invalidation)\n\n"
+                f"🎯 TARGETS:\n"
                 f"{tp_lines}\n\n"
                 f"📊 CONVICTION: {conviction:+.2f}/3  |  🤖 AI CONFIDENCE: {confidence}/10\n\n"
-                f"🧠 TECHNICAL BREAKDOWN:\n"
-                f"{reasoning}{err_str}\n\n"
-                f"Trade Management: Once TP1 hits, secure partial profits and move stop-loss to entry. "
-                f"Let the rest run risk-free.\n\n"
-                f"⚠️ Disclaimer: NFA (Not Financial Advice) | DYOR (Do Your Own Research) | Manage your risk"
+                f"🧠 WHY: {reasoning}{err_str}\n\n"
+                f"💡 Trade Management: Secure partials at first target, move SL to entry, let the rest run.\n\n"
+                f"⚠️ NFA | DYOR | Manage Your Risk"
             )
         else:
             msg = f"📊 HOLD\nReason: {dec.get('reasoning', 'No signal')}"
