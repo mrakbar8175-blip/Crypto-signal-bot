@@ -287,11 +287,6 @@ def score_coin(symbol, price, volume_24h, change1h, btc_score, btc_error):
     }
     return max(-3, min(3, total)), layers, ema50_distance, errors
 
-# ========== HELPER: internal -3..+3 → -5..+5 ==========
-def internal_to_5(internal_score):
-    scaled = internal_score * (5.0 / 3.0)
-    return round(scaled, 1)
-
 # ========== AI REASONING ==========
 def call_groq_reasoning(symbol, entry, atr, layers, errors=None):
     layer_str = "; ".join([f"{k}={v:.2f}" for k,v in layers.items()])
@@ -403,8 +398,8 @@ def generate_signal():
         err_str = ""
         if best_errors:
             err_str = " | Errors: " + "; ".join(best_errors)
-        scaled_best = internal_to_5(best_score)
-        reason = (f"No strong conviction. Best score: {scaled_best:+.1f}/5 for {best_sym}.\n"
+        display_score = round(best_score, 2)
+        reason = (f"No strong conviction. Best score: {display_score:+.2f}/3 for {best_sym}.\n"
                   f"Layers: {layer_str}{err_str}\n"
                   f"All coins: {coin_summary}")
         return {"action": "HOLD", "reasoning": reason}
@@ -434,13 +429,13 @@ def generate_signal():
         err_str = ""
         if best_errors:
             err_str = " | Errors: " + "; ".join(best_errors)
-        scaled_best = internal_to_5(best_score)
-        reason = (f"AI confidence too low ({conf}/10). Best score: {scaled_best:+.1f}/5 for {best['symbol']}.\n"
+        display_score = round(best_score, 2)
+        reason = (f"AI confidence too low ({conf}/10). Best score: {display_score:+.2f}/3 for {best['symbol']}.\n"
                   f"Layers: {layer_str}{err_str}\n"
                   f"All coins: {coin_summary}\n{reason}")
         return {"action": "HOLD", "reasoning": reason}
 
-    conviction_display = internal_to_5(best_score)
+    conviction_display = round(best_score, 2)   # -3..+3
 
     return {
         "action": direction,
@@ -501,7 +496,7 @@ def main():
                 f"🛑 STOP LOSS: ${stop_price:,.4f} (Invalidation level)\n\n"
                 f"🎯 TAKE-PROFIT TARGETS:\n"
                 f"{tp_lines}\n\n"
-                f"📊 CONVICTION: {conviction:+.1f}/5  |  🤖 AI CONFIDENCE: {confidence}/10\n\n"
+                f"📊 CONVICTION: {conviction:+.2f}/3  |  🤖 AI CONFIDENCE: {confidence}/10\n\n"
                 f"🧠 TECHNICAL BREAKDOWN:\n"
                 f"{reasoning}{err_str}\n\n"
                 f"Trade Management: Once TP1 hits, secure partial profits and move stop-loss to entry. "
