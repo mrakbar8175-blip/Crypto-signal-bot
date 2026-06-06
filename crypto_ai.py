@@ -69,7 +69,7 @@ def get_yahoo_klines(symbol_usdt, interval='4h', days=60):
 
 # ========== LAYER 1: TECHNICALS (4h, structure‑heavy, no MACD) – weight 20% ==========
 def get_technicals(symbol_usdt):
-    df = get_yahoo_klines(symbol_usdt, interval='4h', days=14)   # 14 days = ~84 candles
+    df = get_yahoo_klines(symbol_usdt, interval='4h', days=14)
     error = None
     if df.empty or len(df) < 50:
         error = f"insufficient 4h data ({len(df)} candles)"
@@ -199,10 +199,10 @@ def get_4h_atr(symbol_usdt, current_price):
 
 # ========== LAYER 2: BUYING PRESSURE (4h, 48 candles lookback) – weight 45% ==========
 def get_buying_pressure(symbol_usdt):
-    df = get_yahoo_klines(symbol_usdt, interval='4h', days=10)   # 10 days = ~60 candles
+    df = get_yahoo_klines(symbol_usdt, interval='4h', days=10)
     if df.empty or len(df) < 48:
         return 0.0, f"insufficient volume data ({len(df)} candles)"
-    df = df.tail(48)   # last 48 4‑hour candles = 8 days
+    df = df.tail(48)
     buy_vol = df.loc[df['Close'] > df['Open'], 'Volume'].sum()
     sell_vol = df.loc[df['Close'] <= df['Open'], 'Volume'].sum()
     total = buy_vol + sell_vol
@@ -214,7 +214,7 @@ def get_buying_pressure(symbol_usdt):
 def get_volatility_score(symbol_usdt, current_price):
     atr, atr_err = get_4h_atr(symbol_usdt, current_price)
     atr_pct = atr / current_price * 100
-    if atr_pct < 2 or atr_pct > 10:   # 4h sweet spot: 2-10%
+    if atr_pct < 2 or atr_pct > 10:
         return -1, atr_err
     return 1, None
 
@@ -233,13 +233,13 @@ def btc_trend_score():
 
 # ========== LAYER 5: VOLUME TREND (4h, 6 candles) – weight 5% ==========
 def volume_trend_score(symbol_usdt):
-    df = get_yahoo_klines(symbol_usdt, interval='4h', days=5)   # 5 days = 30 candles
+    df = get_yahoo_klines(symbol_usdt, interval='4h', days=5)
     if df.empty or len(df) < 12:
         return 0, f"volume data insufficient ({len(df)} candles)"
     recent = df['Volume'].tail(6)
     first_half = recent[:3].mean()
     second_half = recent[3:].mean()
-    if second_half > first_half * 1.05:      # slightly more sensitive
+    if second_half > first_half * 1.05:
         return 2, None
     elif second_half < first_half * 0.95:
         return -2, None
@@ -252,14 +252,13 @@ def momentum_alignment_score(symbol_usdt, direction):
         return 0.0
     last = df.iloc[-1]
     if direction == "LONG" and last['Close'] > last['Open']:
-        return 0.20   # increased from 0.15
+        return 0.20
     elif direction == "SHORT" and last['Close'] < last['Open']:
         return 0.20
     return 0.0
 
 # ========== TREND STRENGTH BONUS (ADX > 30) ==========
 def trend_strength_bonus(adx_value, base_score):
-    """If ADX > 30 and the base score already points in a direction, add a small bonus."""
     if adx_value > 30 and abs(base_score) > 0.5:
         return 0.20 * (1 if base_score > 0 else -1)
     return 0.0
@@ -291,12 +290,11 @@ def score_coin(symbol, price, volume_24h, change1h, btc_score, btc_error):
     if vt_err:
         errors.append(f"volume_trend({symbol}): {vt_err}")
 
-    # Base total from the five layers
     total = (
         0.20 * tech_combined +
-        0.45 * buying_score +        # increased from 0.40
+        0.45 * buying_score +
         0.05 * vol_score +
-        0.25 * intermarket_s +       # decreased from 0.30
+        0.25 * intermarket_s +
         0.05 * vol_trend_s
     )
 
@@ -395,7 +393,7 @@ def generate_signal():
             sym, price, volume, 0, btc_score, btc_error
         )
         atr, _ = get_4h_atr(sym, price)
-        if atr / price > 0.10:   # 4h volatility cap at 10%
+        if atr / price > 0.10:
             total_score = 0.0
             errors.append("volatility cap triggered (ATR>10%)")
         coin["score"] = total_score
@@ -426,7 +424,6 @@ def generate_signal():
         coin_summary_list.append(f"{c['symbol'].replace('USDT','')}: {c['score']:.2f}")
     coin_summary = " | ".join(coin_summary_list)
 
-    # Strict conviction threshold (1.5)
     if best is None or abs(best_score) < 1.49:
         best_sym = best["symbol"] if best else "none"
         layer_str = "; ".join([f"{k}={v:.2f}" for k,v in best_layers.items()])
@@ -448,7 +445,6 @@ def generate_signal():
     momentum_bonus = momentum_alignment_score(best["symbol"], direction)
     best_score += momentum_bonus
 
-    # Re-check threshold after bonuses (still must be ≥1.5)
     if abs(best_score) < 1.49:
         best_sym = best["symbol"]
         layer_str = "; ".join([f"{k}={v:.2f}" for k,v in best_layers.items()])
@@ -469,7 +465,6 @@ def generate_signal():
     risk = abs(entry - stop)
     qty = round(10 / risk, 4)
 
-    # Original TP ladder (0.4, 0.8, 1.2, 1.6, 2.0)
     mults = [0.4, 0.8, 1.2, 1.6, 2.0]
     tps = []
     for mult in mults:
@@ -534,7 +529,16 @@ def main():
             entry_low  = round(entry_price * 0.995, 4)
             entry_high = round(entry_price * 1.005, 4)
 
-            tp_lines = "\n".join([f"📌 ${tp:,.4f}" for tp in tps])
+            # --- Percentage calculations ---
+            # Stop loss percentage (negative, indicating risk)
+            sl_pct = -abs(stop_price - entry_price) / entry_price * 100
+            # TP percentages (positive, indicating reward)
+            tp_pcts = [abs(tp - entry_price) / entry_price * 100 for tp in tps]
+
+            tp_lines = ""
+            for i, (tp, pct) in enumerate(zip(tps, tp_pcts)):
+                tp_lines += f"📌 ${tp:,.4f} (+{pct:.2f}%)\n"
+            tp_lines = tp_lines.strip()
 
             err_str = ""
             if errors:
@@ -546,7 +550,7 @@ def main():
                 f"📈 Setup: Swing Trade {setup_icon}\n\n"
                 f"⛔ ENTRY: CMP — ${entry_price:,.4f}\n"
                 f"   (or within ${entry_low:,.4f} – ${entry_high:,.4f})\n\n"
-                f"🛑 STOP LOSS: ${stop_price:,.4f} (Invalidation)\n\n"
+                f"🛑 STOP LOSS: ${stop_price:,.4f} ({sl_pct:+.2f}%)\n\n"
                 f"🎯 TARGETS:\n"
                 f"{tp_lines}\n\n"
                 f"📊 CONVICTION: {conviction:+.2f}/3  |  🤖 AI CONFIDENCE: {confidence}/10\n\n"
