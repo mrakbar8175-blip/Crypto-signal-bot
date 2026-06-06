@@ -307,7 +307,7 @@ def score_coin(symbol, price, volume_24h, change1h, btc_score, btc_error):
     }
     return max(-3, min(3, total)), layers, ema50_distance, adx_value, errors
 
-# ========== AI REASONING ==========
+# ========== AI REASONING (confidence now 4‑7 range) ==========
 def call_groq_reasoning(symbol, entry, atr, layers, errors=None):
     layer_str = "; ".join([f"{k}={v:.2f}" for k,v in layers.items()])
     err_str = ""
@@ -324,8 +324,8 @@ def call_groq_reasoning(symbol, entry, atr, layers, errors=None):
         f"Layer scores: {layer_str}{err_str}. "
         f"All {alignment_strength} out of 4 directional layers are strongly aligned (bearish/bullish). "
         "Provide a concise, punchy reasoning (max 2 sentences) capturing why this trade sets up well. "
-        "Also give a confidence score 1-10. "
-        "Confidence must reflect the number of aligned layers: at least 6 if 3 layers agree, 7+ if all 4 agree. "
+        "Also give a confidence score between 4 and 7 (never higher than 7, never lower than 4). "
+        "Confidence must reflect the number of aligned layers: at least 5 if 2 layers agree, 6 if 3 layers agree, 7 only if all 4 layers agree. "
         "Low ATR is a positive sign for risk management, not a caution. "
         "Format: CONFIDENCE: 7 | REASONING: [text]"
     )
@@ -343,12 +343,14 @@ def call_groq_reasoning(symbol, entry, atr, layers, errors=None):
             text = resp.json()["choices"][0]["message"]["content"]
             conf_match = re.search(r'CONFIDENCE:\s*(\d+)', text)
             reason_match = re.search(r'REASONING:\s*(.*)', text)
-            conf = int(conf_match.group(1)) if conf_match else 6
+            conf = int(conf_match.group(1)) if conf_match else 5
+            # Clamp to 4‑7
+            conf = max(4, min(7, conf))
             reason = reason_match.group(1).strip() if reason_match else "Automated signal."
             return conf, reason
     except:
         pass
-    return 6, "Multi-factor model (AI unavailable)."
+    return 5, "Multi-factor model (AI unavailable)."
 
 # ========== HYBRID TP ADJUSTMENT ==========
 def get_swing_levels(symbol_usdt, direction):
@@ -528,7 +530,7 @@ def generate_signal():
     adjusted_tps = adjust_tps(entry, raw_tps, best["symbol"], direction, risk)
 
     conf, reason = call_groq_reasoning(best["symbol"], entry, atr, best_layers, best_errors)
-    if conf < 6:
+    if conf < 5:   # minimum is now 5
         layer_str = "; ".join([f"{k}={v:.2f}" for k,v in best_layers.items()])
         err_str = ""
         if best_errors:
@@ -577,7 +579,9 @@ def main():
             conviction = dec.get('conviction_score', 0)
             tps = dec.get('take_profits', [])
 
-            # Build plain TP lines, each on a new line
+            # Stop‑loss percentage
+            sl_pct = -abs(stop_price - entry_price) / entry_price * 100
+
             tp_lines = ""
             for i, tp in enumerate(tps, start=1):
                 tp_lines += f"TP{i}: {tp:,.4f}\n"
@@ -587,7 +591,7 @@ def main():
                 f"${symbol}\n"
                 f"{action} {direction_icon}\n"
                 f"⛔ Entry: {entry_price:,.4f}\n"
-                f"🛑 Stop: {stop_price:,.4f}\n"
+                f"🛑 Stop: {stop_price:,.4f} ({sl_pct:+.2f}%)\n"
                 f"💰 Targets:\n"
                 f"{tp_lines}\n"
                 f"Conviction: {conviction:+.2f}/3  |  AI: {confidence}/10"
