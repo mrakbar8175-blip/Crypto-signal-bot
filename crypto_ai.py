@@ -352,41 +352,28 @@ def call_groq_reasoning(symbol, entry, atr, layers, errors=None):
 
 # ========== HYBRID TP ADJUSTMENT ==========
 def get_swing_levels(symbol_usdt, direction):
-    """
-    Return sorted list of swing levels that could act as targets.
-    For LONG: swing highs above current price.
-    For SHORT: swing lows below current price.
-    """
     df = get_yahoo_klines(symbol_usdt, interval='4h', days=14)
     if df.empty or len(df) < 20:
         return []
 
     highs = df['High'].values
     lows  = df['Low'].values
-    window = 5   # pivot detection window
+    window = 5
 
     swing_highs = []
     swing_lows  = []
     for i in range(window, len(highs) - window):
-        # swing high
         if all(highs[i] >= highs[i-window:i+window+1]):
             swing_highs.append(highs[i])
-        # swing low
         if all(lows[i] <= lows[i-window:i+window+1]):
             swing_lows.append(lows[i])
 
     if direction == "LONG":
-        # return sorted ascending
         return sorted(list(set(swing_highs)))
     else:
-        # return sorted descending (lowest first)
         return sorted(list(set(swing_lows)), reverse=True)
 
 def adjust_tps(entry, raw_tps, symbol_usdt, direction, risk):
-    """
-    Adjust TP2‑TP5 to nearest swing level within 10% of the raw TP.
-    TP1 (index 0) remains unchanged.
-    """
     if len(raw_tps) < 2:
         return raw_tps
 
@@ -395,15 +382,13 @@ def adjust_tps(entry, raw_tps, symbol_usdt, direction, risk):
         return raw_tps
 
     adjusted = raw_tps.copy()
-    for i in range(1, len(raw_tps)):   # skip TP1
+    for i in range(1, len(raw_tps)):
         raw = raw_tps[i]
-        # find closest swing level within 10% tolerance
         best_swing = None
         min_diff = float('inf')
         for lvl in swing_levels:
             diff = abs(lvl - raw) / raw
             if diff <= 0.10 and diff < min_diff:
-                # ensure the swing is on the correct side
                 if direction == "LONG" and lvl > entry:
                     min_diff = diff
                     best_swing = lvl
@@ -562,7 +547,7 @@ def generate_signal():
         "quantity": qty,
         "limit_price": entry,
         "stop_loss": stop,
-        "take_profits": adjusted_tps,   # now hybrid
+        "take_profits": adjusted_tps,
         "confidence_score": conf,
         "reasoning": reason,
         "conviction_score": conviction_display,
@@ -592,7 +577,7 @@ def main():
             conviction = dec.get('conviction_score', 0)
             tps = dec.get('take_profits', [])
 
-            # Build plain TP lines
+            # Build plain TP lines, each on a new line
             tp_lines = ""
             for i, tp in enumerate(tps, start=1):
                 tp_lines += f"TP{i}: {tp:,.4f}\n"
@@ -601,11 +586,11 @@ def main():
             msg = (
                 f"${symbol}\n"
                 f"{action} {direction_icon}\n"
-                f"Entry: {entry_price:,.4f}\n"
-                f"Stop: {stop_price:,.4f}\n"
+                f"⛔ Entry: {entry_price:,.4f}\n"
+                f"🛑 Stop: {stop_price:,.4f}\n"
+                f"💰 Targets:\n"
                 f"{tp_lines}\n"
-                f"Conviction: {conviction:+.2f}/3  |  AI: {confidence}/10\n"
-                f"NFA | DYOR"
+                f"Conviction: {conviction:+.2f}/3  |  AI: {confidence}/10"
             )
         else:
             msg = f"📊 HOLD\n{dec.get('reasoning', 'No signal')}"
