@@ -26,6 +26,6 @@ jobs:
         run: |
           git config --global user.email "actions@github.com"
           git config --global user.name "GitHub Actions"
-          git add *.csv
+          git add .
           git commit -m "Update trade logs" || echo "No changes to commit"
           git push
