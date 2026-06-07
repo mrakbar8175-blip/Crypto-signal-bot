@@ -19,8 +19,8 @@ portfolio = {
     "daily_loss_limit": -20
 }
 
-# ========== FULL UNIVERSE (major coins + 150 altcoins) ==========
-COIN_LIST = [
+# ========== FULL UNIVERSE (deduplicated) ==========
+COIN_LIST = list(set([
     "BTCUSDT", "ETHUSDT", "BNBUSDT", "XRPUSDT", "ADAUSDT",
     "SOLUSDT", "DOGEUSDT", "AVAXUSDT", "DOTUSDT", "LINKUSDT",
     "MATICUSDT", "LTCUSDT", "NEARUSDT", "ATOMUSDT", "ETCUSDT",
@@ -42,7 +42,6 @@ COIN_LIST = [
     "TOMOUSDT", "DGBUSDT", "DUSKUSDT", "REEFUSDT", "ALPHAUSDT",
     "FORTHUSDT", "POLSUSDT", "C98USDT", "RAREUSDT", "ATAUSDT",
     "IDEXUSDT", "MLNUSDT",
-    # additional 50 popular altcoins
     "PEPEUSDT", "WIFUSDT", "BONKUSDT", "FLOKIUSDT", "SHIBUSDT",
     "APTUSDT", "SUIUSDT", "ARBUSDT", "OPUSDT", "TIAUSDT",
     "SEIUSDT", "RUNEUSDT", "INJUSDT", "LDOUSDT", "GRTUSDT",
@@ -62,7 +61,7 @@ COIN_LIST = [
     "TOMOUSDT", "DGBUSDT", "DUSKUSDT", "REEFUSDT", "ALPHAUSDT",
     "FORTHUSDT", "POLSUSDT", "C98USDT", "RAREUSDT", "ATAUSDT",
     "IDEXUSDT", "MLNUSDT"
-]
+]))
 
 # ========== DATA HELPERS ==========
 def fetch_coingecko(url, retries=2):
@@ -373,7 +372,7 @@ def call_groq_reasoning(symbol, entry, atr, layers, errors=None):
         pass
     return 5, "Multi-factor model (AI unavailable)."
 
-# ========== MAIN SIGNAL GENERATION (scans top 60, no exclusions) ==========
+# ========== MAIN SIGNAL GENERATION (scans top 60) ==========
 def generate_signal():
     cg_url = "https://api.coingecko.com/api/v3/coins/markets?vs_currency=usd&order=volume_desc&per_page=100&page=1"
     coins_data = fetch_coingecko(cg_url)
@@ -392,7 +391,7 @@ def generate_signal():
             continue
         candidates.append({"symbol": sym, "price": cg_map[sym]["price"], "volume": cg_map[sym]["volume"]})
     candidates.sort(key=lambda x: x["volume"], reverse=True)
-    candidates = candidates[:60]   # increased to 60
+    candidates = candidates[:60]
 
     if not candidates:
         return {"action": "HOLD", "reasoning": "No liquid coins in predefined list."}
