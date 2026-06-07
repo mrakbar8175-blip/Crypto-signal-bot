@@ -2,7 +2,7 @@ name: Forex Swing Signal (4H)
 
 on:
   schedule:
-    - cron: '0 */4 * * *'          # every 4 hours
+    - cron: '0 */4 * * 1-5'          # every 4 hours, Monday to Friday
   workflow_dispatch:
 
 jobs:
