@@ -307,7 +307,7 @@ def score_coin(symbol, price, volume_24h, change1h, btc_score, btc_error):
     }
     return max(-3, min(3, total)), layers, ema50_distance, adx_value, errors
 
-# ========== AI REASONING (confidence now 4‑7 range) ==========
+# ========== AI REASONING (confidence 4‑7) ==========
 def call_groq_reasoning(symbol, entry, atr, layers, errors=None):
     layer_str = "; ".join([f"{k}={v:.2f}" for k,v in layers.items()])
     err_str = ""
@@ -344,7 +344,6 @@ def call_groq_reasoning(symbol, entry, atr, layers, errors=None):
             conf_match = re.search(r'CONFIDENCE:\s*(\d+)', text)
             reason_match = re.search(r'REASONING:\s*(.*)', text)
             conf = int(conf_match.group(1)) if conf_match else 5
-            # Clamp to 4‑7
             conf = max(4, min(7, conf))
             reason = reason_match.group(1).strip() if reason_match else "Automated signal."
             return conf, reason
@@ -352,57 +351,7 @@ def call_groq_reasoning(symbol, entry, atr, layers, errors=None):
         pass
     return 5, "Multi-factor model (AI unavailable)."
 
-# ========== HYBRID TP ADJUSTMENT ==========
-def get_swing_levels(symbol_usdt, direction):
-    df = get_yahoo_klines(symbol_usdt, interval='4h', days=14)
-    if df.empty or len(df) < 20:
-        return []
-
-    highs = df['High'].values
-    lows  = df['Low'].values
-    window = 5
-
-    swing_highs = []
-    swing_lows  = []
-    for i in range(window, len(highs) - window):
-        if all(highs[i] >= highs[i-window:i+window+1]):
-            swing_highs.append(highs[i])
-        if all(lows[i] <= lows[i-window:i+window+1]):
-            swing_lows.append(lows[i])
-
-    if direction == "LONG":
-        return sorted(list(set(swing_highs)))
-    else:
-        return sorted(list(set(swing_lows)), reverse=True)
-
-def adjust_tps(entry, raw_tps, symbol_usdt, direction, risk):
-    if len(raw_tps) < 2:
-        return raw_tps
-
-    swing_levels = get_swing_levels(symbol_usdt, direction)
-    if not swing_levels:
-        return raw_tps
-
-    adjusted = raw_tps.copy()
-    for i in range(1, len(raw_tps)):
-        raw = raw_tps[i]
-        best_swing = None
-        min_diff = float('inf')
-        for lvl in swing_levels:
-            diff = abs(lvl - raw) / raw
-            if diff <= 0.10 and diff < min_diff:
-                if direction == "LONG" and lvl > entry:
-                    min_diff = diff
-                    best_swing = lvl
-                elif direction == "SHORT" and lvl < entry:
-                    min_diff = diff
-                    best_swing = lvl
-        if best_swing is not None:
-            adjusted[i] = best_swing
-
-    return adjusted
-
-# ========== MAIN SIGNAL GENERATION ==========
+# ========== MAIN SIGNAL GENERATION (no hybrid TPs) ==========
 def generate_signal():
     cg_url = "https://api.coingecko.com/api/v3/coins/markets?vs_currency=usd&order=volume_desc&per_page=100&page=1"
     coins_data = fetch_coingecko(cg_url)
@@ -517,20 +466,17 @@ def generate_signal():
     risk = abs(entry - stop)
     qty = round(10 / risk, 4)
 
-    # Raw RR‑based TP ladder
-    raw_mults = [0.4, 0.8, 1.2, 1.6, 2.0]
-    raw_tps = []
-    for mult in raw_mults:
+    # Fixed RR‑based TP ladder (no hybrid adjustment)
+    mults = [0.4, 0.8, 1.2, 1.6, 2.0]
+    tps = []
+    for mult in mults:
         if direction == "LONG":
-            raw_tps.append(round(entry + mult * risk, 6))
+            tps.append(round(entry + mult * risk, 6))
         else:
-            raw_tps.append(round(entry - mult * risk, 6))
-
-    # Hybrid adjustment (TP2‑TP5 only)
-    adjusted_tps = adjust_tps(entry, raw_tps, best["symbol"], direction, risk)
+            tps.append(round(entry - mult * risk, 6))
 
     conf, reason = call_groq_reasoning(best["symbol"], entry, atr, best_layers, best_errors)
-    if conf < 5:   # minimum is now 5
+    if conf < 5:
         layer_str = "; ".join([f"{k}={v:.2f}" for k,v in best_layers.items()])
         err_str = ""
         if best_errors:
@@ -549,7 +495,7 @@ def generate_signal():
         "quantity": qty,
         "limit_price": entry,
         "stop_loss": stop,
-        "take_profits": adjusted_tps,
+        "take_profits": tps,
         "confidence_score": conf,
         "reasoning": reason,
         "conviction_score": conviction_display,
