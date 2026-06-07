@@ -19,27 +19,49 @@ portfolio = {
     "daily_loss_limit": -20
 }
 
-# ========== COIN UNIVERSE (99 altcoins) ==========
+# ========== FULL UNIVERSE (major coins + 150 altcoins) ==========
 COIN_LIST = [
-    "SOLUSDT", "DOGEUSDT", "AVAXUSDT", "DOTUSDT", "NEARUSDT",
-    "ATOMUSDT", "ETCUSDT", "STXUSDT", "FILUSDT", "ARBUSDT",
-    "OPUSDT", "INJUSDT", "TIAUSDT", "SEIUSDT", "RUNEUSDT",
-    "GRTUSDT", "AAVEUSDT", "ALGOUSDT", "SANDUSDT", "MANAUSDT",
-    "THETAUSDT", "FTMUSDT", "EOSUSDT", "MKRUSDT", "LDOUSDT",
-    "IMXUSDT", "FLOWUSDT", "XTZUSDT", "NEOUSDT", "KSMUSDT",
-    "ZECUSDT", "DASHUSDT", "EGLDUSDT", "MINAUSDT", "GALAUSDT",
-    "HNTUSDT", "CFXUSDT", "ARUSDT", "FETUSDT", "AGIXUSDT",
-    "OCEANUSDT", "1INCHUSDT", "CRVUSDT", "AXSUSDT", "CHZUSDT",
-    "ENJUSDT", "BATUSDT", "SNXUSDT", "COMPUSDT", "YFIUSDT",
-    "SUSHIUSDT", "ZRXUSDT", "RENUSDT", "CELOUSDT", "LRCUSDT",
-    "ANKRUSDT", "STORJUSDT", "COTIUSDT", "KAVAUSDT", "ICXUSDT",
-    "ONTUSDT", "ZILUSDT", "WAVESUSDT", "QTUMUSDT", "OMGUSDT",
-    "BANDUSDT", "DENTUSDT", "HOTUSDT", "IOSTUSDT", "RVNUSDT",
-    "SCUSDT", "ZENUSDT", "CKBUSDT", "SKLUSDT", "CTSIUSDT",
-    "CTKUSDT", "LINAUSDT", "TRBUSDT", "BALUSDT", "PERPUSDT",
-    "BNTUSDT", "RSRUSDT", "TOMOUSDT", "DGBUSDT", "DUSKUSDT",
-    "REEFUSDT", "ALPHAUSDT", "FORTHUSDT", "POLSUSDT", "C98USDT",
-    "RAREUSDT", "ATAUSDT", "IDEXUSDT", "MLNUSDT",
+    "BTCUSDT", "ETHUSDT", "BNBUSDT", "XRPUSDT", "ADAUSDT",
+    "SOLUSDT", "DOGEUSDT", "AVAXUSDT", "DOTUSDT", "LINKUSDT",
+    "MATICUSDT", "LTCUSDT", "NEARUSDT", "ATOMUSDT", "ETCUSDT",
+    "STXUSDT", "FILUSDT", "ARBUSDT", "OPUSDT", "INJUSDT",
+    "TIAUSDT", "SEIUSDT", "RUNEUSDT", "GRTUSDT", "AAVEUSDT",
+    "ALGOUSDT", "SANDUSDT", "MANAUSDT", "THETAUSDT", "FTMUSDT",
+    "EOSUSDT", "MKRUSDT", "LDOUSDT", "IMXUSDT", "FLOWUSDT",
+    "XTZUSDT", "NEOUSDT", "KSMUSDT", "ZECUSDT", "DASHUSDT",
+    "EGLDUSDT", "MINAUSDT", "GALAUSDT", "HNTUSDT", "CFXUSDT",
+    "ARUSDT", "FETUSDT", "AGIXUSDT", "OCEANUSDT", "1INCHUSDT",
+    "CRVUSDT", "AXSUSDT", "CHZUSDT", "ENJUSDT", "BATUSDT",
+    "SNXUSDT", "COMPUSDT", "YFIUSDT", "SUSHIUSDT", "ZRXUSDT",
+    "RENUSDT", "CELOUSDT", "LRCUSDT", "ANKRUSDT", "STORJUSDT",
+    "COTIUSDT", "KAVAUSDT", "ICXUSDT", "ONTUSDT", "ZILUSDT",
+    "WAVESUSDT", "QTUMUSDT", "OMGUSDT", "BANDUSDT", "DENTUSDT",
+    "HOTUSDT", "IOSTUSDT", "RVNUSDT", "SCUSDT", "ZENUSDT",
+    "CKBUSDT", "SKLUSDT", "CTSIUSDT", "CTKUSDT", "LINAUSDT",
+    "TRBUSDT", "BALUSDT", "PERPUSDT", "BNTUSDT", "RSRUSDT",
+    "TOMOUSDT", "DGBUSDT", "DUSKUSDT", "REEFUSDT", "ALPHAUSDT",
+    "FORTHUSDT", "POLSUSDT", "C98USDT", "RAREUSDT", "ATAUSDT",
+    "IDEXUSDT", "MLNUSDT",
+    # additional 50 popular altcoins
+    "PEPEUSDT", "WIFUSDT", "BONKUSDT", "FLOKIUSDT", "SHIBUSDT",
+    "APTUSDT", "SUIUSDT", "ARBUSDT", "OPUSDT", "TIAUSDT",
+    "SEIUSDT", "RUNEUSDT", "INJUSDT", "LDOUSDT", "GRTUSDT",
+    "AAVEUSDT", "ALGOUSDT", "SANDUSDT", "MANAUSDT", "THETAUSDT",
+    "FTMUSDT", "EOSUSDT", "MKRUSDT", "IMXUSDT", "FLOWUSDT",
+    "XTZUSDT", "NEOUSDT", "KSMUSDT", "ZECUSDT", "DASHUSDT",
+    "EGLDUSDT", "MINAUSDT", "GALAUSDT", "HNTUSDT", "CFXUSDT",
+    "ARUSDT", "FETUSDT", "AGIXUSDT", "OCEANUSDT", "1INCHUSDT",
+    "CRVUSDT", "AXSUSDT", "CHZUSDT", "ENJUSDT", "BATUSDT",
+    "SNXUSDT", "COMPUSDT", "YFIUSDT", "SUSHIUSDT", "ZRXUSDT",
+    "RENUSDT", "CELOUSDT", "LRCUSDT", "ANKRUSDT", "STORJUSDT",
+    "COTIUSDT", "KAVAUSDT", "ICXUSDT", "ONTUSDT", "ZILUSDT",
+    "WAVESUSDT", "QTUMUSDT", "OMGUSDT", "BANDUSDT", "DENTUSDT",
+    "HOTUSDT", "IOSTUSDT", "RVNUSDT", "SCUSDT", "ZENUSDT",
+    "CKBUSDT", "SKLUSDT", "CTSIUSDT", "CTKUSDT", "LINAUSDT",
+    "TRBUSDT", "BALUSDT", "PERPUSDT", "BNTUSDT", "RSRUSDT",
+    "TOMOUSDT", "DGBUSDT", "DUSKUSDT", "REEFUSDT", "ALPHAUSDT",
+    "FORTHUSDT", "POLSUSDT", "C98USDT", "RAREUSDT", "ATAUSDT",
+    "IDEXUSDT", "MLNUSDT"
 ]
 
 # ========== DATA HELPERS ==========
@@ -351,7 +373,7 @@ def call_groq_reasoning(symbol, entry, atr, layers, errors=None):
         pass
     return 5, "Multi-factor model (AI unavailable)."
 
-# ========== MAIN SIGNAL GENERATION (no hybrid TPs) ==========
+# ========== MAIN SIGNAL GENERATION (scans top 60, no exclusions) ==========
 def generate_signal():
     cg_url = "https://api.coingecko.com/api/v3/coins/markets?vs_currency=usd&order=volume_desc&per_page=100&page=1"
     coins_data = fetch_coingecko(cg_url)
@@ -370,7 +392,7 @@ def generate_signal():
             continue
         candidates.append({"symbol": sym, "price": cg_map[sym]["price"], "volume": cg_map[sym]["volume"]})
     candidates.sort(key=lambda x: x["volume"], reverse=True)
-    candidates = candidates[:30]
+    candidates = candidates[:60]   # increased to 60
 
     if not candidates:
         return {"action": "HOLD", "reasoning": "No liquid coins in predefined list."}
@@ -466,7 +488,7 @@ def generate_signal():
     risk = abs(entry - stop)
     qty = round(10 / risk, 4)
 
-    # Fixed RR‑based TP ladder (no hybrid adjustment)
+    # Fixed RR‑based TP ladder
     mults = [0.4, 0.8, 1.2, 1.6, 2.0]
     tps = []
     for mult in mults:
