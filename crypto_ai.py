@@ -43,25 +43,13 @@ COIN_LIST = list(set([
     "FORTHUSDT", "POLSUSDT", "C98USDT", "RAREUSDT", "ATAUSDT",
     "IDEXUSDT", "MLNUSDT",
     "PEPEUSDT", "WIFUSDT", "BONKUSDT", "FLOKIUSDT", "SHIBUSDT",
-    "APTUSDT", "SUIUSDT", "ARBUSDT", "OPUSDT", "TIAUSDT",
-    "SEIUSDT", "RUNEUSDT", "INJUSDT", "LDOUSDT", "GRTUSDT",
-    "AAVEUSDT", "ALGOUSDT", "SANDUSDT", "MANAUSDT", "THETAUSDT",
-    "FTMUSDT", "EOSUSDT", "MKRUSDT", "IMXUSDT", "FLOWUSDT",
-    "XTZUSDT", "NEOUSDT", "KSMUSDT", "ZECUSDT", "DASHUSDT",
-    "EGLDUSDT", "MINAUSDT", "GALAUSDT", "HNTUSDT", "CFXUSDT",
-    "ARUSDT", "FETUSDT", "AGIXUSDT", "OCEANUSDT", "1INCHUSDT",
-    "CRVUSDT", "AXSUSDT", "CHZUSDT", "ENJUSDT", "BATUSDT",
-    "SNXUSDT", "COMPUSDT", "YFIUSDT", "SUSHIUSDT", "ZRXUSDT",
-    "RENUSDT", "CELOUSDT", "LRCUSDT", "ANKRUSDT", "STORJUSDT",
-    "COTIUSDT", "KAVAUSDT", "ICXUSDT", "ONTUSDT", "ZILUSDT",
-    "WAVESUSDT", "QTUMUSDT", "OMGUSDT", "BANDUSDT", "DENTUSDT",
-    "HOTUSDT", "IOSTUSDT", "RVNUSDT", "SCUSDT", "ZENUSDT",
-    "CKBUSDT", "SKLUSDT", "CTSIUSDT", "CTKUSDT", "LINAUSDT",
-    "TRBUSDT", "BALUSDT", "PERPUSDT", "BNTUSDT", "RSRUSDT",
-    "TOMOUSDT", "DGBUSDT", "DUSKUSDT", "REEFUSDT", "ALPHAUSDT",
-    "FORTHUSDT", "POLSUSDT", "C98USDT", "RAREUSDT", "ATAUSDT",
-    "IDEXUSDT", "MLNUSDT"
+    "APTUSDT", "SUIUSDT"
 ]))
+
+# ========== CSV FILE PATHS ==========
+TRADE_LOG_CSV = "trade_log.csv"
+OPEN_TRADES_CSV = "open_trades.csv"
+TRADE_RESULTS_CSV = "trade_results.csv"
 
 # ========== DATA HELPERS ==========
 def fetch_coingecko(url, retries=2):
@@ -87,6 +75,118 @@ def get_yahoo_klines(symbol_usdt, interval='4h', days=60):
         return df
     except:
         return pd.DataFrame()
+
+# ========== CSV LOGGING FUNCTIONS ==========
+def append_csv(filepath, df_new):
+    """Append a DataFrame to a CSV file; create the file with headers if it doesn't exist."""
+    try:
+        existing = pd.read_csv(filepath)
+        updated = pd.concat([existing, df_new], ignore_index=True)
+    except FileNotFoundError:
+        updated = df_new
+    updated.to_csv(filepath, index=False)
+
+def save_csv(filepath, df):
+    """Overwrite a CSV file with a DataFrame."""
+    df.to_csv(filepath, index=False)
+
+def log_signal(signal):
+    """Append a new signal to trade_log.csv."""
+    row = {
+        "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "symbol": signal["symbol"],
+        "action": signal["action"],
+        "entry": signal["limit_price"],
+        "stop": signal["stop_loss"],
+        "TP1": signal["take_profits"][0],
+        "TP2": signal["take_profits"][1],
+        "TP3": signal["take_profits"][2],
+        "TP4": signal["take_profits"][3],
+        "TP5": signal["take_profits"][4],
+        "conviction": signal["conviction_score"],
+        "ai_confidence": signal["confidence_score"],
+    }
+    df = pd.DataFrame([row])
+    append_csv(TRADE_LOG_CSV, df)
+
+def add_open_trade(signal):
+    """Add a new open trade to open_trades.csv."""
+    row = {
+        "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "symbol": signal["symbol"],
+        "action": signal["action"],
+        "entry": signal["limit_price"],
+        "stop": signal["stop_loss"],
+        "TP1": signal["take_profits"][0],
+        "TP2": signal["take_profits"][1],
+        "TP3": signal["take_profits"][2],
+        "TP4": signal["take_profits"][3],
+        "TP5": signal["take_profits"][4],
+        "status": "open"
+    }
+    df = pd.DataFrame([row])
+    append_csv(OPEN_TRADES_CSV, df)
+
+def check_open_trades(current_prices):
+    """
+    Check all open trades against current prices. If stop or TP is hit, move the trade to
+    trade_results.csv and remove from open trades.
+    current_prices: dict symbol -> current bid/ask (we'll use the bot's fetched price)
+    """
+    try:
+        open_df = pd.read_csv(OPEN_TRADES_CSV)
+    except FileNotFoundError:
+        return  # nothing to check
+
+    results = []
+    still_open = []
+    for _, trade in open_df.iterrows():
+        sym = trade["symbol"]
+        if sym not in current_prices:
+            still_open.append(trade)
+            continue
+        price = current_prices[sym]
+        direction = trade["action"]
+        entry = trade["entry"]
+        stop = trade["stop"]
+        tps = [trade[f"TP{i}"] for i in range(1,6)]
+
+        hit = None
+        # For longs: stop is below entry, TPs above entry; for shorts: stop above entry, TPs below entry
+        if direction == "LONG":
+            if price <= stop:
+                hit = "STOP LOSS"
+            else:
+                for i, tp in enumerate(tps, 1):
+                    if price >= tp:
+                        hit = f"TP{i}"
+                        break
+        else:  # SHORT
+            if price >= stop:
+                hit = "STOP LOSS"
+            else:
+                for i, tp in enumerate(tps, 1):
+                    if price <= tp:
+                        hit = f"TP{i}"
+                        break
+        if hit:
+            result = trade.to_dict()
+            result["hit_level"] = hit
+            result["close_time"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            results.append(result)
+        else:
+            still_open.append(trade)
+
+    if results:
+        df_results = pd.DataFrame(results)
+        append_csv(TRADE_RESULTS_CSV, df_results)
+    # Save still open trades
+    if still_open:
+        df_still_open = pd.DataFrame(still_open)
+        save_csv(OPEN_TRADES_CSV, df_still_open)
+    else:
+        # No open trades left — remove the file (or write empty)
+        save_csv(OPEN_TRADES_CSV, pd.DataFrame())
 
 # ========== LAYER 1: TECHNICALS (4h, structure‑heavy, no MACD) – weight 20% ==========
 def get_technicals(symbol_usdt):
@@ -534,9 +634,27 @@ def send_telegram(text):
 
 def main():
     try:
+        # Step 1: check open trades and update results
+        print("Checking open trades...")
+        # We need current prices for all open trades. We'll fetch them from CoinGecko.
+        all_coins_data = fetch_coingecko("https://api.coingecko.com/api/v3/coins/markets?vs_currency=usd&order=volume_desc&per_page=250&page=1")
+        current_prices = {}
+        if all_coins_data:
+            for coin in all_coins_data:
+                sym = coin.get("symbol", "").upper() + "USDT"
+                if coin.get("current_price", 0) > 0:
+                    current_prices[sym] = coin["current_price"]
+        check_open_trades(current_prices)
+
+        # Step 2: generate new signal
         dec = generate_signal()
         action = dec.get('action', 'HOLD')
         if action in ["LONG", "SHORT"]:
+            # Log signal to CSV
+            log_signal(dec)
+            # Add to open trades
+            add_open_trade(dec)
+            # Send Telegram signal
             raw_symbol = dec.get('symbol', '')
             symbol = raw_symbol.replace("USDT", "/USDT") if raw_symbol else ""
             direction_icon = "🟢" if action == "LONG" else "🔴"
@@ -546,9 +664,7 @@ def main():
             conviction = dec.get('conviction_score', 0)
             tps = dec.get('take_profits', [])
 
-            # Stop‑loss percentage
             sl_pct = -abs(stop_price - entry_price) / entry_price * 100
-
             tp_lines = ""
             for i, tp in enumerate(tps, start=1):
                 tp_lines += f"TP{i}: {tp:,.4f}\n"
@@ -563,11 +679,12 @@ def main():
                 f"{tp_lines}\n"
                 f"Conviction: {conviction:+.2f}/3  |  AI: {confidence}/10"
             )
+            send_telegram(msg)
         else:
+            # Still check open trades? Already done above.
             msg = f"📊 HOLD\n{dec.get('reasoning', 'No signal')}"
+            send_telegram(msg)
 
-        print(msg)
-        send_telegram(msg)
     except Exception as e:
         err_msg = f"Bot crashed: {traceback.format_exc()}"
         print(err_msg)
