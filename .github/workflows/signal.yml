@@ -1,9 +1,7 @@
-name: Crypto Swing Signal (4H) with Trade Tracker
+name: Crypto Swing Signal (Manual) with Trade Tracker
 
 on:
-  schedule:
-    - cron: '0 */4 * * *'          # every 4 hours
-  workflow_dispatch:
+  workflow_dispatch:                # manual trigger only
 
 jobs:
   run-bot:
@@ -28,4 +26,5 @@ jobs:
           git config --global user.name "GitHub Actions"
           git add .
           git commit -m "Update trade logs" || echo "No changes to commit"
+          git pull --rebase --autostash origin main
           git push
