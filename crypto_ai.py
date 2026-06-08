@@ -302,10 +302,13 @@ def get_technicals(symbol_usdt):
     ema50_val = ema50.iloc[-1]
     distance_pct = abs(current - ema50_val) / current
 
+    # Also return the trend direction (for the 4h filter)
+    trend_dir = "up" if current > ema50.iloc[-1] else "down"
+
     return {
         "trend": trend, "adx": adx_score, "structure": structure_score,
         "combined": combined, "ema50_distance": distance_pct,
-        "adx_value": adx_now, "error": None
+        "adx_value": adx_now, "trend_dir": trend_dir, "error": None
     }
 
 def get_4h_atr(symbol_usdt, current_price):
@@ -336,7 +339,8 @@ def get_buying_pressure(symbol_usdt):
 def get_volatility_score(symbol_usdt, current_price):
     atr, atr_err = get_4h_atr(symbol_usdt, current_price)
     atr_pct = atr / current_price * 100
-    if atr_pct < 2 or atr_pct > 10:
+    # Tightened to 7% max (was 10%)
+    if atr_pct < 2 or atr_pct > 7:
         return -1, atr_err
     return 1, None
 
@@ -354,7 +358,8 @@ def btc_trend_score():
         return -2, None
 
 # ========== LAYER 5: VOLUME TREND (4h, 6 candles) – weight 5% ==========
-def volume_trend_score(symbol_usdt):
+def volume_trend_score(symbol_usdt, direction=None):
+    """direction: 'up' or 'down' – if provided, rising volume is only bullish in an uptrend."""
     df = get_yahoo_klines(symbol_usdt, interval='4h', days=5)
     if df.empty or len(df) < 12:
         return 0, f"volume data insufficient ({len(df)} candles)"
@@ -362,30 +367,52 @@ def volume_trend_score(symbol_usdt):
     first_half = recent[:3].mean()
     second_half = recent[3:].mean()
     if second_half > first_half * 1.05:
+        # Rising volume – bullish only if trend is up, bearish if trend is down
+        if direction == "down":
+            return -2, None   # rising volume in downtrend = bearish continuation
         return 2, None
     elif second_half < first_half * 0.95:
+        if direction == "up":
+            return -2, None   # falling volume in uptrend = weakness
         return -2, None
     return 0, None
 
-# ========== MOMENTUM ALIGNMENT (last 4h candle direction) ==========
-def momentum_alignment_score(symbol_usdt, direction):
+# ========== MOMENTUM ALIGNMENT (enhanced) ==========
+def momentum_alignment_score(symbol_usdt, direction, layers):
+    """+0.20 only if the last candle agrees AND at least 2 other layers also agree."""
     df = get_yahoo_klines(symbol_usdt, interval='4h', days=2)
     if df.empty or len(df) < 2:
         return 0.0
     last = df.iloc[-1]
-    if direction == "LONG" and last['Close'] > last['Open']:
-        return 0.20
-    elif direction == "SHORT" and last['Close'] < last['Open']:
+    candle_agrees = (direction == "LONG" and last['Close'] > last['Open']) or \
+                    (direction == "SHORT" and last['Close'] < last['Open'])
+    if not candle_agrees:
+        return 0.0
+
+    # Count how many other directional layers support the direction
+    supporting = 0
+    if direction == "LONG":
+        if layers.get("buying_press", 0) > 0.5: supporting += 1
+        if layers.get("intermarket", 0) > 0.5: supporting += 1
+        if layers.get("volume_trend", 0) > 0.5: supporting += 1
+    else:  # SHORT
+        if layers.get("buying_press", 0) < -0.5: supporting += 1
+        if layers.get("intermarket", 0) < -0.5: supporting += 1
+        if layers.get("volume_trend", 0) < -0.5: supporting += 1
+
+    if supporting >= 2:
         return 0.20
     return 0.0
 
-# ========== TREND STRENGTH BONUS (ADX > 30) ==========
+# ========== TREND STRENGTH BONUS (stronger for ADX > 35) ==========
 def trend_strength_bonus(adx_value, base_score):
-    if adx_value > 30 and abs(base_score) > 0.5:
+    if adx_value > 35 and abs(base_score) > 0.5:
+        return 0.30 * (1 if base_score > 0 else -1)
+    elif adx_value > 30 and abs(base_score) > 0.5:
         return 0.20 * (1 if base_score > 0 else -1)
     return 0.0
 
-# ========== SCORING ENGINE ==========
+# ========== SCORING ENGINE (unchanged core, but with enhanced inputs) ==========
 def score_coin(symbol, price, volume_24h, change1h, btc_score, btc_error):
     errors = []
     tech = get_technicals(symbol)
@@ -394,6 +421,7 @@ def score_coin(symbol, price, volume_24h, change1h, btc_score, btc_error):
     tech_combined = tech["combined"]
     ema50_distance = tech["ema50_distance"]
     adx_value = tech.get("adx_value", 0)
+    trend_dir = tech.get("trend_dir", "up")
 
     buying, buy_err = get_buying_pressure(symbol)
     if buy_err:
@@ -408,7 +436,8 @@ def score_coin(symbol, price, volume_24h, change1h, btc_score, btc_error):
     if btc_error:
         errors.append(f"intermarket: {btc_error}")
 
-    vol_trend_s, vt_err = volume_trend_score(symbol)
+    # Volume trend now respects the trend direction
+    vol_trend_s, vt_err = volume_trend_score(symbol, direction=trend_dir)
     if vt_err:
         errors.append(f"volume_trend({symbol}): {vt_err}")
 
@@ -427,7 +456,7 @@ def score_coin(symbol, price, volume_24h, change1h, btc_score, btc_error):
         "intermarket": intermarket_s,
         "volume_trend": vol_trend_s,
     }
-    return max(-3, min(3, total)), layers, ema50_distance, adx_value, errors
+    return max(-3, min(3, total)), layers, ema50_distance, adx_value, trend_dir, errors
 
 # ========== AI REASONING (confidence 4‑7) ==========
 def call_groq_reasoning(symbol, entry, atr, layers, errors=None):
@@ -473,7 +502,7 @@ def call_groq_reasoning(symbol, entry, atr, layers, errors=None):
         pass
     return 5, "Multi-factor model (AI unavailable)."
 
-# ========== MAIN SIGNAL GENERATION (scans top 60, ignores open trades) ==========
+# ========== MAIN SIGNAL GENERATION (with 4h trend filter) ==========
 def generate_signal():
     cg_url = "https://api.coingecko.com/api/v3/coins/markets?vs_currency=usd&order=volume_desc&per_page=100&page=1"
     coins_data = fetch_coingecko(cg_url)
@@ -516,6 +545,7 @@ def generate_signal():
     best_layers = None
     best_ema_distance = 0.0
     best_adx = 0
+    best_trend_dir = None
     best_errors = []
 
     for coin in candidates:
@@ -523,13 +553,13 @@ def generate_signal():
         price = coin["price"]
         volume = coin["volume"]
 
-        total_score, layers, ema_dist, adx_val, errors = score_coin(
+        total_score, layers, ema_dist, adx_val, trend_dir, errors = score_coin(
             sym, price, volume, 0, btc_score, btc_error
         )
         atr, _ = get_4h_atr(sym, price)
-        if atr / price > 0.10:
+        if atr / price > 0.07:   # tightened volatility cap
             total_score = 0.0
-            errors.append("volatility cap triggered (ATR>10%)")
+            errors.append("volatility cap triggered (ATR>7%)")
         coin["score"] = total_score
         coin["atr"] = atr
         coin["bid"] = price * 0.999
@@ -537,6 +567,7 @@ def generate_signal():
         coin["layers"] = layers
         coin["ema_distance"] = ema_dist
         coin["adx_value"] = adx_val
+        coin["trend_dir"] = trend_dir
         coin["errors"] = errors
 
         all_scored.append(coin)
@@ -547,6 +578,7 @@ def generate_signal():
             best_layers = layers
             best_ema_distance = ema_dist
             best_adx = adx_val
+            best_trend_dir = trend_dir
             best_errors = errors
 
     if btc_error:
@@ -572,11 +604,27 @@ def generate_signal():
 
     direction = "LONG" if best_score >= 0 else "SHORT"
 
-    # Apply trend strength bonus (ADX > 30)
+    # ====== 4h Trend Filter ======
+    if best_trend_dir:
+        if (direction == "LONG" and best_trend_dir == "down") or \
+           (direction == "SHORT" and best_trend_dir == "up"):
+            best_sym = best["symbol"]
+            layer_str = "; ".join([f"{k}={v:.2f}" for k,v in best_layers.items()])
+            err_str = ""
+            if best_errors:
+                err_str = " | Errors: " + "; ".join(best_errors)
+            display_score = round(best_score, 2)
+            reason = (f"Signal {direction} rejected due to 4h trend filter ({best_trend_dir}). "
+                      f"Best score: {display_score:+.2f}/3 for {best_sym}.\n"
+                      f"Layers: {layer_str}{err_str}\n"
+                      f"All coins: {coin_summary}")
+            return {"action": "HOLD", "reasoning": reason}
+
+    # Apply trend strength bonus (ADX > 30, stronger for >35)
     best_score += trend_strength_bonus(best_adx, best_score)
 
-    # Apply momentum alignment bonus AFTER selecting direction
-    momentum_bonus = momentum_alignment_score(best["symbol"], direction)
+    # Apply enhanced momentum alignment bonus
+    momentum_bonus = momentum_alignment_score(best["symbol"], direction, best_layers)
     best_score += momentum_bonus
 
     if abs(best_score) < 1.49:
