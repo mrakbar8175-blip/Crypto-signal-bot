@@ -78,13 +78,11 @@ def get_yahoo_klines(symbol_usdt, interval='4h', days=60):
 
 # ========== CSV LOGGING FUNCTIONS ==========
 def init_csv(filepath, columns):
-    """Create CSV file with header row if it doesn't exist."""
     if not os.path.exists(filepath):
         df = pd.DataFrame(columns=columns)
         df.to_csv(filepath, index=False)
 
 def append_csv(filepath, df_new):
-    """Append a DataFrame to a CSV file; create the file with headers if it doesn't exist."""
     try:
         existing = pd.read_csv(filepath)
         updated = pd.concat([existing, df_new], ignore_index=True)
@@ -93,7 +91,6 @@ def append_csv(filepath, df_new):
     updated.to_csv(filepath, index=False)
 
 def save_csv(filepath, df):
-    """Overwrite a CSV file with a DataFrame."""
     df.to_csv(filepath, index=False)
 
 def initialize_trade_files():
@@ -105,7 +102,6 @@ def initialize_trade_files():
                                  "TP1", "TP2", "TP3", "TP4", "TP5", "status", "hit_level", "close_time"])
 
 def log_signal(signal):
-    """Append a new signal to trade_log.csv."""
     row = {
         "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "symbol": signal["symbol"],
@@ -124,7 +120,6 @@ def log_signal(signal):
     append_csv(TRADE_LOG_CSV, df)
 
 def add_open_trade(signal):
-    """Add a new open trade to open_trades.csv."""
     row = {
         "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "symbol": signal["symbol"],
@@ -142,11 +137,6 @@ def add_open_trade(signal):
     append_csv(OPEN_TRADES_CSV, df)
 
 def check_open_trades(current_prices):
-    """
-    Check all open trades against current prices. If stop or TP is hit, move the trade to
-    trade_results.csv and remove from open trades.
-    current_prices: dict symbol -> current price
-    """
     try:
         open_df = pd.read_csv(OPEN_TRADES_CSV)
     except (FileNotFoundError, pd.errors.EmptyDataError):
@@ -483,12 +473,21 @@ def call_groq_reasoning(symbol, entry, atr, layers, errors=None):
         pass
     return 5, "Multi-factor model (AI unavailable)."
 
-# ========== MAIN SIGNAL GENERATION (scans top 60) ==========
+# ========== MAIN SIGNAL GENERATION (scans top 60, ignores open trades) ==========
 def generate_signal():
     cg_url = "https://api.coingecko.com/api/v3/coins/markets?vs_currency=usd&order=volume_desc&per_page=100&page=1"
     coins_data = fetch_coingecko(cg_url)
     if not coins_data:
         return {"action": "HOLD", "reasoning": "CoinGecko market data unavailable."}
+
+    # Get list of symbols with open trades
+    open_symbols = set()
+    try:
+        open_df = pd.read_csv(OPEN_TRADES_CSV)
+        if not open_df.empty:
+            open_symbols = set(open_df["symbol"].values)
+    except (FileNotFoundError, pd.errors.EmptyDataError):
+        pass
 
     cg_map = {}
     for coin in coins_data:
@@ -498,6 +497,8 @@ def generate_signal():
 
     candidates = []
     for sym in COIN_LIST:
+        if sym in open_symbols:        # skip coins with an open trade
+            continue
         if sym not in cg_map:
             continue
         candidates.append({"symbol": sym, "price": cg_map[sym]["price"], "volume": cg_map[sym]["volume"]})
@@ -505,7 +506,7 @@ def generate_signal():
     candidates = candidates[:60]
 
     if not candidates:
-        return {"action": "HOLD", "reasoning": "No liquid coins in predefined list."}
+        return {"action": "HOLD", "reasoning": "No liquid coins available (all coins with open trades skipped)."}
 
     btc_score, btc_error = btc_trend_score()
 
