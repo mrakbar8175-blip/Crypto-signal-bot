@@ -1,1 +1,2 @@
 timestamp,symbol,action,entry,stop,TP1,TP2,TP3,TP4,TP5,status,hit_level,close_time
+2026-06-09 12:43:41,SHIBUSDT,SHORT,4.704699999999999e-06,5e-06,5e-06,4e-06,4e-06,4e-06,4e-06,open,TP1,2026-06-09 12:49:37
