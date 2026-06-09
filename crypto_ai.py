@@ -137,6 +137,10 @@ def add_open_trade(signal):
     append_csv(OPEN_TRADES_CSV, df)
 
 def check_open_trades(current_prices):
+    """
+    Check open trades against current prices, close them if SL/TP hit,
+    save results, and send Telegram alerts.
+    """
     try:
         open_df = pd.read_csv(OPEN_TRADES_CSV)
     except (FileNotFoundError, pd.errors.EmptyDataError):
@@ -144,50 +148,74 @@ def check_open_trades(current_prices):
 
     results = []
     still_open = []
+    alerts = []   # collect Telegram alert lines
+
     for _, trade in open_df.iterrows():
         sym = trade["symbol"]
         if sym not in current_prices:
             still_open.append(trade)
             continue
+
         price = current_prices[sym]
         direction = trade["action"]
         entry = trade["entry"]
         stop = trade["stop"]
-        tps = [trade[f"TP{i}"] for i in range(1,6)]
+        tps = [trade[f"TP{i}"] for i in range(1, 6)]
 
         hit = None
+        exit_price = None
         if direction == "LONG":
             if price <= stop:
                 hit = "STOP LOSS"
+                exit_price = stop
             else:
                 for i, tp in enumerate(tps, 1):
                     if price >= tp:
                         hit = f"TP{i}"
+                        exit_price = tp
                         break
         else:  # SHORT
             if price >= stop:
                 hit = "STOP LOSS"
+                exit_price = stop
             else:
                 for i, tp in enumerate(tps, 1):
                     if price <= tp:
                         hit = f"TP{i}"
+                        exit_price = tp
                         break
+
         if hit:
             result = trade.to_dict()
             result["hit_level"] = hit
             result["close_time"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             results.append(result)
+
+            # PnL and alert message
+            if direction == "LONG":
+                pnl_pct = (exit_price - entry) / entry * 100
+            else:
+                pnl_pct = (entry - exit_price) / entry * 100
+            icon = "🔔" if "TP" in hit else "🔴"
+            alerts.append(f"{icon} {sym.replace('USDT','')} {direction} → {hit} ({pnl_pct:+.2f}%)")
         else:
             still_open.append(trade)
 
+    # Write back updated files
     if results:
         df_results = pd.DataFrame(results)
         append_csv(TRADE_RESULTS_CSV, df_results)
+
     if still_open:
         df_still_open = pd.DataFrame(still_open)
         save_csv(OPEN_TRADES_CSV, df_still_open)
     else:
         save_csv(OPEN_TRADES_CSV, pd.DataFrame())
+
+    # Telegram notification for any closed trades
+    if alerts:
+        msg = "📢 Trade updates:\n" + "\n".join(alerts)
+        send_telegram(msg)
 
 # ========== LAYER 1: TECHNICALS (4h, structure‑heavy, no MACD) – weight 20% ==========
 def get_technicals(symbol_usdt):
@@ -696,7 +724,7 @@ def main():
         # Initialize CSV files (headers only) if they don't exist
         initialize_trade_files()
 
-        # Step 1: check open trades and update results
+        # Step 1: check open trades and update results (with Telegram alerts)
         print("Checking open trades...")
         all_coins_data = fetch_coingecko("https://api.coingecko.com/api/v3/coins/markets?vs_currency=usd&order=volume_desc&per_page=250&page=1")
         current_prices = {}
