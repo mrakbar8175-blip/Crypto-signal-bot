@@ -42,7 +42,8 @@ COIN_LIST = list(set([
     "TOMOUSDT", "DGBUSDT", "DUSKUSDT", "REEFUSDT", "ALPHAUSDT",
     "FORTHUSDT", "POLSUSDT", "C98USDT", "RAREUSDT", "ATAUSDT",
     "IDEXUSDT", "MLNUSDT",
-    "PEPEUSDT", "WIFUSDT", "BONKUSDT", "FLOKIUSDT", "APTUSDT", "SUIUSDT"
+    "PEPEUSDT", "WIFUSDT", "BONKUSDT", "FLOKIUSDT",
+    "APTUSDT", "SUIUSDT"
 ]))
 
 # ========== CSV FILE PATHS ==========
@@ -338,6 +339,7 @@ def get_buying_pressure(symbol_usdt):
 def get_volatility_score(symbol_usdt, current_price):
     atr, atr_err = get_4h_atr(symbol_usdt, current_price)
     atr_pct = atr / current_price * 100
+    # Tightened to 7% max
     if atr_pct < 2 or atr_pct > 7:
         return -1, atr_err
     return 1, None
@@ -364,6 +366,7 @@ def volume_trend_score(symbol_usdt, direction=None):
     first_half = recent[:3].mean()
     second_half = recent[3:].mean()
     if second_half > first_half * 1.05:
+        # Rising volume – bullish only if trend is up, bearish if trend is down
         if direction == "down":
             return -2, None
         return 2, None
@@ -498,13 +501,14 @@ def call_groq_reasoning(symbol, entry, atr, layers, errors=None):
         pass
     return 5, "Multi-factor model (AI unavailable)."
 
-# ========== MAIN SIGNAL GENERATION ==========
+# ========== MAIN SIGNAL GENERATION (with 4h trend filter) ==========
 def generate_signal():
     cg_url = "https://api.coingecko.com/api/v3/coins/markets?vs_currency=usd&order=volume_desc&per_page=100&page=1"
     coins_data = fetch_coingecko(cg_url)
     if not coins_data:
         return {"action": "HOLD", "reasoning": "CoinGecko market data unavailable."}
 
+    # Get list of symbols with open trades
     open_symbols = set()
     try:
         open_df = pd.read_csv(OPEN_TRADES_CSV)
@@ -521,7 +525,7 @@ def generate_signal():
 
     candidates = []
     for sym in COIN_LIST:
-        if sym in open_symbols:
+        if sym in open_symbols:        # skip coins with an open trade
             continue
         if sym not in cg_map:
             continue
@@ -552,7 +556,7 @@ def generate_signal():
             sym, price, volume, 0, btc_score, btc_error
         )
         atr, _ = get_4h_atr(sym, price)
-        if atr / price > 0.07:
+        if atr / price > 0.07:   # tightened volatility cap
             total_score = 0.0
             errors.append("volatility cap triggered (ATR>7%)")
         coin["score"] = total_score
@@ -599,7 +603,7 @@ def generate_signal():
 
     direction = "LONG" if best_score >= 0 else "SHORT"
 
-    # 4h trend filter
+    # ====== 4h Trend Filter ======
     if best_trend_dir:
         if (direction == "LONG" and best_trend_dir == "down") or \
            (direction == "SHORT" and best_trend_dir == "up"):
@@ -642,6 +646,7 @@ def generate_signal():
     risk = abs(entry - stop)
     qty = round(10 / risk, 4)
 
+    # Fixed RR‑based TP ladder
     mults = [0.4, 0.8, 1.2, 1.6, 2.0]
     tps = []
     for mult in mults:
@@ -688,7 +693,10 @@ def send_telegram(text):
 
 def main():
     try:
+        # Initialize CSV files (headers only) if they don't exist
         initialize_trade_files()
+
+        # Step 1: check open trades and update results
         print("Checking open trades...")
         all_coins_data = fetch_coingecko("https://api.coingecko.com/api/v3/coins/markets?vs_currency=usd&order=volume_desc&per_page=250&page=1")
         current_prices = {}
@@ -699,14 +707,19 @@ def main():
                     current_prices[sym] = coin["current_price"]
         check_open_trades(current_prices)
 
+        # Step 2: generate new signal
         dec = generate_signal()
         action = dec.get('action', 'HOLD')
         if action in ["LONG", "SHORT"]:
+            # Log signal to CSV
             log_signal(dec)
+            # Add to open trades
             add_open_trade(dec)
+            # Send Telegram signal
             raw_symbol = dec.get('symbol', '')
             symbol = raw_symbol.replace("USDT", "/USDT") if raw_symbol else ""
             direction_icon = "🟢" if action == "LONG" else "🔴"
+            swing_header = "📈 Swing Setup" if action == "LONG" else "📉 Swing Setup"
             entry_price = dec.get('limit_price', 0)
             stop_price = dec.get('stop_loss', 0)
             confidence = dec.get('confidence_score', 0)
@@ -716,14 +729,15 @@ def main():
             sl_pct = -abs(stop_price - entry_price) / entry_price * 100
             tp_lines = ""
             for i, tp in enumerate(tps, start=1):
-                tp_lines += f"TP{i}: {tp:,.6f}\n"    # 6 decimals for micro‑caps
+                tp_lines += f"TP{i}: {tp:,.6f}\n"
             tp_lines = tp_lines.strip()
 
             msg = (
+                f"{swing_header}\n"
                 f"${symbol}\n"
                 f"{action} {direction_icon}\n"
-                f"⛔ Entry: {entry_price:,.6f}\n"      # 6 decimals
-                f"🛑 Stop: {stop_price:,.6f} ({sl_pct:+.2f}%)\n"  # 6 decimals
+                f"⛔ Entry: {entry_price:,.6f}\n"
+                f"🛑 Stop: {stop_price:,.6f} ({sl_pct:+.2f}%)\n"
                 f"💰 Targets:\n"
                 f"{tp_lines}\n"
                 f"Conviction: {conviction:+.2f}/3  |  AI: {confidence}/10"
@@ -732,6 +746,7 @@ def main():
         else:
             msg = f"📊 HOLD\n{dec.get('reasoning', 'No signal')}"
             send_telegram(msg)
+
     except Exception as e:
         err_msg = f"Bot crashed: {traceback.format_exc()}"
         print(err_msg)
