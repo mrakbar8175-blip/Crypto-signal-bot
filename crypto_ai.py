@@ -302,7 +302,7 @@ def get_technicals(symbol_usdt):
     ema50_val = ema50.iloc[-1]
     distance_pct = abs(current - ema50_val) / current
 
-    # Also return the trend direction (for the 4h filter)
+    # Trend direction for the 4h filter
     trend_dir = "up" if current > ema50.iloc[-1] else "down"
 
     return {
@@ -339,7 +339,7 @@ def get_buying_pressure(symbol_usdt):
 def get_volatility_score(symbol_usdt, current_price):
     atr, atr_err = get_4h_atr(symbol_usdt, current_price)
     atr_pct = atr / current_price * 100
-    # Tightened to 7% max (was 10%)
+    # Tightened to 7% max
     if atr_pct < 2 or atr_pct > 7:
         return -1, atr_err
     return 1, None
@@ -359,7 +359,6 @@ def btc_trend_score():
 
 # ========== LAYER 5: VOLUME TREND (4h, 6 candles) – weight 5% ==========
 def volume_trend_score(symbol_usdt, direction=None):
-    """direction: 'up' or 'down' – if provided, rising volume is only bullish in an uptrend."""
     df = get_yahoo_klines(symbol_usdt, interval='4h', days=5)
     if df.empty or len(df) < 12:
         return 0, f"volume data insufficient ({len(df)} candles)"
@@ -369,17 +368,17 @@ def volume_trend_score(symbol_usdt, direction=None):
     if second_half > first_half * 1.05:
         # Rising volume – bullish only if trend is up, bearish if trend is down
         if direction == "down":
-            return -2, None   # rising volume in downtrend = bearish continuation
+            return -2, None
         return 2, None
     elif second_half < first_half * 0.95:
         if direction == "up":
-            return -2, None   # falling volume in uptrend = weakness
+            return -2, None
         return -2, None
     return 0, None
 
-# ========== MOMENTUM ALIGNMENT (enhanced) ==========
+# ========== MOMENTUM ALIGNMENT (directional fix) ==========
 def momentum_alignment_score(symbol_usdt, direction, layers):
-    """+0.20 only if the last candle agrees AND at least 2 other layers also agree."""
+    """+0.20 for LONG/-0.20 for SHORT when candle agrees and at least 2 other layers support."""
     df = get_yahoo_klines(symbol_usdt, interval='4h', days=2)
     if df.empty or len(df) < 2:
         return 0.0
@@ -389,7 +388,6 @@ def momentum_alignment_score(symbol_usdt, direction, layers):
     if not candle_agrees:
         return 0.0
 
-    # Count how many other directional layers support the direction
     supporting = 0
     if direction == "LONG":
         if layers.get("buying_press", 0) > 0.5: supporting += 1
@@ -401,7 +399,10 @@ def momentum_alignment_score(symbol_usdt, direction, layers):
         if layers.get("volume_trend", 0) < -0.5: supporting += 1
 
     if supporting >= 2:
-        return 0.20
+        if direction == "LONG":
+            return 0.20
+        else:  # SHORT
+            return -0.20     # reinforce bearish conviction
     return 0.0
 
 # ========== TREND STRENGTH BONUS (stronger for ADX > 35) ==========
@@ -412,7 +413,7 @@ def trend_strength_bonus(adx_value, base_score):
         return 0.20 * (1 if base_score > 0 else -1)
     return 0.0
 
-# ========== SCORING ENGINE (unchanged core, but with enhanced inputs) ==========
+# ========== SCORING ENGINE ==========
 def score_coin(symbol, price, volume_24h, change1h, btc_score, btc_error):
     errors = []
     tech = get_technicals(symbol)
@@ -436,7 +437,6 @@ def score_coin(symbol, price, volume_24h, change1h, btc_score, btc_error):
     if btc_error:
         errors.append(f"intermarket: {btc_error}")
 
-    # Volume trend now respects the trend direction
     vol_trend_s, vt_err = volume_trend_score(symbol, direction=trend_dir)
     if vt_err:
         errors.append(f"volume_trend({symbol}): {vt_err}")
@@ -502,7 +502,7 @@ def call_groq_reasoning(symbol, entry, atr, layers, errors=None):
         pass
     return 5, "Multi-factor model (AI unavailable)."
 
-# ========== MAIN SIGNAL GENERATION (with 4h trend filter) ==========
+# ========== MAIN SIGNAL GENERATION (with 4h trend filter, directional momentum) ==========
 def generate_signal():
     cg_url = "https://api.coingecko.com/api/v3/coins/markets?vs_currency=usd&order=volume_desc&per_page=100&page=1"
     coins_data = fetch_coingecko(cg_url)
@@ -526,7 +526,7 @@ def generate_signal():
 
     candidates = []
     for sym in COIN_LIST:
-        if sym in open_symbols:        # skip coins with an open trade
+        if sym in open_symbols:
             continue
         if sym not in cg_map:
             continue
@@ -557,7 +557,7 @@ def generate_signal():
             sym, price, volume, 0, btc_score, btc_error
         )
         atr, _ = get_4h_atr(sym, price)
-        if atr / price > 0.07:   # tightened volatility cap
+        if atr / price > 0.07:
             total_score = 0.0
             errors.append("volatility cap triggered (ATR>7%)")
         coin["score"] = total_score
@@ -620,10 +620,10 @@ def generate_signal():
                       f"All coins: {coin_summary}")
             return {"action": "HOLD", "reasoning": reason}
 
-    # Apply trend strength bonus (ADX > 30, stronger for >35)
+    # Apply trend strength bonus
     best_score += trend_strength_bonus(best_adx, best_score)
 
-    # Apply enhanced momentum alignment bonus
+    # Apply directional momentum alignment bonus
     momentum_bonus = momentum_alignment_score(best["symbol"], direction, best_layers)
     best_score += momentum_bonus
 
@@ -694,10 +694,7 @@ def send_telegram(text):
 
 def main():
     try:
-        # Initialize CSV files (headers only) if they don't exist
         initialize_trade_files()
-
-        # Step 1: check open trades and update results
         print("Checking open trades...")
         all_coins_data = fetch_coingecko("https://api.coingecko.com/api/v3/coins/markets?vs_currency=usd&order=volume_desc&per_page=250&page=1")
         current_prices = {}
@@ -708,15 +705,11 @@ def main():
                     current_prices[sym] = coin["current_price"]
         check_open_trades(current_prices)
 
-        # Step 2: generate new signal
         dec = generate_signal()
         action = dec.get('action', 'HOLD')
         if action in ["LONG", "SHORT"]:
-            # Log signal to CSV
             log_signal(dec)
-            # Add to open trades
             add_open_trade(dec)
-            # Send Telegram signal
             raw_symbol = dec.get('symbol', '')
             symbol = raw_symbol.replace("USDT", "/USDT") if raw_symbol else ""
             direction_icon = "🟢" if action == "LONG" else "🔴"
@@ -745,7 +738,6 @@ def main():
         else:
             msg = f"📊 HOLD\n{dec.get('reasoning', 'No signal')}"
             send_telegram(msg)
-
     except Exception as e:
         err_msg = f"Bot crashed: {traceback.format_exc()}"
         print(err_msg)
