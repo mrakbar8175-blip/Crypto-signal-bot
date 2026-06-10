@@ -137,10 +137,6 @@ def add_open_trade(signal):
     append_csv(OPEN_TRADES_CSV, df)
 
 def check_open_trades(current_prices):
-    """
-    Check open trades against current prices, close them if SL/TP hit,
-    save results, and send Telegram alerts.
-    """
     try:
         open_df = pd.read_csv(OPEN_TRADES_CSV)
     except (FileNotFoundError, pd.errors.EmptyDataError):
@@ -148,7 +144,7 @@ def check_open_trades(current_prices):
 
     results = []
     still_open = []
-    alerts = []   # collect Telegram alert lines
+    alerts = []
 
     for _, trade in open_df.iterrows():
         sym = trade["symbol"]
@@ -191,7 +187,6 @@ def check_open_trades(current_prices):
             result["close_time"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             results.append(result)
 
-            # PnL and alert message
             if direction == "LONG":
                 pnl_pct = (exit_price - entry) / entry * 100
             else:
@@ -201,7 +196,6 @@ def check_open_trades(current_prices):
         else:
             still_open.append(trade)
 
-    # Write back updated files
     if results:
         df_results = pd.DataFrame(results)
         append_csv(TRADE_RESULTS_CSV, df_results)
@@ -212,7 +206,6 @@ def check_open_trades(current_prices):
     else:
         save_csv(OPEN_TRADES_CSV, pd.DataFrame())
 
-    # Telegram notification for any closed trades
     if alerts:
         msg = "📢 Trade updates:\n" + "\n".join(alerts)
         send_telegram(msg)
@@ -232,7 +225,6 @@ def get_technicals(symbol_usdt):
     highs  = df['High']
     lows   = df['Low']
 
-    # EMA trend
     ema50 = closes.ewm(span=50, adjust=False).mean()
     ema200 = closes.ewm(span=200, adjust=False).mean() if len(closes) >= 200 else ema50
     current = closes.iloc[-1]
@@ -247,7 +239,6 @@ def get_technicals(symbol_usdt):
         trend -= 1.5
     trend = max(-3, min(3, trend))
 
-    # ADX
     def calc_adx(high, low, close, period=14):
         dm_plus = high.diff()
         dm_minus = -low.diff()
@@ -280,7 +271,6 @@ def get_technicals(symbol_usdt):
         else:
             adx_score = -1.0
 
-    # PRICE ACTION (structure, window=7 on 4h)
     window = 7
     lookback = min(50, len(highs))
     recent_highs = highs.iloc[-lookback:]
@@ -320,7 +310,6 @@ def get_technicals(symbol_usdt):
                 structure_score = -2.0
     structure_score = max(-3, min(3, structure_score))
 
-    # Combined (structure‑heavy, no MACD)
     combined = (
         trend * 0.30 +
         adx_score * 0.25 +
@@ -330,7 +319,6 @@ def get_technicals(symbol_usdt):
     ema50_val = ema50.iloc[-1]
     distance_pct = abs(current - ema50_val) / current
 
-    # Trend direction for the 4h filter
     trend_dir = "up" if current > ema50.iloc[-1] else "down"
 
     return {
@@ -367,7 +355,6 @@ def get_buying_pressure(symbol_usdt):
 def get_volatility_score(symbol_usdt, current_price):
     atr, atr_err = get_4h_atr(symbol_usdt, current_price)
     atr_pct = atr / current_price * 100
-    # Tightened to 7% max
     if atr_pct < 2 or atr_pct > 7:
         return -1, atr_err
     return 1, None
@@ -394,7 +381,6 @@ def volume_trend_score(symbol_usdt, direction=None):
     first_half = recent[:3].mean()
     second_half = recent[3:].mean()
     if second_half > first_half * 1.05:
-        # Rising volume – bullish only if trend is up, bearish if trend is down
         if direction == "down":
             return -2, None
         return 2, None
@@ -420,7 +406,7 @@ def momentum_alignment_score(symbol_usdt, direction, layers):
         if layers.get("buying_press", 0) > 0.5: supporting += 1
         if layers.get("intermarket", 0) > 0.5: supporting += 1
         if layers.get("volume_trend", 0) > 0.5: supporting += 1
-    else:  # SHORT
+    else:
         if layers.get("buying_press", 0) < -0.5: supporting += 1
         if layers.get("intermarket", 0) < -0.5: supporting += 1
         if layers.get("volume_trend", 0) < -0.5: supporting += 1
@@ -428,8 +414,8 @@ def momentum_alignment_score(symbol_usdt, direction, layers):
     if supporting >= 2:
         if direction == "LONG":
             return 0.20
-        else:  # SHORT
-            return -0.20     # reinforce bearish conviction
+        else:
+            return -0.20
     return 0.0
 
 # ========== TREND STRENGTH BONUS (stronger for ADX > 35) ==========
@@ -536,7 +522,6 @@ def generate_signal():
     if not coins_data:
         return {"action": "HOLD", "reasoning": "CoinGecko market data unavailable."}
 
-    # Get list of symbols with open trades
     open_symbols = set()
     try:
         open_df = pd.read_csv(OPEN_TRADES_CSV)
@@ -553,7 +538,7 @@ def generate_signal():
 
     candidates = []
     for sym in COIN_LIST:
-        if sym in open_symbols:        # skip coins with an open trade
+        if sym in open_symbols:
             continue
         if sym not in cg_map:
             continue
@@ -584,7 +569,7 @@ def generate_signal():
             sym, price, volume, 0, btc_score, btc_error
         )
         atr, _ = get_4h_atr(sym, price)
-        if atr / price > 0.07:   # tightened volatility cap
+        if atr / price > 0.07:
             total_score = 0.0
             errors.append("volatility cap triggered (ATR>7%)")
         coin["score"] = total_score
@@ -631,7 +616,6 @@ def generate_signal():
 
     direction = "LONG" if best_score >= 0 else "SHORT"
 
-    # ====== 4h Trend Filter ======
     if best_trend_dir:
         if (direction == "LONG" and best_trend_dir == "down") or \
            (direction == "SHORT" and best_trend_dir == "up"):
@@ -647,10 +631,7 @@ def generate_signal():
                       f"All coins: {coin_summary}")
             return {"action": "HOLD", "reasoning": reason}
 
-    # Apply trend strength bonus
     best_score += trend_strength_bonus(best_adx, best_score)
-
-    # Apply directional momentum alignment bonus
     momentum_bonus = momentum_alignment_score(best["symbol"], direction, best_layers)
     best_score += momentum_bonus
 
@@ -674,7 +655,6 @@ def generate_signal():
     risk = abs(entry - stop)
     qty = round(10 / risk, 4)
 
-    # Fixed RR‑based TP ladder
     mults = [0.4, 0.8, 1.2, 1.6, 2.0]
     tps = []
     for mult in mults:
@@ -705,7 +685,7 @@ def generate_signal():
         "stop_loss": stop,
         "take_profits": tps,
         "confidence_score": conf,
-        "reasoning": reason,
+        "reasoning": reason,          # <-- the AI's explanation
         "conviction_score": conviction_display,
         "layers": best_layers,
         "errors": best_errors
@@ -721,10 +701,8 @@ def send_telegram(text):
 
 def main():
     try:
-        # Initialize CSV files (headers only) if they don't exist
         initialize_trade_files()
 
-        # Step 1: check open trades and update results (with Telegram alerts)
         print("Checking open trades...")
         all_coins_data = fetch_coingecko("https://api.coingecko.com/api/v3/coins/markets?vs_currency=usd&order=volume_desc&per_page=250&page=1")
         current_prices = {}
@@ -735,15 +713,12 @@ def main():
                     current_prices[sym] = coin["current_price"]
         check_open_trades(current_prices)
 
-        # Step 2: generate new signal
         dec = generate_signal()
         action = dec.get('action', 'HOLD')
         if action in ["LONG", "SHORT"]:
-            # Log signal to CSV
             log_signal(dec)
-            # Add to open trades
             add_open_trade(dec)
-            # Send Telegram signal
+
             raw_symbol = dec.get('symbol', '')
             symbol = raw_symbol.replace("USDT", "/USDT") if raw_symbol else ""
             direction_icon = "🟢" if action == "LONG" else "🔴"
@@ -753,6 +728,7 @@ def main():
             confidence = dec.get('confidence_score', 0)
             conviction = dec.get('conviction_score', 0)
             tps = dec.get('take_profits', [])
+            reasoning_text = dec.get('reasoning', '')
 
             sl_pct = -abs(stop_price - entry_price) / entry_price * 100
             tp_lines = ""
@@ -770,6 +746,10 @@ def main():
                 f"{tp_lines}\n"
                 f"Conviction: {conviction:+.2f}/3  |  AI: {confidence}/10"
             )
+            # 👇 New line: add the AI reasoning
+            if reasoning_text:
+                msg += f"\n🧠 WHY: {reasoning_text}"
+
             send_telegram(msg)
         else:
             msg = f"📊 HOLD\n{dec.get('reasoning', 'No signal')}"
