@@ -63,10 +63,6 @@ def fetch_coingecko(url, retries=2):
     return None
 
 def get_yahoo_klines(symbol_usdt, interval='4h', days=60, start=None, end=None):
-    """
-    Fetch klines from Yahoo Finance. If start/end are given, use them;
-    otherwise fall back to 'days' from now.
-    """
     yahoo_symbol = symbol_usdt.replace("USDT", "-USD")
     if start is None:
         end = datetime.now()
@@ -144,13 +140,117 @@ def add_open_trade(signal):
     df = pd.DataFrame([row])
     append_csv(OPEN_TRADES_CSV, df)
 
-# ========== FIXED TRADE CHECKER (historical path) ==========
+# ========== SIMPLE TRAILING STOP LOGIC ==========
+
+def update_stop(direction, tp_index, entry, tps):
+    """New stop after hitting TP (tp_index: 0=TP1, 1=TP2, ...)"""
+    if direction == "LONG":
+        return entry if tp_index == 0 else tps[tp_index - 1]
+    else:
+        return entry if tp_index == 0 else tps[tp_index - 1]
+
+def resolve_ambiguous(sym, direction, entry, current_stop, tps, start_highest,
+                      start_time, end_time, depth=0):
+    """15m → 5m → heuristic to decide TP or stop first."""
+    if depth == 0:
+        interval = '15m'
+    elif depth == 1:
+        interval = '5m'
+    else:
+        return resolve_heuristic(sym, direction, entry, current_stop, tps, start_highest,
+                                 start_time, end_time)
+
+    df = get_yahoo_klines(sym, interval=interval, start=start_time, end=end_time)
+    if df.empty:
+        return resolve_heuristic(sym, direction, entry, current_stop, tps, start_highest,
+                                 start_time, end_time)
+
+    highest = start_highest
+    temp_stop = current_stop
+
+    for _, candle in df.iterrows():
+        high, low, open_, close_ = candle['High'], candle['Low'], candle['Open'], candle['Close']
+        is_bullish = close_ > open_
+
+        new_tp = None
+        if direction == "LONG":
+            for i in range(len(tps)-1, -1, -1):
+                if high >= tps[i] and i > highest:
+                    new_tp = i
+                    break
+        else:
+            for i in range(len(tps)-1, -1, -1):
+                if low <= tps[i] and i > highest:
+                    new_tp = i
+                    break
+
+        sl_hit = (low <= temp_stop) if direction == "LONG" else (high >= temp_stop)
+
+        if new_tp is not None and sl_hit:
+            if depth < 2:
+                sub_out, sub_exit = resolve_ambiguous(
+                    sym, direction, entry, temp_stop, tps, highest,
+                    candle.name, candle.name + pd.Timedelta(hours=1) if interval=='15m' else candle.name + pd.Timedelta(minutes=15),
+                    depth+1
+                )
+                return sub_out, sub_exit
+            else:
+                return resolve_heuristic_decision(direction, is_bullish, new_tp, temp_stop, tps, highest)
+
+        if new_tp is not None and not sl_hit:
+            highest = new_tp
+            temp_stop = update_stop(direction, highest, entry, tps)
+            if direction == "LONG" and low <= temp_stop:
+                return f"TP{highest+1}", temp_stop
+            if direction == "SHORT" and high >= temp_stop:
+                return f"TP{highest+1}", temp_stop
+            continue
+
+        if sl_hit and new_tp is None:
+            return (f"TP{highest+1}" if highest >= 0 else "STOP LOSS"), temp_stop
+
+    return None, None
+
+def resolve_heuristic(sym, direction, entry, current_stop, tps, start_highest, start_time, end_time):
+    """Use 1h candle direction as last resort."""
+    df = get_yahoo_klines(sym, interval='1h', start=start_time, end=end_time)
+    if df.empty:
+        return "STOP LOSS", current_stop
+    candle = df.iloc[0]
+    is_bullish = candle['Close'] > candle['Open']
+    high, low = candle['High'], candle['Low']
+
+    new_tp = None
+    if direction == "LONG":
+        for i in range(len(tps)-1, -1, -1):
+            if high >= tps[i] and i > start_highest:
+                new_tp = i
+                break
+    else:
+        for i in range(len(tps)-1, -1, -1):
+            if low <= tps[i] and i > start_highest:
+                new_tp = i
+                break
+
+    if new_tp is None:
+        return "STOP LOSS", current_stop
+    return resolve_heuristic_decision(direction, is_bullish, new_tp, current_stop, tps, start_highest)
+
+def resolve_heuristic_decision(direction, is_bullish, new_tp, current_stop, tps, start_highest):
+    if direction == "LONG":
+        if is_bullish:
+            new_stop = update_stop(direction, new_tp, None, tps)
+            return f"TP{new_tp+1}", new_stop
+        else:
+            return "STOP LOSS", current_stop
+    else:
+        if not is_bullish:
+            new_stop = update_stop(direction, new_tp, None, tps)
+            return f"TP{new_tp+1}", new_stop
+        else:
+            return "STOP LOSS", current_stop
+
 def check_open_trades():
-    """
-    Check every open trade against the FULL price path from entry to now.
-    If SL or any TP was touched at any point (even if price retraced),
-    the trade is closed, logged, and a Telegram alert is sent.
-    """
     try:
         open_df = pd.read_csv(OPEN_TRADES_CSV)
     except (FileNotFoundError, pd.errors.EmptyDataError):
@@ -163,110 +263,118 @@ def check_open_trades():
     still_open = []
     alerts = []
     now = datetime.now()
+    mults = [0.4, 0.8, 1.2, 1.6, 2.0]
 
-    for idx, trade in open_df.iterrows():
+    for _, trade in open_df.iterrows():
         sym = trade["symbol"]
         direction = trade["action"]
         entry = float(trade["entry"])
-        stop = float(trade["stop"])
-        tps = [float(trade[f"TP{i}"]) for i in range(1, 6)]
+        stop_orig = float(trade["stop"])
+        risk = abs(entry - stop_orig)
 
-        # Parse the entry timestamp
+        tps = []
+        for m in mults:
+            if direction == "LONG":
+                tps.append(entry + m * risk)
+            else:
+                tps.append(entry - m * risk)
+
         try:
             entry_time = datetime.strptime(trade["timestamp"], "%Y-%m-%d %H:%M:%S")
         except:
-            # If the timestamp is unreadable, keep the trade open
             still_open.append(trade)
             continue
 
-        # Fetch 4h candles covering the entire lifetime of the trade
-        df = get_yahoo_klines(sym, interval='4h', start=entry_time, end=now)
-        if df.empty:
-            # Data missing – leave the trade for next run
+        df_1h = get_yahoo_klines(sym, interval='1h', start=entry_time, end=now)
+        if df_1h.empty:
             still_open.append(trade)
             continue
 
-        # The extremes of the whole period tell us what actually happened
-        period_high = df['High'].max()
-        period_low  = df['Low'].min()
-
-        hit = None
+        current_stop = stop_orig
+        highest_tp_idx = -1
+        outcome = None
         exit_price = None
 
-        # Check SL first, then TP5 down to TP1 (highest priority)
-        if direction == "LONG":
-            if period_low <= stop:
-                hit = "STOP LOSS"
-                exit_price = stop
-            elif period_high >= tps[4]:
-                hit = "TP5"
-                exit_price = tps[4]
-            elif period_high >= tps[3]:
-                hit = "TP4"
-                exit_price = tps[3]
-            elif period_high >= tps[2]:
-                hit = "TP3"
-                exit_price = tps[2]
-            elif period_high >= tps[1]:
-                hit = "TP2"
-                exit_price = tps[1]
-            elif period_high >= tps[0]:
-                hit = "TP1"
-                exit_price = tps[0]
-        else:  # SHORT
-            if period_high >= stop:
-                hit = "STOP LOSS"
-                exit_price = stop
-            elif period_low <= tps[4]:
-                hit = "TP5"
-                exit_price = tps[4]
-            elif period_low <= tps[3]:
-                hit = "TP4"
-                exit_price = tps[3]
-            elif period_low <= tps[2]:
-                hit = "TP3"
-                exit_price = tps[2]
-            elif period_low <= tps[1]:
-                hit = "TP2"
-                exit_price = tps[1]
-            elif period_low <= tps[0]:
-                hit = "TP1"
-                exit_price = tps[0]
+        for candle_time, candle in df_1h.iterrows():
+            high = candle['High']
+            low = candle['Low']
+            open_ = candle['Open']
+            close_ = candle['Close']
 
-        if hit:
-            result = trade.to_dict()
-            result["hit_level"] = hit
-            result["close_time"] = now.strftime("%Y-%m-%d %H:%M:%S")
-            results.append(result)
-
-            # PnL
+            new_tp_idx = None
             if direction == "LONG":
-                pnl_pct = (exit_price - entry) / entry * 100
+                for i in range(len(tps)-1, -1, -1):
+                    if high >= tps[i] and i > highest_tp_idx:
+                        new_tp_idx = i
+                        break
             else:
-                pnl_pct = (entry - exit_price) / entry * 100
-            icon = "🔔" if "TP" in hit else "🔴"
-            alerts.append(f"{icon} {sym.replace('USDT','')} {direction} → {hit} ({pnl_pct:+.2f}%)")
-        else:
-            still_open.append(trade)
+                for i in range(len(tps)-1, -1, -1):
+                    if low <= tps[i] and i > highest_tp_idx:
+                        new_tp_idx = i
+                        break
 
-    # Save results
+            sl_touched = (low <= current_stop) if direction == "LONG" else (high >= current_stop)
+
+            if new_tp_idx is not None and sl_touched:
+                sub_outcome, sub_exit = resolve_ambiguous(
+                    sym, direction, entry, current_stop, tps, highest_tp_idx,
+                    candle_time, candle_time + timedelta(hours=1)
+                )
+                if sub_outcome:
+                    outcome = sub_outcome
+                    exit_price = sub_exit
+                    break
+                continue
+
+            if new_tp_idx is not None and not sl_touched:
+                highest_tp_idx = new_tp_idx
+                current_stop = update_stop(direction, highest_tp_idx, entry, tps)
+                if direction == "LONG" and low <= current_stop:
+                    outcome = f"TP{highest_tp_idx+1}"
+                    exit_price = current_stop
+                    break
+                if direction == "SHORT" and high >= current_stop:
+                    outcome = f"TP{highest_tp_idx+1}"
+                    exit_price = current_stop
+                    break
+                continue
+
+            if sl_touched and new_tp_idx is None:
+                outcome = f"TP{highest_tp_idx+1}" if highest_tp_idx >= 0 else "STOP LOSS"
+                exit_price = current_stop
+                break
+
+        if outcome is None:
+            still_open.append(trade)
+            continue
+
+        result = trade.to_dict()
+        result["hit_level"] = outcome
+        result["close_time"] = now.strftime("%Y-%m-%d %H:%M:%S")
+        results.append(result)
+
+        if direction == "LONG":
+            pnl_pct = (exit_price - entry) / entry * 100
+        else:
+            pnl_pct = (entry - exit_price) / entry * 100
+        icon = "🔔" if "TP" in outcome else "🔴"
+        alerts.append(f"{icon} {sym.replace('USDT','')} {direction} → {outcome} ({pnl_pct:+.2f}%)")
+
     if results:
         df_results = pd.DataFrame(results)
         append_csv(TRADE_RESULTS_CSV, df_results)
 
-    # Update open trades file (overwrite)
     if still_open:
         df_still_open = pd.DataFrame(still_open)
         save_csv(OPEN_TRADES_CSV, df_still_open)
     else:
         save_csv(OPEN_TRADES_CSV, pd.DataFrame())
 
-    # Telegram alerts
     if alerts:
         msg = "📢 Trade updates:\n" + "\n".join(alerts)
         send_telegram(msg)
 
-# ========== LAYER 1: TECHNICALS (4h, structure‑heavy, no MACD) – weight 20% ==========
+# ========== YOUR ORIGINAL SIGNAL ENGINE (UNTOUCHED) ==========
 def get_technicals(symbol_usdt):
     df = get_yahoo_klines(symbol_usdt, interval='4h', days=14)
     error = None
@@ -276,11 +384,9 @@ def get_technicals(symbol_usdt):
             "trend": 0, "adx": 0, "structure": 0,
             "combined": 0, "ema50_distance": 1.0, "error": error
         }
-
     closes = df['Close']
     highs  = df['High']
     lows   = df['Low']
-
     ema50 = closes.ewm(span=50, adjust=False).mean()
     ema200 = closes.ewm(span=200, adjust=False).mean() if len(closes) >= 200 else ema50
     current = closes.iloc[-1]
@@ -331,7 +437,6 @@ def get_technicals(symbol_usdt):
     lookback = min(50, len(highs))
     recent_highs = highs.iloc[-lookback:]
     recent_lows  = lows.iloc[-lookback:]
-
     swing_highs = []
     swing_lows  = []
     for i in range(window, len(recent_highs) - window):
@@ -371,12 +476,9 @@ def get_technicals(symbol_usdt):
         adx_score * 0.25 +
         structure_score * 0.45
     )
-
     ema50_val = ema50.iloc[-1]
     distance_pct = abs(current - ema50_val) / current
-
     trend_dir = "up" if current > ema50.iloc[-1] else "down"
-
     return {
         "trend": trend, "adx": adx_score, "structure": structure_score,
         "combined": combined, "ema50_distance": distance_pct,
@@ -394,7 +496,6 @@ def get_4h_atr(symbol_usdt, current_price):
         return current_price * 0.02, "ATR calculation failed, using 2% fallback"
     return atr, None
 
-# ========== LAYER 2: BUYING PRESSURE (4h, 48 candles lookback) – weight 45% ==========
 def get_buying_pressure(symbol_usdt):
     df = get_yahoo_klines(symbol_usdt, interval='4h', days=10)
     if df.empty or len(df) < 48:
@@ -407,7 +508,6 @@ def get_buying_pressure(symbol_usdt):
         return 0.0, "zero total volume"
     return (buy_vol - sell_vol) / total, None
 
-# ========== LAYER 3: VOLATILITY (4h) – weight 5% ==========
 def get_volatility_score(symbol_usdt, current_price):
     atr, atr_err = get_4h_atr(symbol_usdt, current_price)
     atr_pct = atr / current_price * 100
@@ -415,7 +515,6 @@ def get_volatility_score(symbol_usdt, current_price):
         return -1, atr_err
     return 1, None
 
-# ========== LAYER 4: INTERMARKET (BTC 4h trend) – weight 25% ==========
 def btc_trend_score():
     df = get_yahoo_klines("BTCUSDT", interval='4h', days=14)
     if df.empty or len(df) < 50:
@@ -428,7 +527,6 @@ def btc_trend_score():
     else:
         return -2, None
 
-# ========== LAYER 5: VOLUME TREND (4h, 6 candles) – weight 5% ==========
 def volume_trend_score(symbol_usdt, direction=None):
     df = get_yahoo_klines(symbol_usdt, interval='4h', days=5)
     if df.empty or len(df) < 12:
@@ -446,7 +544,6 @@ def volume_trend_score(symbol_usdt, direction=None):
         return -2, None
     return 0, None
 
-# ========== MOMENTUM ALIGNMENT (directional fix) ==========
 def momentum_alignment_score(symbol_usdt, direction, layers):
     df = get_yahoo_klines(symbol_usdt, interval='4h', days=2)
     if df.empty or len(df) < 2:
@@ -456,7 +553,6 @@ def momentum_alignment_score(symbol_usdt, direction, layers):
                     (direction == "SHORT" and last['Close'] < last['Open'])
     if not candle_agrees:
         return 0.0
-
     supporting = 0
     if direction == "LONG":
         if layers.get("buying_press", 0) > 0.5: supporting += 1
@@ -466,7 +562,6 @@ def momentum_alignment_score(symbol_usdt, direction, layers):
         if layers.get("buying_press", 0) < -0.5: supporting += 1
         if layers.get("intermarket", 0) < -0.5: supporting += 1
         if layers.get("volume_trend", 0) < -0.5: supporting += 1
-
     if supporting >= 2:
         if direction == "LONG":
             return 0.20
@@ -474,7 +569,6 @@ def momentum_alignment_score(symbol_usdt, direction, layers):
             return -0.20
     return 0.0
 
-# ========== TREND STRENGTH BONUS (stronger for ADX > 35) ==========
 def trend_strength_bonus(adx_value, base_score):
     if adx_value > 35 and abs(base_score) > 0.5:
         return 0.30 * (1 if base_score > 0 else -1)
@@ -482,7 +576,6 @@ def trend_strength_bonus(adx_value, base_score):
         return 0.20 * (1 if base_score > 0 else -1)
     return 0.0
 
-# ========== SCORING ENGINE ==========
 def score_coin(symbol, price, volume_24h, change1h, btc_score, btc_error):
     errors = []
     tech = get_technicals(symbol)
@@ -492,24 +585,19 @@ def score_coin(symbol, price, volume_24h, change1h, btc_score, btc_error):
     ema50_distance = tech["ema50_distance"]
     adx_value = tech.get("adx_value", 0)
     trend_dir = tech.get("trend_dir", "up")
-
     buying, buy_err = get_buying_pressure(symbol)
     if buy_err:
         errors.append(f"buying_press({symbol}): {buy_err}")
     buying_score = buying * 3
-
     vol_score, vol_err = get_volatility_score(symbol, price)
     if vol_err:
         errors.append(f"volatility({symbol}): {vol_err}")
-
     intermarket_s = btc_score
     if btc_error:
         errors.append(f"intermarket: {btc_error}")
-
     vol_trend_s, vt_err = volume_trend_score(symbol, direction=trend_dir)
     if vt_err:
         errors.append(f"volume_trend({symbol}): {vt_err}")
-
     total = (
         0.20 * tech_combined +
         0.45 * buying_score +
@@ -517,7 +605,6 @@ def score_coin(symbol, price, volume_24h, change1h, btc_score, btc_error):
         0.25 * intermarket_s +
         0.05 * vol_trend_s
     )
-
     layers = {
         "tech": tech_combined,
         "buying_press": buying_score,
@@ -527,18 +614,15 @@ def score_coin(symbol, price, volume_24h, change1h, btc_score, btc_error):
     }
     return max(-3, min(3, total)), layers, ema50_distance, adx_value, trend_dir, errors
 
-# ========== AI REASONING (confidence 4‑7) ==========
 def call_groq_reasoning(symbol, entry, atr, layers, errors=None):
     layer_str = "; ".join([f"{k}={v:.2f}" for k,v in layers.items()])
     err_str = ""
     if errors:
         err_str = " | Data issues: " + "; ".join(errors)
-
     directional_scores = [layers["tech"], layers["buying_press"], layers["intermarket"], layers["volume_trend"]]
     bearish_count = sum(1 for s in directional_scores if s < -0.5)
     bullish_count = sum(1 for s in directional_scores if s > 0.5)
     alignment_strength = max(bearish_count, bullish_count)
-
     prompt = (
         f"Trade signal for {symbol} at {entry}. 4h ATR: {atr:.4f}. "
         f"Layer scores: {layer_str}{err_str}. "
@@ -571,13 +655,11 @@ def call_groq_reasoning(symbol, entry, atr, layers, errors=None):
         pass
     return 5, "Multi-factor model (AI unavailable)."
 
-# ========== MAIN SIGNAL GENERATION (with 4h trend filter) ==========
 def generate_signal():
     cg_url = "https://api.coingecko.com/api/v3/coins/markets?vs_currency=usd&order=volume_desc&per_page=100&page=1"
     coins_data = fetch_coingecko(cg_url)
     if not coins_data:
         return {"action": "HOLD", "reasoning": "CoinGecko market data unavailable."}
-
     open_symbols = set()
     try:
         open_df = pd.read_csv(OPEN_TRADES_CSV)
@@ -585,13 +667,11 @@ def generate_signal():
             open_symbols = set(open_df["symbol"].values)
     except (FileNotFoundError, pd.errors.EmptyDataError):
         pass
-
     cg_map = {}
     for coin in coins_data:
         sym = coin.get("symbol", "").upper() + "USDT"
         if coin.get("current_price", 0) > 0:
             cg_map[sym] = {"price": coin["current_price"], "volume": coin.get("total_volume", 0)}
-
     candidates = []
     for sym in COIN_LIST:
         if sym in open_symbols:
@@ -601,12 +681,9 @@ def generate_signal():
         candidates.append({"symbol": sym, "price": cg_map[sym]["price"], "volume": cg_map[sym]["volume"]})
     candidates.sort(key=lambda x: x["volume"], reverse=True)
     candidates = candidates[:60]
-
     if not candidates:
         return {"action": "HOLD", "reasoning": "No liquid coins available (all coins with open trades skipped)."}
-
     btc_score, btc_error = btc_trend_score()
-
     all_scored = []
     best = None
     best_score = 0
@@ -615,12 +692,10 @@ def generate_signal():
     best_adx = 0
     best_trend_dir = None
     best_errors = []
-
     for coin in candidates:
         sym = coin["symbol"]
         price = coin["price"]
         volume = coin["volume"]
-
         total_score, layers, ema_dist, adx_val, trend_dir, errors = score_coin(
             sym, price, volume, 0, btc_score, btc_error
         )
@@ -637,9 +712,7 @@ def generate_signal():
         coin["adx_value"] = adx_val
         coin["trend_dir"] = trend_dir
         coin["errors"] = errors
-
         all_scored.append(coin)
-
         if best is None or abs(total_score) > abs(best_score):
             best = coin
             best_score = total_score
@@ -648,16 +721,13 @@ def generate_signal():
             best_adx = adx_val
             best_trend_dir = trend_dir
             best_errors = errors
-
     if btc_error:
         best_errors.append(f"intermarket: {btc_error}")
-
     all_scored_sorted = sorted(all_scored, key=lambda x: abs(x["score"]), reverse=True)
     coin_summary_list = []
     for c in all_scored_sorted:
         coin_summary_list.append(f"{c['symbol'].replace('USDT','')}: {c['score']:.2f}")
     coin_summary = " | ".join(coin_summary_list)
-
     if best is None or abs(best_score) < 1.49:
         best_sym = best["symbol"] if best else "none"
         layer_str = "; ".join([f"{k}={v:.2f}" for k,v in best_layers.items()])
@@ -669,9 +739,7 @@ def generate_signal():
                   f"Layers: {layer_str}{err_str}\n"
                   f"All coins: {coin_summary}")
         return {"action": "HOLD", "reasoning": reason}
-
     direction = "LONG" if best_score >= 0 else "SHORT"
-
     if best_trend_dir:
         if (direction == "LONG" and best_trend_dir == "down") or \
            (direction == "SHORT" and best_trend_dir == "up"):
@@ -686,11 +754,9 @@ def generate_signal():
                       f"Layers: {layer_str}{err_str}\n"
                       f"All coins: {coin_summary}")
             return {"action": "HOLD", "reasoning": reason}
-
     best_score += trend_strength_bonus(best_adx, best_score)
     momentum_bonus = momentum_alignment_score(best["symbol"], direction, best_layers)
     best_score += momentum_bonus
-
     if abs(best_score) < 1.49:
         best_sym = best["symbol"]
         layer_str = "; ".join([f"{k}={v:.2f}" for k,v in best_layers.items()])
@@ -702,7 +768,6 @@ def generate_signal():
                   f"Layers: {layer_str}{err_str}\n"
                   f"All coins: {coin_summary}")
         return {"action": "HOLD", "reasoning": reason}
-
     entry = best["bid"] if direction == "LONG" else best["ask"]
     atr = best["atr"]
     min_stop = max(1.5 * atr, entry * 0.02)
@@ -710,7 +775,6 @@ def generate_signal():
     stop = round(stop, 6)
     risk = abs(entry - stop)
     qty = round(10 / risk, 4)
-
     mults = [0.4, 0.8, 1.2, 1.6, 2.0]
     tps = []
     for mult in mults:
@@ -718,7 +782,6 @@ def generate_signal():
             tps.append(round(entry + mult * risk, 6))
         else:
             tps.append(round(entry - mult * risk, 6))
-
     conf, reason = call_groq_reasoning(best["symbol"], entry, atr, best_layers, best_errors)
     if conf < 5:
         layer_str = "; ".join([f"{k}={v:.2f}" for k,v in best_layers.items()])
@@ -730,9 +793,7 @@ def generate_signal():
                   f"Layers: {layer_str}{err_str}\n"
                   f"All coins: {coin_summary}\n{reason}")
         return {"action": "HOLD", "reasoning": reason}
-
     conviction_display = round(best_score, 2)
-
     return {
         "action": direction,
         "symbol": best["symbol"],
@@ -747,7 +808,6 @@ def generate_signal():
         "errors": best_errors
     }
 
-# ========== TELEGRAM ==========
 def send_telegram(text):
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     try:
@@ -758,16 +818,13 @@ def send_telegram(text):
 def main():
     try:
         initialize_trade_files()
-
         print("Checking open trades...")
-        check_open_trades()   # <--- NO arguments needed now; uses full history
-
+        check_open_trades()
         dec = generate_signal()
         action = dec.get('action', 'HOLD')
         if action in ["LONG", "SHORT"]:
             log_signal(dec)
             add_open_trade(dec)
-
             raw_symbol = dec.get('symbol', '')
             symbol = raw_symbol.replace("USDT", "/USDT") if raw_symbol else ""
             direction_icon = "🟢" if action == "LONG" else "🔴"
@@ -778,13 +835,11 @@ def main():
             conviction = dec.get('conviction_score', 0)
             tps = dec.get('take_profits', [])
             reasoning_text = dec.get('reasoning', '')
-
             sl_pct = -abs(stop_price - entry_price) / entry_price * 100
             tp_lines = ""
             for i, tp in enumerate(tps, start=1):
                 tp_lines += f"TP{i}: {tp:,.6f}\n"
             tp_lines = tp_lines.strip()
-
             msg = (
                 f"{swing_header}\n"
                 f"${symbol}\n"
@@ -797,12 +852,10 @@ def main():
             )
             if reasoning_text:
                 msg += f"\n🧠 WHY: {reasoning_text}"
-
             send_telegram(msg)
         else:
             msg = f"📊 HOLD\n{dec.get('reasoning', 'No signal')}"
             send_telegram(msg)
-
     except Exception as e:
         err_msg = f"Bot crashed: {traceback.format_exc()}"
         print(err_msg)
