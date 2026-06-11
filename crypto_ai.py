@@ -62,10 +62,18 @@ def fetch_coingecko(url, retries=2):
             pass
     return None
 
-def get_yahoo_klines(symbol_usdt, interval='4h', days=60):
+def get_yahoo_klines(symbol_usdt, interval='4h', days=60, start=None, end=None):
+    """
+    Fetch klines from Yahoo Finance. If start/end are given, use them;
+    otherwise fall back to 'days' from now.
+    """
     yahoo_symbol = symbol_usdt.replace("USDT", "-USD")
-    end = datetime.now()
-    start = end - timedelta(days=days)
+    if start is None:
+        end = datetime.now()
+        start = end - timedelta(days=days)
+    else:
+        if end is None:
+            end = datetime.now()
     try:
         df = yf.download(yahoo_symbol, start=start, end=end, interval=interval, progress=False)
         if df.empty:
@@ -136,57 +144,102 @@ def add_open_trade(signal):
     df = pd.DataFrame([row])
     append_csv(OPEN_TRADES_CSV, df)
 
-def check_open_trades(current_prices):
+# ========== FIXED TRADE CHECKER (historical path) ==========
+def check_open_trades():
+    """
+    Check every open trade against the FULL price path from entry to now.
+    If SL or any TP was touched at any point (even if price retraced),
+    the trade is closed, logged, and a Telegram alert is sent.
+    """
     try:
         open_df = pd.read_csv(OPEN_TRADES_CSV)
     except (FileNotFoundError, pd.errors.EmptyDataError):
         return
 
+    if open_df.empty:
+        return
+
     results = []
     still_open = []
     alerts = []
+    now = datetime.now()
 
-    for _, trade in open_df.iterrows():
+    for idx, trade in open_df.iterrows():
         sym = trade["symbol"]
-        if sym not in current_prices:
+        direction = trade["action"]
+        entry = float(trade["entry"])
+        stop = float(trade["stop"])
+        tps = [float(trade[f"TP{i}"]) for i in range(1, 6)]
+
+        # Parse the entry timestamp
+        try:
+            entry_time = datetime.strptime(trade["timestamp"], "%Y-%m-%d %H:%M:%S")
+        except:
+            # If the timestamp is unreadable, keep the trade open
             still_open.append(trade)
             continue
 
-        price = current_prices[sym]
-        direction = trade["action"]
-        entry = trade["entry"]
-        stop = trade["stop"]
-        tps = [trade[f"TP{i}"] for i in range(1, 6)]
+        # Fetch 4h candles covering the entire lifetime of the trade
+        df = get_yahoo_klines(sym, interval='4h', start=entry_time, end=now)
+        if df.empty:
+            # Data missing – leave the trade for next run
+            still_open.append(trade)
+            continue
+
+        # The extremes of the whole period tell us what actually happened
+        period_high = df['High'].max()
+        period_low  = df['Low'].min()
 
         hit = None
         exit_price = None
+
+        # Check SL first, then TP5 down to TP1 (highest priority)
         if direction == "LONG":
-            if price <= stop:
+            if period_low <= stop:
                 hit = "STOP LOSS"
                 exit_price = stop
-            else:
-                for i, tp in enumerate(tps, 1):
-                    if price >= tp:
-                        hit = f"TP{i}"
-                        exit_price = tp
-                        break
+            elif period_high >= tps[4]:
+                hit = "TP5"
+                exit_price = tps[4]
+            elif period_high >= tps[3]:
+                hit = "TP4"
+                exit_price = tps[3]
+            elif period_high >= tps[2]:
+                hit = "TP3"
+                exit_price = tps[2]
+            elif period_high >= tps[1]:
+                hit = "TP2"
+                exit_price = tps[1]
+            elif period_high >= tps[0]:
+                hit = "TP1"
+                exit_price = tps[0]
         else:  # SHORT
-            if price >= stop:
+            if period_high >= stop:
                 hit = "STOP LOSS"
                 exit_price = stop
-            else:
-                for i, tp in enumerate(tps, 1):
-                    if price <= tp:
-                        hit = f"TP{i}"
-                        exit_price = tp
-                        break
+            elif period_low <= tps[4]:
+                hit = "TP5"
+                exit_price = tps[4]
+            elif period_low <= tps[3]:
+                hit = "TP4"
+                exit_price = tps[3]
+            elif period_low <= tps[2]:
+                hit = "TP3"
+                exit_price = tps[2]
+            elif period_low <= tps[1]:
+                hit = "TP2"
+                exit_price = tps[1]
+            elif period_low <= tps[0]:
+                hit = "TP1"
+                exit_price = tps[0]
 
         if hit:
             result = trade.to_dict()
             result["hit_level"] = hit
-            result["close_time"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            result["close_time"] = now.strftime("%Y-%m-%d %H:%M:%S")
             results.append(result)
 
+            # PnL
             if direction == "LONG":
                 pnl_pct = (exit_price - entry) / entry * 100
             else:
@@ -196,16 +249,19 @@ def check_open_trades(current_prices):
         else:
             still_open.append(trade)
 
+    # Save results
     if results:
         df_results = pd.DataFrame(results)
         append_csv(TRADE_RESULTS_CSV, df_results)
 
+    # Update open trades file (overwrite)
     if still_open:
         df_still_open = pd.DataFrame(still_open)
         save_csv(OPEN_TRADES_CSV, df_still_open)
     else:
         save_csv(OPEN_TRADES_CSV, pd.DataFrame())
 
+    # Telegram alerts
     if alerts:
         msg = "📢 Trade updates:\n" + "\n".join(alerts)
         send_telegram(msg)
@@ -685,7 +741,7 @@ def generate_signal():
         "stop_loss": stop,
         "take_profits": tps,
         "confidence_score": conf,
-        "reasoning": reason,          # <-- the AI's explanation
+        "reasoning": reason,
         "conviction_score": conviction_display,
         "layers": best_layers,
         "errors": best_errors
@@ -704,14 +760,7 @@ def main():
         initialize_trade_files()
 
         print("Checking open trades...")
-        all_coins_data = fetch_coingecko("https://api.coingecko.com/api/v3/coins/markets?vs_currency=usd&order=volume_desc&per_page=250&page=1")
-        current_prices = {}
-        if all_coins_data:
-            for coin in all_coins_data:
-                sym = coin.get("symbol", "").upper() + "USDT"
-                if coin.get("current_price", 0) > 0:
-                    current_prices[sym] = coin["current_price"]
-        check_open_trades(current_prices)
+        check_open_trades()   # <--- NO arguments needed now; uses full history
 
         dec = generate_signal()
         action = dec.get('action', 'HOLD')
@@ -746,7 +795,6 @@ def main():
                 f"{tp_lines}\n"
                 f"Conviction: {conviction:+.2f}/3  |  AI: {confidence}/10"
             )
-            # 👇 New line: add the AI reasoning
             if reasoning_text:
                 msg += f"\n🧠 WHY: {reasoning_text}"
 
