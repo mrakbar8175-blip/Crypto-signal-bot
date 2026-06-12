@@ -374,7 +374,7 @@ def check_open_trades():
         msg = "📢 Trade updates:\n" + "\n".join(alerts)
         send_telegram(msg)
 
-# ========== YOUR ORIGINAL SIGNAL ENGINE (UNTOUCHED) ==========
+# ========== 4‑HOUR ANALYSIS ENGINE (UNTOUCHED) ==========
 def get_technicals(symbol_usdt):
     df = get_yahoo_klines(symbol_usdt, interval='4h', days=14)
     error = None
@@ -614,32 +614,35 @@ def score_coin(symbol, price, volume_24h, change1h, btc_score, btc_error):
     }
     return max(-3, min(3, total)), layers, ema50_distance, adx_value, trend_dir, errors
 
+# ========== AI REASONING – NOW HUMAN‑LIKE ==========
 def call_groq_reasoning(symbol, entry, atr, layers, errors=None):
     layer_str = "; ".join([f"{k}={v:.2f}" for k,v in layers.items()])
     err_str = ""
     if errors:
         err_str = " | Data issues: " + "; ".join(errors)
+
     directional_scores = [layers["tech"], layers["buying_press"], layers["intermarket"], layers["volume_trend"]]
     bearish_count = sum(1 for s in directional_scores if s < -0.5)
     bullish_count = sum(1 for s in directional_scores if s > 0.5)
     alignment_strength = max(bearish_count, bullish_count)
+
     prompt = (
         f"Trade signal for {symbol} at {entry}. 4h ATR: {atr:.4f}. "
-        f"Layer scores: {layer_str}{err_str}. "
-        f"All {alignment_strength} out of 4 directional layers are strongly aligned (bearish/bullish). "
-        "Provide a concise, punchy reasoning (max 2 sentences) capturing why this trade sets up well. "
-        "Also give a confidence score between 4 and 7 (never higher than 7, never lower than 4). "
-        "Confidence must reflect the number of aligned layers: at least 5 if 2 layers agree, 6 if 3 layers agree, 7 only if all 4 layers agree. "
-        "Low ATR is a positive sign for risk management, not a caution. "
+        f"Internal technical scores: {layer_str}{err_str}. "
+        f"Alignment: {alignment_strength}/4 directional metrics are strongly aligned (bullish/bearish). "
+        "Provide a very short, natural‑sounding reasoning (max 2 sentences) for this trade, as if you were a trader explaining it to a friend. "
+        "Do NOT mention any technical indicator names, numbers, or the word 'layers'. Use plain language, e.g., 'ETH is at resistance' or 'Strong bullish momentum on the 4h'. "
+        "Also give a confidence score between 4 and 7 (never higher than 7, never lower than 4) based on alignment strength: 5 if 2 metrics align, 6 if 3 align, 7 if all 4 align. "
         "Format: CONFIDENCE: 7 | REASONING: [text]"
     )
+
     url = "https://api.groq.com/openai/v1/chat/completions"
     headers = {"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"}
     payload = {
         "model": "llama-3.3-70b-versatile",
         "messages": [{"role": "user", "content": prompt}],
-        "temperature": 0.3,
-        "max_tokens": 200
+        "temperature": 0.5,          # a bit higher for varied phrasing
+        "max_tokens": 150
     }
     try:
         resp = requests.post(url, headers=headers, json=payload, timeout=30)
@@ -660,6 +663,7 @@ def generate_signal():
     coins_data = fetch_coingecko(cg_url)
     if not coins_data:
         return {"action": "HOLD", "reasoning": "CoinGecko market data unavailable."}
+
     open_symbols = set()
     try:
         open_df = pd.read_csv(OPEN_TRADES_CSV)
@@ -667,11 +671,13 @@ def generate_signal():
             open_symbols = set(open_df["symbol"].values)
     except (FileNotFoundError, pd.errors.EmptyDataError):
         pass
+
     cg_map = {}
     for coin in coins_data:
         sym = coin.get("symbol", "").upper() + "USDT"
         if coin.get("current_price", 0) > 0:
             cg_map[sym] = {"price": coin["current_price"], "volume": coin.get("total_volume", 0)}
+
     candidates = []
     for sym in COIN_LIST:
         if sym in open_symbols:
@@ -681,8 +687,10 @@ def generate_signal():
         candidates.append({"symbol": sym, "price": cg_map[sym]["price"], "volume": cg_map[sym]["volume"]})
     candidates.sort(key=lambda x: x["volume"], reverse=True)
     candidates = candidates[:60]
+
     if not candidates:
         return {"action": "HOLD", "reasoning": "No liquid coins available (all coins with open trades skipped)."}
+
     btc_score, btc_error = btc_trend_score()
     all_scored = []
     best = None
@@ -692,10 +700,12 @@ def generate_signal():
     best_adx = 0
     best_trend_dir = None
     best_errors = []
+
     for coin in candidates:
         sym = coin["symbol"]
         price = coin["price"]
         volume = coin["volume"]
+
         total_score, layers, ema_dist, adx_val, trend_dir, errors = score_coin(
             sym, price, volume, 0, btc_score, btc_error
         )
@@ -712,7 +722,9 @@ def generate_signal():
         coin["adx_value"] = adx_val
         coin["trend_dir"] = trend_dir
         coin["errors"] = errors
+
         all_scored.append(coin)
+
         if best is None or abs(total_score) > abs(best_score):
             best = coin
             best_score = total_score
@@ -721,13 +733,16 @@ def generate_signal():
             best_adx = adx_val
             best_trend_dir = trend_dir
             best_errors = errors
+
     if btc_error:
         best_errors.append(f"intermarket: {btc_error}")
+
     all_scored_sorted = sorted(all_scored, key=lambda x: abs(x["score"]), reverse=True)
     coin_summary_list = []
     for c in all_scored_sorted:
         coin_summary_list.append(f"{c['symbol'].replace('USDT','')}: {c['score']:.2f}")
     coin_summary = " | ".join(coin_summary_list)
+
     if best is None or abs(best_score) < 1.49:
         best_sym = best["symbol"] if best else "none"
         layer_str = "; ".join([f"{k}={v:.2f}" for k,v in best_layers.items()])
@@ -739,7 +754,9 @@ def generate_signal():
                   f"Layers: {layer_str}{err_str}\n"
                   f"All coins: {coin_summary}")
         return {"action": "HOLD", "reasoning": reason}
+
     direction = "LONG" if best_score >= 0 else "SHORT"
+
     if best_trend_dir:
         if (direction == "LONG" and best_trend_dir == "down") or \
            (direction == "SHORT" and best_trend_dir == "up"):
@@ -754,9 +771,11 @@ def generate_signal():
                       f"Layers: {layer_str}{err_str}\n"
                       f"All coins: {coin_summary}")
             return {"action": "HOLD", "reasoning": reason}
+
     best_score += trend_strength_bonus(best_adx, best_score)
     momentum_bonus = momentum_alignment_score(best["symbol"], direction, best_layers)
     best_score += momentum_bonus
+
     if abs(best_score) < 1.49:
         best_sym = best["symbol"]
         layer_str = "; ".join([f"{k}={v:.2f}" for k,v in best_layers.items()])
@@ -768,6 +787,7 @@ def generate_signal():
                   f"Layers: {layer_str}{err_str}\n"
                   f"All coins: {coin_summary}")
         return {"action": "HOLD", "reasoning": reason}
+
     entry = best["bid"] if direction == "LONG" else best["ask"]
     atr = best["atr"]
     min_stop = max(1.5 * atr, entry * 0.02)
@@ -775,6 +795,7 @@ def generate_signal():
     stop = round(stop, 6)
     risk = abs(entry - stop)
     qty = round(10 / risk, 4)
+
     mults = [0.4, 0.8, 1.2, 1.6, 2.0]
     tps = []
     for mult in mults:
@@ -782,6 +803,7 @@ def generate_signal():
             tps.append(round(entry + mult * risk, 6))
         else:
             tps.append(round(entry - mult * risk, 6))
+
     conf, reason = call_groq_reasoning(best["symbol"], entry, atr, best_layers, best_errors)
     if conf < 5:
         layer_str = "; ".join([f"{k}={v:.2f}" for k,v in best_layers.items()])
@@ -793,7 +815,15 @@ def generate_signal():
                   f"Layers: {layer_str}{err_str}\n"
                   f"All coins: {coin_summary}\n{reason}")
         return {"action": "HOLD", "reasoning": reason}
+
     conviction_display = round(best_score, 2)
+    # Scale conviction to ±10
+    conviction10 = round(best_score * 10 / 3)
+    if conviction10 >= 0:
+        conviction_str = f"+{conviction10}/10"
+    else:
+        conviction_str = f"{conviction10}/10"
+
     return {
         "action": direction,
         "symbol": best["symbol"],
@@ -804,6 +834,7 @@ def generate_signal():
         "confidence_score": conf,
         "reasoning": reason,
         "conviction_score": conviction_display,
+        "conviction10_str": conviction_str,   # for the message
         "layers": best_layers,
         "errors": best_errors
     }
@@ -826,32 +857,27 @@ def main():
             log_signal(dec)
             add_open_trade(dec)
             raw_symbol = dec.get('symbol', '')
-            symbol = raw_symbol.replace("USDT", "/USDT") if raw_symbol else ""
+            symbol_display = raw_symbol.replace("USDT", "/USDT")
             direction_icon = "🟢" if action == "LONG" else "🔴"
-            swing_header = "📈 Swing Setup" if action == "LONG" else "📉 Swing Setup"
             entry_price = dec.get('limit_price', 0)
             stop_price = dec.get('stop_loss', 0)
-            confidence = dec.get('confidence_score', 0)
-            conviction = dec.get('conviction_score', 0)
             tps = dec.get('take_profits', [])
+            conviction_str = dec.get('conviction10_str', '0/10')
             reasoning_text = dec.get('reasoning', '')
-            sl_pct = -abs(stop_price - entry_price) / entry_price * 100
-            tp_lines = ""
-            for i, tp in enumerate(tps, start=1):
-                tp_lines += f"TP{i}: {tp:,.6f}\n"
-            tp_lines = tp_lines.strip()
+
+            # Build targets string
+            tp_list = [f"{tp:,.6f}" for tp in tps]
+            tp_str = " / ".join(tp_list)
+
+            # Minimal signal message
             msg = (
-                f"{swing_header}\n"
-                f"${symbol}\n"
-                f"{action} {direction_icon}\n"
-                f"⛔ Entry: {entry_price:,.6f}\n"
-                f"🛑 Stop: {stop_price:,.6f} ({sl_pct:+.2f}%)\n"
-                f"💰 Targets:\n"
-                f"{tp_lines}\n"
-                f"Conviction: {conviction:+.2f}/3  |  AI: {confidence}/10"
+                f"{symbol_display} ({action}) {direction_icon}\n"
+                f"• Entry: {entry_price:,.6f}\n"
+                f"• Stop Loss: {stop_price:,.6f}\n"
+                f"Targets: {tp_str}\n"
+                f"Conviction: {conviction_str}\n"
+                f"{reasoning_text}"
             )
-            if reasoning_text:
-                msg += f"\n🧠 WHY: {reasoning_text}"
             send_telegram(msg)
         else:
             msg = f"📊 HOLD\n{dec.get('reasoning', 'No signal')}"
