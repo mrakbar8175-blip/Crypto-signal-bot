@@ -100,8 +100,9 @@ def save_csv(filepath, df):
 def initialize_trade_files():
     init_csv(TRADE_LOG_CSV, ["timestamp", "symbol", "action", "entry", "stop",
                              "TP1", "TP2", "TP3", "TP4", "TP5", "conviction", "ai_confidence"])
+    # New column "highest_tp" stores the index (-1 = none) of the highest TP reached
     init_csv(OPEN_TRADES_CSV, ["timestamp", "symbol", "action", "entry", "stop",
-                               "TP1", "TP2", "TP3", "TP4", "TP5", "status"])
+                               "TP1", "TP2", "TP3", "TP4", "TP5", "status", "highest_tp"])
     init_csv(TRADE_RESULTS_CSV, ["timestamp", "symbol", "action", "entry", "stop",
                                  "TP1", "TP2", "TP3", "TP4", "TP5", "status", "hit_level", "close_time"])
 
@@ -135,7 +136,8 @@ def add_open_trade(signal):
         "TP3": signal["take_profits"][2],
         "TP4": signal["take_profits"][3],
         "TP5": signal["take_profits"][4],
-        "status": "open"
+        "status": "open",
+        "highest_tp": -1        # no TP reached yet
     }
     df = pd.DataFrame([row])
     append_csv(OPEN_TRADES_CSV, df)
@@ -259,13 +261,18 @@ def check_open_trades():
     if open_df.empty:
         return
 
+    # Ensure the "highest_tp" column exists (for older files)
+    if "highest_tp" not in open_df.columns:
+        open_df["highest_tp"] = -1
+
     results = []
     still_open = []
     alerts = []
+    tp_alerts = []          # New: instant TP hit alerts
     now = datetime.now()
     mults = [0.4, 0.8, 1.2, 1.6, 2.0]
 
-    for _, trade in open_df.iterrows():
+    for idx, trade in open_df.iterrows():
         sym = trade["symbol"]
         direction = trade["action"]
         entry = float(trade["entry"])
@@ -290,10 +297,16 @@ def check_open_trades():
             still_open.append(trade)
             continue
 
+        # Start from the last known highest TP
         current_stop = stop_orig
-        highest_tp_idx = -1
+        highest_tp_idx = int(trade.get("highest_tp", -1))
+        # If we already had a TP, adjust the current stop accordingly
+        if highest_tp_idx >= 0:
+            current_stop = update_stop(direction, highest_tp_idx, entry, tps)
+
         outcome = None
         exit_price = None
+        new_high = highest_tp_idx   # track new highs during this run
 
         for candle_time, candle in df_1h.iterrows():
             high = candle['High']
@@ -327,8 +340,19 @@ def check_open_trades():
                 continue
 
             if new_tp_idx is not None and not sl_touched:
+                # A new higher TP was reached — send an instant alert
                 highest_tp_idx = new_tp_idx
+                new_high = highest_tp_idx
                 current_stop = update_stop(direction, highest_tp_idx, entry, tps)
+
+                # Build TP hit alert
+                if highest_tp_idx == 0:
+                    stop_desc = "BE"
+                else:
+                    stop_desc = f"TP{highest_tp_idx}"
+                tp_alerts.append(f"🚀 {sym.replace('USDT','')} {direction} TP{highest_tp_idx+1} hit — SL moved to {stop_desc}")
+
+                # Check if the new stop is immediately breached in the same candle
                 if direction == "LONG" and low <= current_stop:
                     outcome = f"TP{highest_tp_idx+1}"
                     exit_price = current_stop
@@ -345,9 +369,12 @@ def check_open_trades():
                 break
 
         if outcome is None:
+            # Trade still open — update highest_tp in the record
+            trade["highest_tp"] = new_high
             still_open.append(trade)
             continue
 
+        # Trade closed
         result = trade.to_dict()
         result["hit_level"] = outcome
         result["close_time"] = now.strftime("%Y-%m-%d %H:%M:%S")
@@ -360,16 +387,23 @@ def check_open_trades():
         icon = "🔔" if "TP" in outcome else "🔴"
         alerts.append(f"{icon} {sym.replace('USDT','')} {direction} → {outcome} ({pnl_pct:+.2f}%)")
 
+    # Save results and open trades
     if results:
         df_results = pd.DataFrame(results)
         append_csv(TRADE_RESULTS_CSV, df_results)
 
     if still_open:
         df_still_open = pd.DataFrame(still_open)
+        # Ensure the "highest_tp" column is present
+        if "highest_tp" not in df_still_open.columns:
+            df_still_open["highest_tp"] = -1
         save_csv(OPEN_TRADES_CSV, df_still_open)
     else:
         save_csv(OPEN_TRADES_CSV, pd.DataFrame())
 
+    # Send alerts
+    if tp_alerts:
+        send_telegram("\n".join(tp_alerts))
     if alerts:
         msg = "📢 Trade updates:\n" + "\n".join(alerts)
         send_telegram(msg)
@@ -614,18 +648,15 @@ def score_coin(symbol, price, volume_24h, change1h, btc_score, btc_error):
     }
     return max(-3, min(3, total)), layers, ema50_distance, adx_value, trend_dir, errors
 
-# ========== AI REASONING – NOW HUMAN‑LIKE ==========
 def call_groq_reasoning(symbol, entry, atr, layers, errors=None):
     layer_str = "; ".join([f"{k}={v:.2f}" for k,v in layers.items()])
     err_str = ""
     if errors:
         err_str = " | Data issues: " + "; ".join(errors)
-
     directional_scores = [layers["tech"], layers["buying_press"], layers["intermarket"], layers["volume_trend"]]
     bearish_count = sum(1 for s in directional_scores if s < -0.5)
     bullish_count = sum(1 for s in directional_scores if s > 0.5)
     alignment_strength = max(bearish_count, bullish_count)
-
     prompt = (
         f"Trade signal for {symbol} at {entry}. 4h ATR: {atr:.4f}. "
         f"Internal technical scores: {layer_str}{err_str}. "
@@ -635,13 +666,12 @@ def call_groq_reasoning(symbol, entry, atr, layers, errors=None):
         "Also give a confidence score between 4 and 7 (never higher than 7, never lower than 4) based on alignment strength: 5 if 2 metrics align, 6 if 3 align, 7 if all 4 align. "
         "Format: CONFIDENCE: 7 | REASONING: [text]"
     )
-
     url = "https://api.groq.com/openai/v1/chat/completions"
     headers = {"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"}
     payload = {
         "model": "llama-3.3-70b-versatile",
         "messages": [{"role": "user", "content": prompt}],
-        "temperature": 0.5,          # a bit higher for varied phrasing
+        "temperature": 0.5,
         "max_tokens": 150
     }
     try:
@@ -817,7 +847,6 @@ def generate_signal():
         return {"action": "HOLD", "reasoning": reason}
 
     conviction_display = round(best_score, 2)
-    # Scale conviction to ±10
     conviction10 = round(best_score * 10 / 3)
     if conviction10 >= 0:
         conviction_str = f"+{conviction10}/10"
@@ -834,7 +863,7 @@ def generate_signal():
         "confidence_score": conf,
         "reasoning": reason,
         "conviction_score": conviction_display,
-        "conviction10_str": conviction_str,   # for the message
+        "conviction10_str": conviction_str,
         "layers": best_layers,
         "errors": best_errors
     }
@@ -865,11 +894,9 @@ def main():
             conviction_str = dec.get('conviction10_str', '0/10')
             reasoning_text = dec.get('reasoning', '')
 
-            # Build targets string
             tp_list = [f"{tp:,.6f}" for tp in tps]
             tp_str = " / ".join(tp_list)
 
-            # Minimal signal message
             msg = (
                 f"{symbol_display} ({action}) {direction_icon}\n"
                 f"• Entry: {entry_price:,.6f}\n"
