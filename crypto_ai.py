@@ -1,11 +1,8 @@
 #!/usr/bin/env python3
 """
-Crypto Trading Bot – Production Ready
-- Binance public API (no key needed)
-- Dynamic top‑volume USDT universe
-- 5% daily loss limit (scales with balance)
-- Configurable via config.json
-- Trailing stops, AI reasoning, backtest skeleton
+Crypto Trading Bot – Single-File, No Config.json
+All settings are directly in the SETTINGS dictionary below.
+Secrets must be set as environment variables: TELEGRAM_TOKEN, CHAT_ID, GROQ_API_KEY.
 """
 
 import requests, json, os, sys, traceback, re, time, argparse
@@ -13,67 +10,46 @@ import pandas as pd
 import numpy as np
 from datetime import datetime, timedelta
 
-# ===================== CONFIGURATION =====================
-CONFIG_FILE = "config.json"
+# ===================== ALL SETTINGS – EDIT HERE =====================
+SETTINGS = {
+    # --- Essentials ---
+    "initial_balance": 1000.0,          # starting USDT balance
+    "daily_loss_limit_pct": 5.0,        # stop trading after losing X% of current balance in a day
+    "risk_per_trade": 0.01,             # risk 1% of balance per trade
+    "max_positions": 2,                 # maximum simultaneous open trades
 
-default_config = {
-    "telegram_token": "",
-    "chat_id": "",
-    "groq_api_key": "",
-    "portfolio_file": "portfolio.json",
-    "initial_balance": 1000.0,
-    "daily_loss_limit_pct": 5.0,          # 5% daily loss limit
-    "risk_per_trade": 0.01,
-    "max_positions": 2,
-    "conviction_threshold": 1.49,
-    "ai_confidence_min": 4,
-    "volatility_cap_pct": 7,
+    # --- Strategy thresholds ---
+    "conviction_threshold": 1.49,       # minimum absolute conviction score to take a trade
+    "ai_confidence_min": 4,             # minimum AI confidence (1-10) required
+    "volatility_cap_pct": 7,            # ignore coins with 4h ATR > X% of price
     "atr_period": 14,
-    "atr_stop_multiplier": 1.5,
-    "trading_interval": "4h",
+    "atr_stop_multiplier": 1.5,        # stop distance = max(ATR*mult, 1% of entry)
+
+    # --- Data & Universe ---
     "binance_base_url": "https://api.binance.com",
-    "universe_top_n": 30,
-    "min_notional": 10.0,
+    "universe_top_n": 30,               # number of top-volume USDT pairs to scan
+    "min_notional": 10.0,               # minimum order value in USDT
+
+    # --- Backtest (skeleton) ---
     "backtest_start": "2023-01-01",
     "backtest_end": "2024-01-01",
     "backtest_interval": "4h",
     "backtest_initial_balance": 1000.0,
 }
 
-def load_config():
-    if os.path.exists(CONFIG_FILE):
-        with open(CONFIG_FILE) as f:
-            user = json.load(f)
-    else:
-        user = {}
-    cfg = default_config.copy()
-    cfg.update(user)
-    # Env variables override config file
-    if not cfg["telegram_token"]:
-        cfg["telegram_token"] = os.environ.get("TELEGRAM_TOKEN", "")
-    if not cfg["chat_id"]:
-        cfg["chat_id"] = os.environ.get("CHAT_ID", "")
-    if not cfg["groq_api_key"]:
-        cfg["groq_api_key"] = os.environ.get("GROQ_API_KEY", "")
-    return cfg
+# ===================== SECRETS (set as env vars) =====================
+TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "")
+CHAT_ID = os.environ.get("CHAT_ID", "")
+GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
 
-config = load_config()
-TELEGRAM_TOKEN = config["telegram_token"]
-CHAT_ID = config["chat_id"]
-GROQ_API_KEY = config["groq_api_key"]
-PORTFOLIO_FILE = config["portfolio_file"]
-INITIAL_BALANCE = config["initial_balance"]
-DAILY_LOSS_LIMIT_PCT = config["daily_loss_limit_pct"]
-RISK_PER_TRADE = config["risk_per_trade"]
-MAX_POSITIONS = config["max_positions"]
-CONVICTION_THRESHOLD = config["conviction_threshold"]
-AI_CONFIDENCE_MIN = config["ai_confidence_min"]
-VOLATILITY_CAP_PCT = config["volatility_cap_pct"]
-ATR_PERIOD = config["atr_period"]
-ATR_STOP_MULT = config["atr_stop_multiplier"]
-UNIVERSE_TOP_N = config["universe_top_n"]
-MIN_NOTIONAL = config["min_notional"]
-BINANCE_BASE = config["binance_base_url"]
+if not TELEGRAM_TOKEN or not CHAT_ID:
+    print("Warning: TELEGRAM_TOKEN and CHAT_ID not set – bot will not send messages.")
+
+# Shortcuts to settings
+PORTFOLIO_FILE = "portfolio.json"
+TRADE_LOG_CSV = "trade_log.csv"
+OPEN_TRADES_CSV = "open_trades.csv"
+TRADE_RESULTS_CSV = "trade_results.csv"
 
 # ===================== PERSISTENT PORTFOLIO =====================
 def load_portfolio():
@@ -82,14 +58,14 @@ def load_portfolio():
             with open(PORTFOLIO_FILE) as f:
                 data = json.load(f)
             return {
-                "balance_usdt": data.get("balance_usdt", INITIAL_BALANCE),
+                "balance_usdt": data.get("balance_usdt", SETTINGS["initial_balance"]),
                 "realized_pnl": data.get("realized_pnl", 0.0),
                 "open_positions": data.get("open_positions", 0)
             }
         except:
             pass
     return {
-        "balance_usdt": INITIAL_BALANCE,
+        "balance_usdt": SETTINGS["initial_balance"],
         "realized_pnl": 0.0,
         "open_positions": 0
     }
@@ -103,15 +79,8 @@ def save_portfolio(p):
 
 # ===================== BINANCE DATA HELPERS =====================
 def binance_klines(symbol, interval, start_time=None, end_time=None, limit=500):
-    """
-    Fetch klines from Binance. start_time/end_time are datetime objects or ms timestamps.
-    """
-    url = f"{BINANCE_BASE}/api/v3/klines"
-    params = {
-        "symbol": symbol,
-        "interval": interval,
-        "limit": limit
-    }
+    url = f"{SETTINGS['binance_base_url']}/api/v3/klines"
+    params = {"symbol": symbol, "interval": interval, "limit": limit}
     if start_time:
         if isinstance(start_time, datetime):
             params["startTime"] = int(start_time.timestamp() * 1000)
@@ -147,8 +116,7 @@ def binance_klines(symbol, interval, start_time=None, end_time=None, limit=500):
         return pd.DataFrame()
 
 def binance_24hr_tickers():
-    """Fetch 24hr ticker for all USDT pairs, return sorted by volume."""
-    url = f"{BINANCE_BASE}/api/v3/ticker/24hr"
+    url = f"{SETTINGS['binance_base_url']}/api/v3/ticker/24hr"
     try:
         resp = requests.get(url, timeout=10)
         if resp.status_code == 200:
@@ -166,8 +134,7 @@ def binance_24hr_tickers():
         return []
 
 def binance_exchange_info(symbol):
-    """Get lot size step and min notional for a symbol."""
-    url = f"{BINANCE_BASE}/api/v3/exchangeInfo"
+    url = f"{SETTINGS['binance_base_url']}/api/v3/exchangeInfo"
     try:
         resp = requests.get(url, timeout=10)
         if resp.status_code == 200:
@@ -181,13 +148,9 @@ def binance_exchange_info(symbol):
                     return step_size, min_qty, min_notional
     except:
         pass
-    return 0.001, 0.001, 10.0  # fallback
+    return 0.001, 0.001, 10.0
 
-# ===================== CSV FILES & LOGGING =====================
-TRADE_LOG_CSV = "trade_log.csv"
-OPEN_TRADES_CSV = "open_trades.csv"
-TRADE_RESULTS_CSV = "trade_results.csv"
-
+# ===================== CSV LOGGING =====================
 def init_csv(filepath, columns):
     if not os.path.exists(filepath):
         pd.DataFrame(columns=columns).to_csv(filepath, index=False)
@@ -249,7 +212,6 @@ def add_open_trade(signal):
 
 # ===================== TECHNICAL ANALYSIS =====================
 def get_technicals(df):
-    """Requires DataFrame with columns ['High','Low','Close']"""
     if df.empty or len(df) < 50:
         return {"trend": 0, "adx": 0, "structure": 0, "combined": 0, "ema50_distance": 1.0, "error": "insufficient data"}
     closes = df['Close']
@@ -284,7 +246,7 @@ def get_technicals(df):
         adx = dx.ewm(alpha=1/period, adjust=False).mean()
         return adx, di_plus, di_minus
 
-    adx_series, di_plus, di_minus = calc_adx(highs, lows, closes, ATR_PERIOD)
+    adx_series, di_plus, di_minus = calc_adx(highs, lows, closes, SETTINGS["atr_period"])
     adx_now = adx_series.iloc[-1]
     di_plus_now = di_plus.iloc[-1]
     di_minus_now = di_minus.iloc[-1]
@@ -332,11 +294,11 @@ def get_technicals(df):
     }
 
 def get_4h_atr(df, current_price):
-    if df.empty or len(df) < ATR_PERIOD:
+    if df.empty or len(df) < SETTINGS["atr_period"]:
         return current_price * 0.02
     high, low, close = df['High'], df['Low'], df['Close']
     tr = pd.concat([high - low, (high - close.shift()).abs(), (low - close.shift()).abs()], axis=1).max(axis=1)
-    atr = tr.rolling(ATR_PERIOD).mean().iloc[-1]
+    atr = tr.rolling(SETTINGS["atr_period"]).mean().iloc[-1]
     if pd.isna(atr):
         return current_price * 0.02
     return atr
@@ -384,7 +346,7 @@ def anchored_vwap_score(df, current_price):
 def get_volatility_score(df, current_price):
     atr = get_4h_atr(df, current_price)
     atr_pct = atr / current_price * 100
-    if atr_pct < 2 or atr_pct > VOLATILITY_CAP_PCT:
+    if atr_pct < 2 or atr_pct > SETTINGS["volatility_cap_pct"]:
         return -1
     return 1
 
@@ -409,14 +371,12 @@ def volume_trend_score(df, direction=None):
     return 0
 
 def institutional_macro_filter(df_btc):
-    """Uses BTC 4h data and USDT dominance mock (fallback if no CoinGecko)."""
     if df_btc.empty or len(df_btc) < 50:
         return 0
     closes = df_btc['Close']
     ema50 = closes.ewm(span=50, adjust=False).mean()
     btc_bullish = closes.iloc[-1] > ema50.iloc[-1]
-    # Fallback USDT dominance (we skip CoinGecko to keep it simple)
-    usdt_dom = 5.0
+    usdt_dom = 5.0  # fallback (no external API)
     macro = 0
     if btc_bullish:
         macro += 1
@@ -813,16 +773,14 @@ def check_open_trades():
 
 # ========== UNIVERSE BUILDER ==========
 def build_universe():
-    """Get top N USDT pairs by 24h volume from Binance."""
     tickers = binance_24hr_tickers()
     if not tickers:
         return []
-    # Filter out low-volume, stablecoins, and weird pairs
     filtered = [t for t in tickers if t["quoteVolume"] > 500_000
                 and t["symbol"].endswith("USDT")
                 and "USDC" not in t["symbol"]
                 and "BUSD" not in t["symbol"]]
-    top = filtered[:UNIVERSE_TOP_N]
+    top = filtered[:SETTINGS["universe_top_n"]]
     return [t["symbol"] for t in top]
 
 # ========== SIGNAL GENERATION ==========
@@ -843,7 +801,6 @@ def generate_signal(balance_usdt, backtest_mode=False):
     for sym in universe:
         if sym in open_symbols:
             continue
-        # Get current price from 24hr ticker
         tickers = binance_24hr_tickers()
         ticker = next((t for t in tickers if t["symbol"] == sym), None)
         if ticker is None or float(ticker["lastPrice"]) <= 0:
@@ -856,7 +813,6 @@ def generate_signal(balance_usdt, backtest_mode=False):
     if not candidates:
         return {"action": "HOLD", "reasoning": "No liquid candidates."}
 
-    # Fetch BTC 4h for intermarket and macro
     btc_4h = binance_klines("BTCUSDT", "4h", limit=200)
     btc_score = btc_trend_score(btc_4h)
     macro_score = institutional_macro_filter(btc_4h)
@@ -872,7 +828,7 @@ def generate_signal(balance_usdt, backtest_mode=False):
             continue
         total_score, layers, ema_dist, adx_val, trend_dir, errors = score_coin(sym, price, df_4h, btc_4h, macro_score)
         atr = get_4h_atr(df_4h, price)
-        if atr / price * 100 > VOLATILITY_CAP_PCT:
+        if atr / price * 100 > SETTINGS["volatility_cap_pct"]:
             total_score = 0.0
             errors.append("volatility cap")
         coin["score"] = total_score
@@ -888,7 +844,7 @@ def generate_signal(balance_usdt, backtest_mode=False):
             best = coin
             best_score = total_score
 
-    if best is None or abs(best_score) < CONVICTION_THRESHOLD:
+    if best is None or abs(best_score) < SETTINGS["conviction_threshold"]:
         best_sym = best["symbol"] if best else "none"
         reason = f"No strong conviction (best {best_sym} score {best_score:+.2f})"
         return {"action": "HOLD", "reasoning": reason}
@@ -904,22 +860,20 @@ def generate_signal(balance_usdt, backtest_mode=False):
     )
     best_score += momentum_bonus
 
-    if abs(best_score) < CONVICTION_THRESHOLD:
+    if abs(best_score) < SETTINGS["conviction_threshold"]:
         return {"action": "HOLD", "reasoning": f"Final conviction {best_score:+.2f} below threshold."}
 
     entry = best["price"] * (0.999 if direction == "LONG" else 1.001)
     atr = best["atr"]
-    min_stop_distance = max(ATR_STOP_MULT * atr, entry * 0.01)
+    min_stop_distance = max(SETTINGS["atr_stop_multiplier"] * atr, entry * 0.01)
     stop = entry - min_stop_distance if direction == "LONG" else entry + min_stop_distance
     risk_per_share = abs(entry - stop)
 
-    # Lot size rounding
     step_size, min_qty, min_notional = binance_exchange_info(best["symbol"])
-    risk_amount = balance_usdt * RISK_PER_TRADE
+    risk_amount = balance_usdt * SETTINGS["risk_per_trade"]
     qty = risk_amount / risk_per_share
-    # Round down to step size
     qty = (qty // step_size) * step_size
-    if qty < min_qty or qty * entry < min_notional or qty * entry < MIN_NOTIONAL:
+    if qty < min_qty or qty * entry < min_notional or qty * entry < SETTINGS["min_notional"]:
         return {"action": "HOLD", "reasoning": f"Position size {qty:.6f} too small."}
 
     mults = [0.4, 0.8, 1.2, 1.6, 2.0]
@@ -931,7 +885,7 @@ def generate_signal(balance_usdt, backtest_mode=False):
             tps.append(round(entry - m * risk_per_share, 6))
 
     conf, reason = call_groq_reasoning(best["symbol"], entry, atr, best["layers"], best["errors"])
-    if conf < AI_CONFIDENCE_MIN:
+    if conf < SETTINGS["ai_confidence_min"]:
         return {"action": "HOLD", "reasoning": f"AI confidence too low ({conf}/10). {reason}"}
 
     return {
@@ -951,15 +905,13 @@ def backtest():
     print("Starting backtest...")
     initialize_trade_files()
     portfolio = load_portfolio()
-    portfolio["balance_usdt"] = config["backtest_initial_balance"]
+    portfolio["balance_usdt"] = SETTINGS["backtest_initial_balance"]
     save_portfolio(portfolio)
 
-    start = datetime.strptime(config["backtest_start"], "%Y-%m-%d")
-    end = datetime.strptime(config["backtest_end"], "%Y-%m-%d")
+    start = datetime.strptime(SETTINGS["backtest_start"], "%Y-%m-%d")
+    end = datetime.strptime(SETTINGS["backtest_end"], "%Y-%m-%d")
     current = start
     while current <= end:
-        # Simulate checking open trades (simplified: just skip, as backtest is snapshot)
-        # For a real backtest you'd track positions over time.
         print(f"Backtest: {current.strftime('%Y-%m-%d')}")
         signal = generate_signal(portfolio["balance_usdt"], backtest_mode=True)
         if signal["action"] in ["LONG", "SHORT"]:
@@ -968,9 +920,7 @@ def backtest():
             portfolio = load_portfolio()
             portfolio["open_positions"] += 1
             save_portfolio(portfolio)
-        # Simulate closing everything at next step? Not implemented fully; would need price updates.
-        # This is a skeleton.
-        current += timedelta(hours=4)  # 4h steps
+        current += timedelta(hours=4)
     print("Backtest finished (simplified).")
 
 # ========== TELEGRAM ==========
@@ -1009,8 +959,8 @@ def main():
     portfolio = load_portfolio()
     balance = portfolio['balance_usdt']
 
-    # Calculate daily loss limit in USD (5% of current balance)
-    daily_loss_limit_usd = -balance * (DAILY_LOSS_LIMIT_PCT / 100)
+    # 5% daily loss limit based on current balance
+    daily_loss_limit_usd = -balance * (SETTINGS["daily_loss_limit_pct"] / 100)
 
     daily_pnl = get_daily_pnl()
     if daily_pnl <= daily_loss_limit_usd:
@@ -1019,8 +969,8 @@ def main():
         if TELEGRAM_TOKEN: send_telegram(msg)
         return
 
-    if portfolio['open_positions'] >= MAX_POSITIONS:
-        msg = f"Max positions reached ({portfolio['open_positions']}/{MAX_POSITIONS})."
+    if portfolio['open_positions'] >= SETTINGS["max_positions"]:
+        msg = f"Max positions reached ({portfolio['open_positions']}/{SETTINGS['max_positions']})."
         if TELEGRAM_TOKEN: send_telegram(msg)
         return
 
