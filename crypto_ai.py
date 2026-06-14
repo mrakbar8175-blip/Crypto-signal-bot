@@ -468,7 +468,6 @@ def check_open_trades():
             still_open.append(trade)
             continue
 
-        # Trade closed – record and send chart
         if direction == "LONG":
             pnl_usdt = qty * (exit_price - entry)
         else:
@@ -493,7 +492,7 @@ def check_open_trades():
         icon = "🔔" if "TP" in outcome else "🔴"
         alerts.append(f"{icon} {sym.replace('USDT','')} {direction} → {outcome} ({pnl_pct:+.2f}%)")
 
-        # Send chart for this closed trade
+        # Send chart (image or TradingView link with EMA+VWAP)
         send_trade_chart({
             'symbol': sym,
             'action': direction,
@@ -662,25 +661,20 @@ def get_volatility_score(symbol_usdt, current_price):
         return -1, atr_err
     return 1, None
 
-# ---------- FIXED INTERMARKET LAYER (no more flickering) ----------
 def btc_trend_score():
     df = get_yahoo_klines("BTCUSDT", interval='4h', days=14)
     if df.empty or len(df) < 50:
         return 0, "BTC data unavailable"
-
     closes = df['Close']
     ema50 = closes.ewm(span=50, adjust=False).mean()
     current = closes.iloc[-1]
     ema_now = ema50.iloc[-1]
-
     if len(ema50) >= 7:
         ema_prev = ema50.iloc[-7]
         slope_up = ema_now > ema_prev
     else:
         slope_up = True
-
     price_above = current > ema_now
-
     if price_above and slope_up:
         return 2, None
     elif not price_above and not slope_up:
@@ -841,12 +835,12 @@ def call_groq_reasoning(symbol, entry, atr, layers, errors=None):
         pass
     return 5, "Market structure: neutral. Catalyst: none. Risk note: automated signal."
 
-# ========== SIGNAL GENERATION (DYNAMIC TOP 50) ==========
+# ========== SIGNAL GENERATION ==========
 def generate_signal(balance_usdt):
     cg_url = "https://api.coingecko.com/api/v3/coins/markets?vs_currency=usd&order=volume_desc&per_page=100&page=1"
     coins_data = fetch_coingecko(cg_url)
     if not coins_data:
-        return {"action": "HOLD", "reasoning": "CoinGecko market data unavailable."}
+        return {"action": "HOLD", "reasoning": "CoinGecko market data unavailable.", "best_candidate": None}
 
     open_symbols = set()
     try:
@@ -1022,17 +1016,26 @@ def generate_signal(balance_usdt):
         "best_candidate": best
     }
 
-# ========== CHART GENERATOR (reusable) ==========
+# ========== CHART (with EMA+VWAP TradingView fallback) ==========
 def send_trade_chart(signal, title_suffix=""):
     """
-    Generate a 4h candlestick chart.
-    If 'signal' has entry/stop/tps, those lines are drawn.
-    Otherwise just show the clean chart with EMA/VWAP.
+    Sends a 4h chart as a Telegram photo.
+    If mplfinance fails, sends a TradingView link with EMA(50) and VWAP pre-loaded.
     """
+    # Primary method: mplfinance image
     try:
-        import mplfinance as mpf
+        import matplotlib
+        matplotlib.use('Agg')
         import matplotlib.pyplot as plt
+        import mplfinance as mpf
     except ImportError:
+        # Fallback to TradingView with indicators
+        sym = signal['symbol']
+        base = sym.replace("USDT", "").upper()
+        # EMA(50) and Anchored VWAP (session)
+        studies = "&studies[]=STD%3BEMA%3B50&studies[]=STD%3BVWAP"
+        url = f"https://www.tradingview.com/chart/?symbol=BINANCE:{base}USDT&interval=240{studies}"
+        send_telegram(f"📈 Chart with EMA & VWAP: {url}")
         return
 
     sym = signal['symbol']
@@ -1040,45 +1043,52 @@ def send_trade_chart(signal, title_suffix=""):
     if df.empty or len(df) < 20:
         return
 
-    ema50 = df['Close'].ewm(span=50, adjust=False).mean()
-    typical = (df['High'] + df['Low'] + df['Close']) / 3
-    vwap = (typical * df['Volume']).cumsum() / df['Volume'].cumsum()
+    try:
+        ema50 = df['Close'].ewm(span=50, adjust=False).mean()
+        typical = (df['High'] + df['Low'] + df['Close']) / 3
+        vwap = (typical * df['Volume']).cumsum() / df['Volume'].cumsum()
 
-    apds = [
-        mpf.make_addplot(ema50, color='orange', width=1.5, label='EMA50'),
-        mpf.make_addplot(vwap, color='blue', width=1, linestyle='--', label='VWAP')
-    ]
+        apds = [
+            mpf.make_addplot(ema50, color='orange', width=1.5, label='EMA50'),
+            mpf.make_addplot(vwap, color='blue', width=1, linestyle='--', label='VWAP')
+        ]
 
-    title = f"{sym.replace('USDT','')} 4h"
-    if title_suffix:
-        title += title_suffix
+        title = f"{sym.replace('USDT','')} 4h"
+        if title_suffix:
+            title += title_suffix
 
-    fig, axes = mpf.plot(df, type='candle', style='charles',
-                         title=title, ylabel='Price', addplot=apds,
-                         returnfig=True, figsize=(8,6))
-    ax = axes[0]
+        fig, axes = mpf.plot(df, type='candle', style='charles',
+                             title=title, ylabel='Price', addplot=apds,
+                             returnfig=True, figsize=(8,6))
+        ax = axes[0]
 
-    # Draw trade lines only if signal contains entry/stop/tps
-    entry = signal.get('limit_price')
-    stop = signal.get('stop_loss')
-    tps = signal.get('take_profits')
-    if entry is not None and stop is not None:
-        ax.axhline(y=entry, color='gold', linestyle='--', linewidth=1.5, label='Entry')
-        ax.axhline(y=stop, color='red', linestyle='--', linewidth=1.5, label='Stop')
-        if tps:
-            for i, tp in enumerate(tps):
-                ax.axhline(y=tp, color='green', linestyle='--', linewidth=1, alpha=0.6,
-                           label=f'TP{i+1}' if i==0 else None)
-        ax.legend(loc='upper left')
+        entry = signal.get('limit_price')
+        stop = signal.get('stop_loss')
+        tps = signal.get('take_profits')
+        if entry is not None and stop is not None:
+            ax.axhline(y=entry, color='gold', linestyle='--', linewidth=1.5, label='Entry')
+            ax.axhline(y=stop, color='red', linestyle='--', linewidth=1.5, label='Stop')
+            if tps:
+                for i, tp in enumerate(tps):
+                    ax.axhline(y=tp, color='green', linestyle='--', linewidth=1, alpha=0.6,
+                               label=f'TP{i+1}' if i==0 else None)
+            ax.legend(loc='upper left')
 
-    chart_path = f"{sym.replace('USDT','')}_chart.png"
-    fig.savefig(chart_path, dpi=150, bbox_inches='tight')
-    plt.close(fig)
+        chart_path = f"{sym.replace('USDT','')}_chart.png"
+        fig.savefig(chart_path, dpi=150, bbox_inches='tight')
+        plt.close(fig)
 
-    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendPhoto"
-    with open(chart_path, 'rb') as img:
-        requests.post(url, data={'chat_id': CHAT_ID}, files={'photo': img})
-    os.remove(chart_path)
+        url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendPhoto"
+        with open(chart_path, 'rb') as img:
+            requests.post(url, data={'chat_id': CHAT_ID}, files={'photo': img})
+        os.remove(chart_path)
+    except Exception as e:
+        # If image creation fails, fallback to link
+        print(f"Chart render error: {e}")
+        base = sym.replace("USDT", "").upper()
+        studies = "&studies[]=STD%3BEMA%3B50&studies[]=STD%3BVWAP"
+        url = f"https://www.tradingview.com/chart/?symbol=BINANCE:{base}USDT&interval=240{studies}"
+        send_telegram(f"📈 Chart with EMA & VWAP: {url}")
 
 def send_telegram(text):
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
@@ -1132,20 +1142,15 @@ def main():
                 f"Drop your entries below if you're taking this."
             )
             send_telegram(msg)
-            # Send chart with trade lines
             send_trade_chart(dec)
-
         else:
-            # HOLD – send text message
             msg = f"HOLD\n{dec.get('reasoning', 'No signal')}"
             send_telegram(msg)
-
-            # Also send a clean chart of the best candidate (if any)
             best = dec.get('best_candidate')
             if best:
                 send_trade_chart({
                     'symbol': best['symbol'],
-                    'limit_price': None,   # no trade lines
+                    'limit_price': None,
                     'stop_loss': None,
                     'take_profits': None
                 })
