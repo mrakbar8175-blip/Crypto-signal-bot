@@ -1018,6 +1018,57 @@ def generate_signal(balance_usdt):
         "errors": best_errors
     }
 
+# ========== CHART GENERATOR ==========
+def send_trade_chart(signal):
+    """Generate a 4h candlestick chart with entry/stop/TPs and send as Telegram photo."""
+    try:
+        import mplfinance as mpf
+        import matplotlib.pyplot as plt
+    except ImportError:
+        return  # mplfinance not installed, skip silently
+
+    sym = signal['symbol']
+    entry = signal['limit_price']
+    stop = signal['stop_loss']
+    tps = signal['take_profits']
+    action = signal['action']
+
+    df = get_yahoo_klines(sym, interval='4h', days=10)
+    if df.empty or len(df) < 20:
+        return
+
+    ema50 = df['Close'].ewm(span=50, adjust=False).mean()
+    typical = (df['High'] + df['Low'] + df['Close']) / 3
+    vwap = (typical * df['Volume']).cumsum() / df['Volume'].cumsum()
+
+    apds = [
+        mpf.make_addplot(ema50, color='orange', width=1.5, label='EMA50'),
+        mpf.make_addplot(vwap, color='blue', width=1, linestyle='--', label='VWAP')
+    ]
+
+    fig, axes = mpf.plot(df, type='candle', style='charles',
+                         title=f'{sym.replace("USDT","")} 4h – {action}',
+                         ylabel='Price', addplot=apds,
+                         returnfig=True, figsize=(8,6))
+    ax = axes[0]
+
+    ax.axhline(y=entry, color='gold', linestyle='--', linewidth=1.5, label='Entry')
+    ax.axhline(y=stop, color='red', linestyle='--', linewidth=1.5, label='Stop')
+    for i, tp in enumerate(tps):
+        ax.axhline(y=tp, color='green', linestyle='--', linewidth=1, alpha=0.6,
+                   label=f'TP{i+1}' if i==0 else None)
+    ax.legend(loc='upper left')
+
+    chart_path = f"{sym.replace('USDT','')}_chart.png"
+    fig.savefig(chart_path, dpi=150, bbox_inches='tight')
+    plt.close(fig)
+
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendPhoto"
+    with open(chart_path, 'rb') as img:
+        requests.post(url, data={'chat_id': CHAT_ID}, files={'photo': img})
+    os.remove(chart_path)
+
+# ========== TELEGRAM TEXT ==========
 def send_telegram(text):
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     try:
@@ -1025,6 +1076,7 @@ def send_telegram(text):
     except Exception as e:
         print("Telegram send failed:", e)
 
+# ========== MAIN ==========
 def main():
     try:
         initialize_trade_files()
@@ -1070,6 +1122,10 @@ def main():
                 f"Drop your entries below if you're taking this."
             )
             send_telegram(msg)
+
+            # Send chart after the text signal
+            send_trade_chart(dec)
+
         else:
             msg = f"HOLD\n{dec.get('reasoning', 'No signal')}"
             send_telegram(msg)
