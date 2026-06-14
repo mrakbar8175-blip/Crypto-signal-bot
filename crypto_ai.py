@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 """
-Crypto Trading Bot – Single-File, No Config.json
-All settings are directly in the SETTINGS dictionary below.
-Secrets must be set as environment variables: TELEGRAM_TOKEN, CHAT_ID, GROQ_API_KEY.
+Crypto Trading Bot – No Limits
+- No daily loss limit
+- No maximum open positions
+- All settings editable in the SETTINGS dict
+- Secrets from environment variables
 """
 
 import requests, json, os, sys, traceback, re, time, argparse
@@ -14,9 +16,7 @@ from datetime import datetime, timedelta
 SETTINGS = {
     # --- Essentials ---
     "initial_balance": 1000.0,          # starting USDT balance
-    "daily_loss_limit_pct": 5.0,        # stop trading after losing X% of current balance in a day
     "risk_per_trade": 0.01,             # risk 1% of balance per trade
-    "max_positions": 2,                 # maximum simultaneous open trades
 
     # --- Strategy thresholds ---
     "conviction_threshold": 1.49,       # minimum absolute conviction score to take a trade
@@ -933,16 +933,6 @@ def send_telegram(text):
     except Exception as e:
         print("Telegram send failed:", e)
 
-def get_daily_pnl():
-    try:
-        df = pd.read_csv(TRADE_RESULTS_CSV)
-        today = datetime.now().strftime("%Y-%m-%d")
-        df['close_time'] = pd.to_datetime(df['close_time'])
-        daily = df[df['close_time'].dt.strftime("%Y-%m-%d") == today]
-        return daily['pnl_usdt'].sum() if not daily.empty else 0.0
-    except:
-        return 0.0
-
 # ========== MAIN ==========
 def main():
     parser = argparse.ArgumentParser()
@@ -959,20 +949,11 @@ def main():
     portfolio = load_portfolio()
     balance = portfolio['balance_usdt']
 
-    # 5% daily loss limit based on current balance
-    daily_loss_limit_usd = -balance * (SETTINGS["daily_loss_limit_pct"] / 100)
+    # --- No daily loss limit anymore ---
+    # (the block that checked daily_pnl <= daily_loss_limit_usd has been removed)
 
-    daily_pnl = get_daily_pnl()
-    if daily_pnl <= daily_loss_limit_usd:
-        msg = (f"Daily loss limit of {abs(daily_loss_limit_usd):.2f} USD reached "
-               f"(PnL: {daily_pnl:.2f}). No new trades.")
-        if TELEGRAM_TOKEN: send_telegram(msg)
-        return
-
-    if portfolio['open_positions'] >= SETTINGS["max_positions"]:
-        msg = f"Max positions reached ({portfolio['open_positions']}/{SETTINGS['max_positions']})."
-        if TELEGRAM_TOKEN: send_telegram(msg)
-        return
+    # --- No maximum positions cap ---
+    # (the block that checked open_positions >= max_positions has been removed)
 
     signal = generate_signal(balance)
     if signal["action"] in ["LONG", "SHORT"]:
