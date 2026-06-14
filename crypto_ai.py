@@ -652,33 +652,37 @@ def get_volatility_score(symbol_usdt, current_price):
         return -1, atr_err
     return 1, None
 
-# ---------- FIXED INTERMARKET LAYER (slope‑based, no more flickering) ----------
+# ---------- FIXED INTERMARKET LAYER (no more flickering) ----------
 def btc_trend_score():
-    """Returns +2 if 4h EMA50 is rising over the last 24h, –2 if falling, else 0."""
+    """
+    Returns +2 if BTC is clearly bullish: price above EMA50 AND EMA50 rising over 24h.
+    Returns -2 if clearly bearish: price below EMA50 AND EMA50 falling.
+    Returns 0 if mixed or insufficient data.
+    """
     df = get_yahoo_klines("BTCUSDT", interval='4h', days=14)
     if df.empty or len(df) < 50:
         return 0, "BTC data unavailable"
 
     closes = df['Close']
     ema50 = closes.ewm(span=50, adjust=False).mean()
+    current = closes.iloc[-1]
+    ema_now = ema50.iloc[-1]
 
-    # Need at least 7 candles (1 day) to compare the slope
+    # Slope over 24h (6 candles)
     if len(ema50) >= 7:
-        ema_now = ema50.iloc[-1]
-        ema_prev = ema50.iloc[-7]      # 6 candles ago = 24 hours
-        if ema_now > ema_prev:
-            return 2, None
-        elif ema_now < ema_prev:
-            return -2, None
-        else:
-            return 0, None
+        ema_prev = ema50.iloc[-7]
+        slope_up = ema_now > ema_prev
     else:
-        # Fallback: simple cross
-        current = closes.iloc[-1]
-        if current > ema50.iloc[-1]:
-            return 2, None
-        else:
-            return -2, None
+        slope_up = True
+
+    price_above = current > ema_now
+
+    if price_above and slope_up:
+        return 2, None
+    elif not price_above and not slope_up:
+        return -2, None
+    else:
+        return 0, None
 
 def volume_trend_score(symbol_usdt, direction=None):
     df = get_yahoo_klines(symbol_usdt, interval='4h', days=5)
