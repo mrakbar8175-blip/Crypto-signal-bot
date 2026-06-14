@@ -43,32 +43,6 @@ def save_portfolio(p):
 
 portfolio = load_portfolio()
 
-# ========== FULL UNIVERSE (deduplicated – removed delisted coins) ==========
-COIN_LIST = list(set([
-    "BTCUSDT", "ETHUSDT", "BNBUSDT", "XRPUSDT", "ADAUSDT",
-    "SOLUSDT", "DOGEUSDT", "AVAXUSDT", "DOTUSDT", "LINKUSDT",
-    "MATICUSDT", "LTCUSDT", "NEARUSDT", "ATOMUSDT", "ETCUSDT",
-    "STXUSDT", "FILUSDT", "ARBUSDT", "OPUSDT", "INJUSDT",
-    "TIAUSDT", "SEIUSDT", "RUNEUSDT", "GRTUSDT", "AAVEUSDT",
-    "ALGOUSDT", "SANDUSDT", "MANAUSDT", "THETAUSDT", "FTMUSDT",
-    "EOSUSDT", "MKRUSDT", "LDOUSDT", "IMXUSDT", "FLOWUSDT",
-    "XTZUSDT", "NEOUSDT", "KSMUSDT", "ZECUSDT", "DASHUSDT",
-    "EGLDUSDT", "MINAUSDT", "GALAUSDT", "HNTUSDT", "CFXUSDT",
-    "ARUSDT", "FETUSDT", "AGIXUSDT", "OCEANUSDT", "1INCHUSDT",
-    "CRVUSDT", "AXSUSDT", "CHZUSDT", "ENJUSDT", "BATUSDT",
-    "SNXUSDT", "COMPUSDT", "YFIUSDT", "SUSHIUSDT", "ZRXUSDT",
-    "RENUSDT", "CELOUSDT", "LRCUSDT", "ANKRUSDT", "STORJUSDT",
-    "COTIUSDT", "KAVAUSDT", "ICXUSDT", "ONTUSDT", "ZILUSDT",
-    "WAVESUSDT", "QTUMUSDT", "OMGUSDT", "BANDUSDT", "DENTUSDT",
-    "HOTUSDT", "IOSTUSDT", "RVNUSDT", "SCUSDT", "ZENUSDT",
-    "CKBUSDT", "SKLUSDT", "CTSIUSDT", "CTKUSDT", "LINAUSDT",
-    "TRBUSDT", "BALUSDT", "PERPUSDT", "BNTUSDT", "RSRUSDT",
-    "TOMOUSDT", "DGBUSDT", "DUSKUSDT", "REEFUSDT", "ALPHAUSDT",
-    "FORTHUSDT", "POLSUSDT", "C98USDT", "RAREUSDT", "ATAUSDT",
-    "IDEXUSDT", "MLNUSDT",
-    "WIFUSDT", "BONKUSDT", "FLOKIUSDT"
-]))
-
 # ========== CSV FILE PATHS ==========
 TRADE_LOG_CSV = "trade_log.csv"
 OPEN_TRADES_CSV = "open_trades.csv"
@@ -170,7 +144,6 @@ def add_open_trade(signal):
 
 # ========== PORTFOLIO HELPERS ==========
 def get_daily_pnl():
-    """Calculate today's realized PnL from trade_results.csv."""
     try:
         df = pd.read_csv(TRADE_RESULTS_CSV)
         if df.empty:
@@ -844,13 +817,15 @@ def call_groq_reasoning(symbol, entry, atr, layers, errors=None):
         pass
     return 5, "Market structure: neutral. Catalyst: none. Risk note: automated signal."
 
-# ========== SIGNAL GENERATION ==========
+# ========== SIGNAL GENERATION (NOW DYNAMIC TOP 50) ==========
 def generate_signal(balance_usdt):
+    # Fetch top 100 from CoinGecko, we'll keep top 50 by volume
     cg_url = "https://api.coingecko.com/api/v3/coins/markets?vs_currency=usd&order=volume_desc&per_page=100&page=1"
     coins_data = fetch_coingecko(cg_url)
     if not coins_data:
         return {"action": "HOLD", "reasoning": "CoinGecko market data unavailable."}
 
+    # Get open symbols
     open_symbols = set()
     try:
         open_df = pd.read_csv(OPEN_TRADES_CSV)
@@ -859,21 +834,18 @@ def generate_signal(balance_usdt):
     except (FileNotFoundError, pd.errors.EmptyDataError):
         pass
 
-    cg_map = {}
+    # Build candidates from CoinGecko's top 50 liquid coins
+    candidates = []
     for coin in coins_data:
         sym = coin.get("symbol", "").upper() + "USDT"
-        if coin.get("current_price", 0) > 0:
-            cg_map[sym] = {"price": coin["current_price"], "volume": coin.get("total_volume", 0)}
+        price = coin.get("current_price", 0)
+        volume = coin.get("total_volume", 0)
+        if price > 0 and sym not in open_symbols:
+            candidates.append({"symbol": sym, "price": price, "volume": volume})
 
-    candidates = []
-    for sym in COIN_LIST:
-        if sym in open_symbols:
-            continue
-        if sym not in cg_map:
-            continue
-        candidates.append({"symbol": sym, "price": cg_map[sym]["price"], "volume": cg_map[sym]["volume"]})
+    # Sort by volume descending and take top 50
     candidates.sort(key=lambda x: x["volume"], reverse=True)
-    candidates = candidates[:60]
+    candidates = candidates[:50]
 
     if not candidates:
         return {"action": "HOLD", "reasoning": "No liquid coins available (all coins with open trades skipped)."}
