@@ -1,7 +1,7 @@
 name: Crypto Swing Signal (Manual) with Trade Tracker
 
 on:
-  workflow_dispatch:                # manual trigger only
+  workflow_dispatch:
 
 jobs:
   run-bot:
@@ -13,7 +13,7 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.10'
-      - run: pip install requests pandas numpy yfinance
+      - run: pip install requests pandas numpy yfinance mplfinance matplotlib
       - name: Run bot
         env:
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
