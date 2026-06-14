@@ -1,12 +1,11 @@
 #!/usr/bin/env python3
 """
-Improved Crypto Trading Bot
-- Binance data (free, no key needed)
-- Dynamic coin universe (top 30 USDT pairs by volume)
-- config.json for all parameters
-- Backtest mode
-- Robust risk sizing with lot‑size rounding
-- Polished Groq AI reasoning
+Crypto Trading Bot – Production Ready
+- Binance public API (no key needed)
+- Dynamic top‑volume USDT universe
+- 5% daily loss limit (scales with balance)
+- Configurable via config.json
+- Trailing stops, AI reasoning, backtest skeleton
 """
 
 import requests, json, os, sys, traceback, re, time, argparse
@@ -23,7 +22,7 @@ default_config = {
     "groq_api_key": "",
     "portfolio_file": "portfolio.json",
     "initial_balance": 1000.0,
-    "daily_loss_limit": -20,
+    "daily_loss_limit_pct": 5.0,          # 5% daily loss limit
     "risk_per_trade": 0.01,
     "max_positions": 2,
     "conviction_threshold": 1.49,
@@ -64,7 +63,7 @@ CHAT_ID = config["chat_id"]
 GROQ_API_KEY = config["groq_api_key"]
 PORTFOLIO_FILE = config["portfolio_file"]
 INITIAL_BALANCE = config["initial_balance"]
-DAILY_LOSS_LIMIT = config["daily_loss_limit"]
+DAILY_LOSS_LIMIT_PCT = config["daily_loss_limit_pct"]
 RISK_PER_TRADE = config["risk_per_trade"]
 MAX_POSITIONS = config["max_positions"]
 CONVICTION_THRESHOLD = config["conviction_threshold"]
@@ -85,16 +84,14 @@ def load_portfolio():
             return {
                 "balance_usdt": data.get("balance_usdt", INITIAL_BALANCE),
                 "realized_pnl": data.get("realized_pnl", 0.0),
-                "open_positions": data.get("open_positions", 0),
-                "daily_loss_limit": data.get("daily_loss_limit", DAILY_LOSS_LIMIT)
+                "open_positions": data.get("open_positions", 0)
             }
         except:
             pass
     return {
         "balance_usdt": INITIAL_BALANCE,
         "realized_pnl": 0.0,
-        "open_positions": 0,
-        "daily_loss_limit": DAILY_LOSS_LIMIT
+        "open_positions": 0
     }
 
 def save_portfolio(p):
@@ -963,7 +960,6 @@ def backtest():
     while current <= end:
         # Simulate checking open trades (simplified: just skip, as backtest is snapshot)
         # For a real backtest you'd track positions over time.
-        # Here we just generate signals on each bar.
         print(f"Backtest: {current.strftime('%Y-%m-%d')}")
         signal = generate_signal(portfolio["balance_usdt"], backtest_mode=True)
         if signal["action"] in ["LONG", "SHORT"]:
@@ -1011,9 +1007,15 @@ def main():
     check_open_trades()
 
     portfolio = load_portfolio()
+    balance = portfolio['balance_usdt']
+
+    # Calculate daily loss limit in USD (5% of current balance)
+    daily_loss_limit_usd = -balance * (DAILY_LOSS_LIMIT_PCT / 100)
+
     daily_pnl = get_daily_pnl()
-    if daily_pnl <= portfolio['daily_loss_limit']:
-        msg = f"Daily loss limit reached ({daily_pnl:.2f} USD). No new trades."
+    if daily_pnl <= daily_loss_limit_usd:
+        msg = (f"Daily loss limit of {abs(daily_loss_limit_usd):.2f} USD reached "
+               f"(PnL: {daily_pnl:.2f}). No new trades.")
         if TELEGRAM_TOKEN: send_telegram(msg)
         return
 
@@ -1022,7 +1024,6 @@ def main():
         if TELEGRAM_TOKEN: send_telegram(msg)
         return
 
-    balance = portfolio['balance_usdt']
     signal = generate_signal(balance)
     if signal["action"] in ["LONG", "SHORT"]:
         log_signal(signal)
