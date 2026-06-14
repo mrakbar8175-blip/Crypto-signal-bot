@@ -468,6 +468,7 @@ def check_open_trades():
             still_open.append(trade)
             continue
 
+        # Trade closed – record and send chart
         if direction == "LONG":
             pnl_usdt = qty * (exit_price - entry)
         else:
@@ -491,6 +492,15 @@ def check_open_trades():
         pnl_pct = (exit_price - entry) / entry * 100 if direction == "LONG" else (entry - exit_price) / entry * 100
         icon = "🔔" if "TP" in outcome else "🔴"
         alerts.append(f"{icon} {sym.replace('USDT','')} {direction} → {outcome} ({pnl_pct:+.2f}%)")
+
+        # Send chart for this closed trade
+        send_trade_chart({
+            'symbol': sym,
+            'action': direction,
+            'limit_price': entry,
+            'stop_loss': stop_orig,
+            'take_profits': tps
+        }, title_suffix=f" – {outcome}")
 
     if results:
         df_results = pd.DataFrame(results)
@@ -654,11 +664,6 @@ def get_volatility_score(symbol_usdt, current_price):
 
 # ---------- FIXED INTERMARKET LAYER (no more flickering) ----------
 def btc_trend_score():
-    """
-    Returns +2 if BTC is clearly bullish: price above EMA50 AND EMA50 rising over 24h.
-    Returns -2 if clearly bearish: price below EMA50 AND EMA50 falling.
-    Returns 0 if mixed or insufficient data.
-    """
     df = get_yahoo_klines("BTCUSDT", interval='4h', days=14)
     if df.empty or len(df) < 50:
         return 0, "BTC data unavailable"
@@ -668,7 +673,6 @@ def btc_trend_score():
     current = closes.iloc[-1]
     ema_now = ema50.iloc[-1]
 
-    # Slope over 24h (6 candles)
     if len(ema50) >= 7:
         ema_prev = ema50.iloc[-7]
         slope_up = ema_now > ema_prev
@@ -864,7 +868,7 @@ def generate_signal(balance_usdt):
     candidates = candidates[:50]
 
     if not candidates:
-        return {"action": "HOLD", "reasoning": "No liquid coins available (all coins with open trades skipped)."}
+        return {"action": "HOLD", "reasoning": "No liquid coins available (all coins with open trades skipped).", "best_candidate": None}
 
     btc_score, btc_error = btc_trend_score()
     macro_score = institutional_macro_filter()
@@ -930,7 +934,7 @@ def generate_signal(balance_usdt):
         reason = (f"No strong conviction. Best score: {display_score:+.2f}/3 for {best_sym}.\n"
                   f"Layers: {layer_str}{err_str}\n"
                   f"All coins: {coin_summary}")
-        return {"action": "HOLD", "reasoning": reason}
+        return {"action": "HOLD", "reasoning": reason, "best_candidate": best}
 
     direction = "LONG" if best_score >= 0 else "SHORT"
 
@@ -947,7 +951,7 @@ def generate_signal(balance_usdt):
                       f"Best score: {display_score:+.2f}/3 for {best_sym}.\n"
                       f"Layers: {layer_str}{err_str}\n"
                       f"All coins: {coin_summary}")
-            return {"action": "HOLD", "reasoning": reason}
+            return {"action": "HOLD", "reasoning": reason, "best_candidate": best}
 
     best_score += trend_strength_bonus(best_adx, best_score)
     momentum_bonus = momentum_alignment_score(best["symbol"], direction, best_layers)
@@ -963,7 +967,7 @@ def generate_signal(balance_usdt):
         reason = (f"No strong conviction after bonuses. Best score: {display_score:+.2f}/3 for {best_sym}.\n"
                   f"Layers: {layer_str}{err_str}\n"
                   f"All coins: {coin_summary}")
-        return {"action": "HOLD", "reasoning": reason}
+        return {"action": "HOLD", "reasoning": reason, "best_candidate": best}
 
     entry = best["bid"] if direction == "LONG" else best["ask"]
     atr = best["atr"]
@@ -972,7 +976,6 @@ def generate_signal(balance_usdt):
     stop = round(stop, 6)
     risk_per_share = abs(entry - stop)
 
-    # Fixed 1% risk per trade
     risk_percent = 0.01
     risk_amount = balance_usdt * risk_percent
     qty = round(risk_amount / risk_per_share, 6)
@@ -995,7 +998,7 @@ def generate_signal(balance_usdt):
         reason = (f"AI confidence too low ({conf}/10). Best score: {display_score:+.2f}/3 for {best['symbol']}.\n"
                   f"Layers: {layer_str}{err_str}\n"
                   f"All coins: {coin_summary}\n{reason}")
-        return {"action": "HOLD", "reasoning": reason}
+        return {"action": "HOLD", "reasoning": reason, "best_candidate": best}
 
     conviction10 = round(best_score * 10 / 3)
     if conviction10 >= 0:
@@ -1015,24 +1018,24 @@ def generate_signal(balance_usdt):
         "conviction_score": round(best_score, 2),
         "conviction10_str": conviction_str,
         "layers": best_layers,
-        "errors": best_errors
+        "errors": best_errors,
+        "best_candidate": best
     }
 
-# ========== CHART GENERATOR ==========
-def send_trade_chart(signal):
-    """Generate a 4h candlestick chart with entry/stop/TPs and send as Telegram photo."""
+# ========== CHART GENERATOR (reusable) ==========
+def send_trade_chart(signal, title_suffix=""):
+    """
+    Generate a 4h candlestick chart.
+    If 'signal' has entry/stop/tps, those lines are drawn.
+    Otherwise just show the clean chart with EMA/VWAP.
+    """
     try:
         import mplfinance as mpf
         import matplotlib.pyplot as plt
     except ImportError:
-        return  # mplfinance not installed, skip silently
+        return
 
     sym = signal['symbol']
-    entry = signal['limit_price']
-    stop = signal['stop_loss']
-    tps = signal['take_profits']
-    action = signal['action']
-
     df = get_yahoo_klines(sym, interval='4h', days=10)
     if df.empty or len(df) < 20:
         return
@@ -1046,18 +1049,27 @@ def send_trade_chart(signal):
         mpf.make_addplot(vwap, color='blue', width=1, linestyle='--', label='VWAP')
     ]
 
+    title = f"{sym.replace('USDT','')} 4h"
+    if title_suffix:
+        title += title_suffix
+
     fig, axes = mpf.plot(df, type='candle', style='charles',
-                         title=f'{sym.replace("USDT","")} 4h – {action}',
-                         ylabel='Price', addplot=apds,
+                         title=title, ylabel='Price', addplot=apds,
                          returnfig=True, figsize=(8,6))
     ax = axes[0]
 
-    ax.axhline(y=entry, color='gold', linestyle='--', linewidth=1.5, label='Entry')
-    ax.axhline(y=stop, color='red', linestyle='--', linewidth=1.5, label='Stop')
-    for i, tp in enumerate(tps):
-        ax.axhline(y=tp, color='green', linestyle='--', linewidth=1, alpha=0.6,
-                   label=f'TP{i+1}' if i==0 else None)
-    ax.legend(loc='upper left')
+    # Draw trade lines only if signal contains entry/stop/tps
+    entry = signal.get('limit_price')
+    stop = signal.get('stop_loss')
+    tps = signal.get('take_profits')
+    if entry is not None and stop is not None:
+        ax.axhline(y=entry, color='gold', linestyle='--', linewidth=1.5, label='Entry')
+        ax.axhline(y=stop, color='red', linestyle='--', linewidth=1.5, label='Stop')
+        if tps:
+            for i, tp in enumerate(tps):
+                ax.axhline(y=tp, color='green', linestyle='--', linewidth=1, alpha=0.6,
+                           label=f'TP{i+1}' if i==0 else None)
+        ax.legend(loc='upper left')
 
     chart_path = f"{sym.replace('USDT','')}_chart.png"
     fig.savefig(chart_path, dpi=150, bbox_inches='tight')
@@ -1068,7 +1080,6 @@ def send_trade_chart(signal):
         requests.post(url, data={'chat_id': CHAT_ID}, files={'photo': img})
     os.remove(chart_path)
 
-# ========== TELEGRAM TEXT ==========
 def send_telegram(text):
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     try:
@@ -1076,7 +1087,6 @@ def send_telegram(text):
     except Exception as e:
         print("Telegram send failed:", e)
 
-# ========== MAIN ==========
 def main():
     try:
         initialize_trade_files()
@@ -1122,13 +1132,23 @@ def main():
                 f"Drop your entries below if you're taking this."
             )
             send_telegram(msg)
-
-            # Send chart after the text signal
+            # Send chart with trade lines
             send_trade_chart(dec)
 
         else:
+            # HOLD – send text message
             msg = f"HOLD\n{dec.get('reasoning', 'No signal')}"
             send_telegram(msg)
+
+            # Also send a clean chart of the best candidate (if any)
+            best = dec.get('best_candidate')
+            if best:
+                send_trade_chart({
+                    'symbol': best['symbol'],
+                    'limit_price': None,   # no trade lines
+                    'stop_loss': None,
+                    'take_profits': None
+                })
     except Exception as e:
         err_msg = f"Bot crashed: {traceback.format_exc()}"
         print(err_msg)
