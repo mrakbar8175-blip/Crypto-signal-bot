@@ -19,7 +19,7 @@ portfolio = {
     "daily_loss_limit": -20
 }
 
-# ========== FULL UNIVERSE (deduplicated) ==========
+# ========== FULL UNIVERSE (deduplicated – removed delisted coins) ==========
 COIN_LIST = list(set([
     "BTCUSDT", "ETHUSDT", "BNBUSDT", "XRPUSDT", "ADAUSDT",
     "SOLUSDT", "DOGEUSDT", "AVAXUSDT", "DOTUSDT", "LINKUSDT",
@@ -42,8 +42,7 @@ COIN_LIST = list(set([
     "TOMOUSDT", "DGBUSDT", "DUSKUSDT", "REEFUSDT", "ALPHAUSDT",
     "FORTHUSDT", "POLSUSDT", "C98USDT", "RAREUSDT", "ATAUSDT",
     "IDEXUSDT", "MLNUSDT",
-    "PEPEUSDT", "WIFUSDT", "BONKUSDT", "FLOKIUSDT",
-    "APTUSDT", "SUIUSDT"
+    "WIFUSDT", "BONKUSDT", "FLOKIUSDT"
 ]))
 
 # ========== CSV FILE PATHS ==========
@@ -144,11 +143,6 @@ def add_open_trade(signal):
 # ========== INSTITUTIONAL IMPROVEMENTS ==========
 
 def institutional_macro_filter():
-    """
-    Check BTC 4h trend and a simple DXY proxy (using USDT dominance via CoinGecko).
-    Returns a score between -2 and +2.
-    """
-    # BTC trend (already available)
     df_btc = get_yahoo_klines("BTCUSDT", interval='4h', days=14)
     if df_btc.empty or len(df_btc) < 50:
         return 0
@@ -157,16 +151,13 @@ def institutional_macro_filter():
     current = closes.iloc[-1]
     btc_bullish = current > ema50.iloc[-1]
 
-    # USDT dominance (proxy for risk on/off)
     try:
-        # CoinGecko global data
         data = fetch_coingecko("https://api.coingecko.com/api/v3/global")
         if data and 'data' in data:
             dom = data['data'].get('market_cap_percentage', {}).get('usdt', 0)
-            # Lower USDT dominance usually means risk-on
             usdt_dom = dom
         else:
-            usdt_dom = 5  # neutral default
+            usdt_dom = 5
     except:
         usdt_dom = 5
 
@@ -174,25 +165,25 @@ def institutional_macro_filter():
     if btc_bullish:
         macro_score += 1
         if usdt_dom < 4.5:
-            macro_score += 1      # strong risk-on
+            macro_score += 1
     else:
         macro_score -= 1
         if usdt_dom > 6.5:
-            macro_score -= 1      # strong risk-off
+            macro_score -= 1
 
     return max(-2, min(2, macro_score))
 
 def anchored_vwap_score(df, current_price):
-    """Simple VWAP from the last 14 days of 4h candles."""
     if len(df) < 50:
         return 0
     df = df.copy()
     typical = (df['High'] + df['Low'] + df['Close']) / 3
     df['vpv'] = typical * df['Volume']
-    vwap = df['vpv'].sum() / df['Volume'].sum()
+    total_vol = df['Volume'].sum()
+    if total_vol == 0:
+        return 0
+    vwap = df['vpv'].sum() / total_vol
     deviation = (current_price - vwap) / vwap * 100
-
-    # Score: -1 if deep below VWAP, +1 if above, 0 within 1%
     if deviation > 1:
         return 1
     elif deviation < -1:
@@ -201,28 +192,26 @@ def anchored_vwap_score(df, current_price):
         return 0
 
 def refined_buying_pressure(symbol_usdt):
-    """Return (short_pressure, long_pressure) using 12 and 48 candles."""
     df = get_yahoo_klines(symbol_usdt, interval='4h', days=10)
     if df.empty or len(df) < 48:
         return 0, 0
-    # Short-term (12 candles)
     short = df.tail(12)
     buy_vol_s = short.loc[short['Close'] > short['Open'], 'Volume'].sum()
     sell_vol_s = short.loc[short['Close'] <= short['Open'], 'Volume'].sum()
-    short_press = (buy_vol_s - sell_vol_s) / (buy_vol_s + sell_vol_s) if (buy_vol_s + sell_vol_s) > 0 else 0
+    total_s = buy_vol_s + sell_vol_s
+    short_press = (buy_vol_s - sell_vol_s) / total_s if total_s > 0 else 0
 
-    # Long-term (48 candles)
     long_df = df.tail(48)
     buy_vol_l = long_df.loc[long_df['Close'] > long_df['Open'], 'Volume'].sum()
     sell_vol_l = long_df.loc[long_df['Close'] <= long_df['Open'], 'Volume'].sum()
-    long_press = (buy_vol_l - sell_vol_l) / (buy_vol_l + sell_vol_l) if (buy_vol_l + sell_vol_l) > 0 else 0
+    total_l = buy_vol_l + sell_vol_l
+    long_press = (buy_vol_l - sell_vol_l) / total_l if total_l > 0 else 0
 
     return short_press, long_press
 
-# ========== TRAILING STOP LOGIC (WITH DYNAMIC ATR AFTER TP2) ==========
+# ========== TRAILING STOP LOGIC ==========
 
 def update_stop(direction, tp_index, entry, tps):
-    """Returns the new stop after hitting TP."""
     if direction == "LONG":
         return entry if tp_index == 0 else tps[tp_index - 1]
     else:
@@ -379,7 +368,7 @@ def check_open_trades():
         outcome = None
         exit_price = None
         new_high = highest_tp_idx
-        atr_4h = None  # for dynamic trailing later
+        atr_4h = None
 
         for candle_time, candle in df_1h.iterrows():
             high = candle['High']
@@ -387,35 +376,6 @@ def check_open_trades():
             open_ = candle['Open']
             close_ = candle['Close']
 
-            # If we have passed TP2, we switch to ATR trailing
-            if highest_tp_idx >= 1:  # TP2 or higher
-                # Fetch 4h ATR for dynamic stop (cached)
-                if atr_4h is None:
-                    atr_val, _ = get_4h_atr(sym, entry)
-                    atr_4h = atr_val
-                # Trailing logic
-                if direction == "LONG":
-                    # Trail from highest high since TP2
-                    # We need a running highest high from the candle where TP2 was reached.
-                    # For simplicity, we use the highest high of all candles after TP2.
-                    # We'll just use the current candle's high to update a trailing stop.
-                    # We don't have a persistent "highest high" across runs, but we can approximate.
-                    # Since we process sequentially, we can track a 'trailing_high' in this loop.
-                    # We'll implement inside the loop:
-                    pass
-                # However, this implementation inside a simple loop is tricky.
-                # Instead, we'll keep the fixed stair-step for TP2/TP3/TP4 but after TP2
-                # we still follow the rule: if TP3 hit, SL to TP2, etc.
-                # This ensures we lock profit but not overly complex.
-                # The user wanted "dynamic trailing after TP2", so we'll implement a simple
-                # trailing stop after TP2 using the highest high since TP2 occurred.
-                # For the first pass after TP2, we set current_stop to max(TP1, highest high since TP2 - 1.5*ATR).
-                # Since we don't have the exact candle of TP2 hit, we approximate using the
-                # highest high of the current 1h candle and previous ones we've already passed.
-                # But simpler: after TP2, we override current_stop with ATR-based trailing.
-                # We'll add a flag.
-
-            # Rest of original logic
             new_tp_idx = None
             if direction == "LONG":
                 for i in range(len(tps)-1, -1, -1):
@@ -444,28 +404,24 @@ def check_open_trades():
             if new_tp_idx is not None and not sl_touched:
                 highest_tp_idx = new_tp_idx
                 new_high = highest_tp_idx
-                # Update stop using stair-step, but if we've passed TP2, also consider ATR trail.
                 current_stop = update_stop(direction, highest_tp_idx, entry, tps)
-                # After TP2, add dynamic trailing: keep the tighter of fixed stop and ATR trailing
+
                 if highest_tp_idx >= 1:
-                    # Compute ATR trailing stop: trailing_high - 1.5*ATR (long)
-                    # For simplicity we use the high of the current candle as the reference
+                    if atr_4h is None:
+                        atr_4h, _ = get_4h_atr(sym, entry)
                     if direction == "LONG":
                         trail_stop = high - 1.5 * atr_4h
-                        # Only use if it's above the fixed stop
                         current_stop = max(current_stop, trail_stop)
                     else:
                         trail_stop = low + 1.5 * atr_4h
                         current_stop = min(current_stop, trail_stop)
 
-                # Alert for new TP
                 if highest_tp_idx == 0:
                     stop_desc = "BE"
                 else:
                     stop_desc = f"TP{highest_tp_idx} (dynamic trail)"
                 tp_alerts.append(f"🚀 {sym.replace('USDT','')} {direction} TP{highest_tp_idx+1} hit — SL moved to {stop_desc}")
 
-                # Check if new stop immediately broken
                 if direction == "LONG" and low <= current_stop:
                     outcome = f"TP{highest_tp_idx+1}"
                     exit_price = current_stop
@@ -639,14 +595,10 @@ def get_4h_atr(symbol_usdt, current_price):
     return atr, None
 
 def get_buying_pressure(symbol_usdt):
-    """Now uses refined function: returns combined score from short and long alignment."""
     short_p, long_p = refined_buying_pressure(symbol_usdt)
-    # If both align in same direction, boost; if opposite, neutralize.
     if short_p * long_p > 0:
-        # Both same direction: average them and multiply by 3
         score = (short_p + long_p) / 2 * 3
     else:
-        # Mixed: reduce influence
         score = (short_p + long_p) / 2 * 3 * 0.3
     return score, None
 
@@ -721,7 +673,6 @@ def trend_strength_bonus(adx_value, base_score):
 # ========== SCORING ENGINE (WITH NEW FEATURES) ==========
 def score_coin(symbol, price, volume_24h, change1h, btc_score, btc_error, macro_score):
     errors = []
-    # Technicals
     tech = get_technicals(symbol)
     if tech.get("error"):
         errors.append(f"tech({symbol}): {tech['error']}")
@@ -730,31 +681,25 @@ def score_coin(symbol, price, volume_24h, change1h, btc_score, btc_error, macro_
     adx_value = tech.get("adx_value", 0)
     trend_dir = tech.get("trend_dir", "up")
 
-    # Buying pressure (refined)
     buying_score, buy_err = get_buying_pressure(symbol)
     if buy_err:
         errors.append(f"buying_press({symbol}): {buy_err}")
 
-    # Volatility
     vol_score, vol_err = get_volatility_score(symbol, price)
     if vol_err:
         errors.append(f"volatility({symbol}): {vol_err}")
 
-    # Intermarket
     intermarket_s = btc_score
     if btc_error:
         errors.append(f"intermarket: {btc_error}")
 
-    # Volume trend
     vol_trend_s, vt_err = volume_trend_score(symbol, direction=trend_dir)
     if vt_err:
         errors.append(f"volume_trend({symbol}): {vt_err}")
 
-    # VWAP score
     df_vwap = get_yahoo_klines(symbol, interval='4h', days=14)
     vwap_score = anchored_vwap_score(df_vwap, price)
 
-    # Base total from five layers (original weights)
     total = (
         0.20 * tech_combined +
         0.45 * buying_score +
@@ -763,11 +708,9 @@ def score_coin(symbol, price, volume_24h, change1h, btc_score, btc_error, macro_
         0.05 * vol_trend_s
     )
 
-    # Apply macro filter: macro_score in [-2,2], we multiply total by (1 + 0.15*macro_score)
     macro_multiplier = 1 + 0.15 * macro_score
     total *= macro_multiplier
 
-    # Apply VWAP adjustment (small)
     total += vwap_score * 0.1
 
     layers = {
@@ -779,7 +722,7 @@ def score_coin(symbol, price, volume_24h, change1h, btc_score, btc_error, macro_
     }
     return max(-3, min(3, total)), layers, ema50_distance, adx_value, trend_dir, errors
 
-# ========== INSTITUTIONAL AI REASONING ==========
+# ========== INSTITUTIONAL AI REASONING (still used internally) ==========
 def call_groq_reasoning(symbol, entry, atr, layers, errors=None):
     layer_str = "; ".join([f"{k}={v:.2f}" for k,v in layers.items()])
     err_str = ""
@@ -974,13 +917,12 @@ def generate_signal():
     stop = round(stop, 6)
     risk = abs(entry - stop)
 
-    # Conviction‑based sizing
     conviction10 = round(best_score * 10 / 3)
     if conviction10 >= 8:
-        risk_mult = 1.5   # 3.75% risk
+        risk_mult = 1.5
     else:
-        risk_mult = 1.0   # 2.5% risk
-    qty = round(10 / risk * risk_mult, 4)   # base risk 10 USD scaled
+        risk_mult = 1.0
+    qty = round(10 / risk * risk_mult, 4)
 
     mults = [0.4, 0.8, 1.2, 1.6, 2.0]
     tps = []
@@ -1016,7 +958,7 @@ def generate_signal():
         "stop_loss": stop,
         "take_profits": tps,
         "confidence_score": conf,
-        "reasoning": reason,   # structured reasoning
+        "reasoning": reason,
         "conviction_score": conviction_display,
         "conviction10_str": conviction_str,
         "layers": best_layers,
@@ -1041,25 +983,27 @@ def main():
             log_signal(dec)
             add_open_trade(dec)
             raw_symbol = dec.get('symbol', '')
-            symbol_display = raw_symbol.replace("USDT", "/USDT")
-            direction_str = "LONG" if action == "LONG" else "SHORT"
+            symbol_display = raw_symbol.replace("USDT", "")
+            direction_icon = "🟢" if action == "LONG" else "🔴"
             entry_price = dec.get('limit_price', 0)
             stop_price = dec.get('stop_loss', 0)
             tps = dec.get('take_profits', [])
             conviction_str = dec.get('conviction10_str', '0/10')
-            reasoning_text = dec.get('reasoning', 'No reasoning')
-
-            sl_pct = abs(entry_price - stop_price) / entry_price * 100
 
             tp_str = " / ".join([f"{tp:,.6f}" for tp in tps])
 
+            # New signal format exactly as requested
+            if action == "LONG":
+                header = f"📈${symbol_display} (LONG{direction_icon})"
+            else:
+                header = f"📉${symbol_display} (SHORT{direction_icon})"
+
             msg = (
-                f"{symbol_display} ({direction_str})\n"
-                f"Entry: {entry_price:,.6f}\n"
-                f"Stop: {stop_price:,.6f} (-{sl_pct:.2f}%)\n"
-                f"Targets: {tp_str}\n"
-                f"Conviction: {conviction_str}\n"
-                f"{reasoning_text}\n"
+                f"{header}\n"
+                f"⛔Entry: {entry_price:,.6f}\n"
+                f"🛑Stop: {stop_price:,.6f}\n"
+                f"💰Targets: {tp_str}\n"
+                f"✔️Confidence: {conviction_str}\n"
                 f"Drop your entries below if you're taking this."
             )
             send_telegram(msg)
