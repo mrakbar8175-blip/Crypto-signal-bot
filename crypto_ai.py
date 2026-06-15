@@ -100,7 +100,8 @@ def initialize_trade_files():
     init_csv(TRADE_LOG_CSV, ["timestamp", "symbol", "action", "entry", "stop",
                              "TP1", "TP2", "TP3", "TP4", "TP5", "conviction", "ai_confidence"])
     init_csv(OPEN_TRADES_CSV, ["timestamp", "symbol", "action", "entry", "stop",
-                               "TP1", "TP2", "TP3", "TP4", "TP5", "status", "quantity", "highest_tp"])
+                               "TP1", "TP2", "TP3", "TP4", "TP5", "status",
+                               "quantity", "original_qty", "highest_tp"])
     init_csv(TRADE_RESULTS_CSV, ["timestamp", "symbol", "action", "entry", "stop",
                                  "TP1", "TP2", "TP3", "TP4", "TP5", "status", "hit_level",
                                  "close_time", "exit_price", "quantity", "pnl_usdt"])
@@ -137,6 +138,7 @@ def add_open_trade(signal):
         "TP5": signal["take_profits"][4],
         "status": "open",
         "quantity": signal["quantity"],
+        "original_qty": signal["quantity"],
         "highest_tp": -1
     }
     df = pd.DataFrame([row])
@@ -160,7 +162,6 @@ def get_daily_pnl():
 def update_portfolio(trade_result):
     portfolio['balance_usdt'] += trade_result['pnl_usdt']
     portfolio['realized_pnl'] += trade_result['pnl_usdt']
-    portfolio['open_positions'] -= 1
     save_portfolio(portfolio)
 
 # ========== INSTITUTIONAL IMPROVEMENTS ==========
@@ -232,112 +233,7 @@ def refined_buying_pressure(symbol_usdt):
 
     return short_press, long_press
 
-# ========== TRAILING STOP LOGIC ==========
-
-def update_stop(direction, tp_index, entry, tps):
-    if direction == "LONG":
-        return entry if tp_index == 0 else tps[tp_index - 1]
-    else:
-        return entry if tp_index == 0 else tps[tp_index - 1]
-
-def resolve_ambiguous(sym, direction, entry, current_stop, tps, start_highest,
-                      start_time, end_time, depth=0):
-    if depth == 0:
-        interval = '15m'
-    elif depth == 1:
-        interval = '5m'
-    else:
-        return resolve_heuristic(sym, direction, entry, current_stop, tps, start_highest,
-                                 start_time, end_time)
-
-    df = get_yahoo_klines(sym, interval=interval, start=start_time, end=end_time)
-    if df.empty:
-        return resolve_heuristic(sym, direction, entry, current_stop, tps, start_highest,
-                                 start_time, end_time)
-
-    highest = start_highest
-    temp_stop = current_stop
-
-    for _, candle in df.iterrows():
-        high, low, open_, close_ = candle['High'], candle['Low'], candle['Open'], candle['Close']
-        is_bullish = close_ > open_
-
-        new_tp = None
-        if direction == "LONG":
-            for i in range(len(tps)-1, -1, -1):
-                if high >= tps[i] and i > highest:
-                    new_tp = i
-                    break
-        else:
-            for i in range(len(tps)-1, -1, -1):
-                if low <= tps[i] and i > highest:
-                    new_tp = i
-                    break
-
-        sl_hit = (low <= temp_stop) if direction == "LONG" else (high >= temp_stop)
-
-        if new_tp is not None and sl_hit:
-            if depth < 2:
-                sub_out, sub_exit = resolve_ambiguous(
-                    sym, direction, entry, temp_stop, tps, highest,
-                    candle.name, candle.name + pd.Timedelta(hours=1) if interval=='15m' else candle.name + pd.Timedelta(minutes=15),
-                    depth+1
-                )
-                return sub_out, sub_exit
-            else:
-                return resolve_heuristic_decision(direction, is_bullish, new_tp, temp_stop, tps, highest)
-
-        if new_tp is not None and not sl_hit:
-            highest = new_tp
-            temp_stop = update_stop(direction, highest, entry, tps)
-            if direction == "LONG" and low <= temp_stop:
-                return f"TP{highest+1}", temp_stop
-            if direction == "SHORT" and high >= temp_stop:
-                return f"TP{highest+1}", temp_stop
-            continue
-
-        if sl_hit and new_tp is None:
-            return (f"TP{highest+1}" if highest >= 0 else "STOP LOSS"), temp_stop
-
-    return None, None
-
-def resolve_heuristic(sym, direction, entry, current_stop, tps, start_highest, start_time, end_time):
-    df = get_yahoo_klines(sym, interval='1h', start=start_time, end=end_time)
-    if df.empty:
-        return "STOP LOSS", current_stop
-    candle = df.iloc[0]
-    is_bullish = candle['Close'] > candle['Open']
-    high, low = candle['High'], candle['Low']
-
-    new_tp = None
-    if direction == "LONG":
-        for i in range(len(tps)-1, -1, -1):
-            if high >= tps[i] and i > start_highest:
-                new_tp = i
-                break
-    else:
-        for i in range(len(tps)-1, -1, -1):
-            if low <= tps[i] and i > start_highest:
-                new_tp = i
-                break
-
-    if new_tp is None:
-        return "STOP LOSS", current_stop
-    return resolve_heuristic_decision(direction, is_bullish, new_tp, current_stop, tps, start_highest)
-
-def resolve_heuristic_decision(direction, is_bullish, new_tp, current_stop, tps, start_highest):
-    if direction == "LONG":
-        if is_bullish:
-            new_stop = update_stop(direction, new_tp, None, tps)
-            return f"TP{new_tp+1}", new_stop
-        else:
-            return "STOP LOSS", current_stop
-    else:
-        if not is_bullish:
-            new_stop = update_stop(direction, new_tp, None, tps)
-            return f"TP{new_tp+1}", new_stop
-        else:
-            return "STOP LOSS", current_stop
+# ========== TRAILING STOP LOGIC (simplified for partial exits) ==========
 
 def check_open_trades():
     try:
@@ -348,24 +244,24 @@ def check_open_trades():
     if open_df.empty:
         return
 
-    if "highest_tp" not in open_df.columns:
-        open_df["highest_tp"] = -1
-    if "quantity" not in open_df.columns:
-        open_df["quantity"] = 0.0
+    for col in ["highest_tp", "quantity", "original_qty"]:
+        if col not in open_df.columns:
+            open_df[col] = 0.0 if col != "highest_tp" else -1
 
     results = []
     still_open = []
     alerts = []
-    tp_alerts = []
     now = datetime.now()
     mults = [0.4, 0.8, 1.2, 1.6, 2.0]
+    fractions = [0.20, 0.20, 0.30]  # TP1, TP2, TP3
 
     for idx, trade in open_df.iterrows():
         sym = trade["symbol"]
         direction = trade["action"]
         entry = float(trade["entry"])
         stop_orig = float(trade["stop"])
-        qty = float(trade.get("quantity", 0))
+        original_qty = float(trade.get("original_qty", trade.get("quantity", 0)))
+        remaining_qty = float(trade.get("quantity", original_qty))
         risk = abs(entry - stop_orig)
 
         tps = []
@@ -386,21 +282,12 @@ def check_open_trades():
             still_open.append(trade)
             continue
 
-        current_stop = stop_orig
         highest_tp_idx = int(trade.get("highest_tp", -1))
-        if highest_tp_idx >= 0:
-            current_stop = update_stop(direction, highest_tp_idx, entry, tps)
-
-        outcome = None
-        exit_price = None
-        new_high = highest_tp_idx
-        atr_4h = None
+        current_stop = entry if highest_tp_idx >= 0 else stop_orig
 
         for candle_time, candle in df_1h.iterrows():
             high = candle['High']
             low = candle['Low']
-            open_ = candle['Open']
-            close_ = candle['Close']
 
             new_tp_idx = None
             if direction == "LONG":
@@ -414,111 +301,94 @@ def check_open_trades():
                         new_tp_idx = i
                         break
 
-            sl_touched = (low <= current_stop) if direction == "LONG" else (high >= current_stop)
+            if new_tp_idx is not None:
+                for i in range(highest_tp_idx+1, new_tp_idx+1):
+                    if remaining_qty <= 0:
+                        break
 
-            if new_tp_idx is not None and sl_touched:
-                sub_outcome, sub_exit = resolve_ambiguous(
-                    sym, direction, entry, current_stop, tps, highest_tp_idx,
-                    candle_time, candle_time + timedelta(hours=1)
-                )
-                if sub_outcome:
-                    outcome = sub_outcome
-                    exit_price = sub_exit
-                    break
-                continue
+                    if i <= 2:  # TP1, TP2, TP3
+                        fraction = fractions[i]
+                        exit_qty = original_qty * fraction
+                        if exit_qty > remaining_qty:
+                            exit_qty = remaining_qty
+                        if exit_qty > 0:
+                            exit_price = tps[i]
+                            pnl = (exit_price - entry) * exit_qty if direction == "LONG" else (entry - exit_price) * exit_qty
+                            partial = trade.to_dict()
+                            partial["hit_level"] = f"TP{i+1} (partial)"
+                            partial["close_time"] = now.strftime("%Y-%m-%d %H:%M:%S")
+                            partial["exit_price"] = exit_price
+                            partial["quantity"] = exit_qty
+                            partial["pnl_usdt"] = round(pnl, 4)
+                            results.append(partial)
+                            update_portfolio({'pnl_usdt': pnl})
+                            remaining_qty -= exit_qty
+                            highest_tp_idx = i
+                            if i == 0:
+                                current_stop = entry
+                        alerts.append(f"🚀 {sym.replace('USDT','')} {direction} TP{i+1} hit — {fraction*100:.0f}% closed, SL now {'BE' if i==0 else 'at entry'}")
 
-            if new_tp_idx is not None and not sl_touched:
-                highest_tp_idx = new_tp_idx
-                new_high = highest_tp_idx
-                current_stop = update_stop(direction, highest_tp_idx, entry, tps)
-
-                if highest_tp_idx >= 1:
-                    if atr_4h is None:
-                        atr_4h, _ = get_4h_atr(sym, entry)
-                    if direction == "LONG":
-                        trail_stop = high - 1.5 * atr_4h
-                        current_stop = max(current_stop, trail_stop)
+                    elif i == 4:  # TP5
+                        if remaining_qty > 0:
+                            exit_price = tps[4]
+                            pnl = (exit_price - entry) * remaining_qty if direction == "LONG" else (entry - exit_price) * remaining_qty
+                            final = trade.to_dict()
+                            final["hit_level"] = "TP5 (final)"
+                            final["close_time"] = now.strftime("%Y-%m-%d %H:%M:%S")
+                            final["exit_price"] = exit_price
+                            final["quantity"] = remaining_qty
+                            final["pnl_usdt"] = round(pnl, 4)
+                            results.append(final)
+                            update_portfolio({'pnl_usdt': pnl})
+                            remaining_qty = 0
+                            highest_tp_idx = 4
+                            alerts.append(f"🔔 {sym.replace('USDT','')} {direction} TP5 hit — remaining closed")
+                        break
                     else:
-                        trail_stop = low + 1.5 * atr_4h
-                        current_stop = min(current_stop, trail_stop)
+                        highest_tp_idx = 3
 
-                if highest_tp_idx == 0:
-                    stop_desc = "BE"
-                else:
-                    stop_desc = f"TP{highest_tp_idx} (dynamic trail)"
-                tp_alerts.append(f"🚀 {sym.replace('USDT','')} {direction} TP{highest_tp_idx+1} hit — SL moved to {stop_desc}")
-
-                if direction == "LONG" and low <= current_stop:
-                    outcome = f"TP{highest_tp_idx+1}"
-                    exit_price = current_stop
+                if remaining_qty <= 0:
                     break
-                if direction == "SHORT" and high >= current_stop:
-                    outcome = f"TP{highest_tp_idx+1}"
+
+            if remaining_qty > 0:
+                sl_hit = (low <= current_stop) if direction == "LONG" else (high >= current_stop)
+                if sl_hit:
                     exit_price = current_stop
+                    pnl = (exit_price - entry) * remaining_qty if direction == "LONG" else (entry - exit_price) * remaining_qty
+                    final = trade.to_dict()
+                    desc = "STOP LOSS" if highest_tp_idx == -1 else f"STOP LOSS (after TP{highest_tp_idx+1})"
+                    final["hit_level"] = desc
+                    final["close_time"] = now.strftime("%Y-%m-%d %H:%M:%S")
+                    final["exit_price"] = exit_price
+                    final["quantity"] = remaining_qty
+                    final["pnl_usdt"] = round(pnl, 4)
+                    results.append(final)
+                    update_portfolio({'pnl_usdt': pnl})
+                    remaining_qty = 0
+                    alerts.append(f"🔴 {sym.replace('USDT','')} {direction} → {desc} (remaining closed)")
                     break
-                continue
 
-            if sl_touched and new_tp_idx is None:
-                outcome = f"TP{highest_tp_idx+1}" if highest_tp_idx >= 0 else "STOP LOSS"
-                exit_price = current_stop
-                break
-
-        if outcome is None:
-            trade["highest_tp"] = new_high
+        if remaining_qty > 0:
+            trade["highest_tp"] = highest_tp_idx
+            trade["quantity"] = remaining_qty
             still_open.append(trade)
-            continue
-
-        if direction == "LONG":
-            pnl_usdt = qty * (exit_price - entry)
-        else:
-            pnl_usdt = qty * (entry - exit_price)
-
-        result = trade.to_dict()
-        result["hit_level"] = outcome
-        result["close_time"] = now.strftime("%Y-%m-%d %H:%M:%S")
-        result["exit_price"] = exit_price
-        result["pnl_usdt"] = round(pnl_usdt, 4)
-        results.append(result)
-
-        update_portfolio({
-            'pnl_usdt': pnl_usdt,
-            'quantity': qty,
-            'direction': direction,
-            'entry': entry,
-            'exit_price': exit_price
-        })
-
-        pnl_pct = (exit_price - entry) / entry * 100 if direction == "LONG" else (entry - exit_price) / entry * 100
-        icon = "🔔" if "TP" in outcome else "🔴"
-        alerts.append(f"{icon} {sym.replace('USDT','')} {direction} → {outcome} ({pnl_pct:+.2f}%)")
-
-        send_trade_chart({
-            'symbol': sym,
-            'action': direction,
-            'limit_price': entry,
-            'stop_loss': stop_orig,
-            'take_profits': tps
-        }, title_suffix=f" – {outcome}")
 
     if results:
         df_results = pd.DataFrame(results)
         append_csv(TRADE_RESULTS_CSV, df_results)
 
     if still_open:
-        df_still_open = pd.DataFrame(still_open)
-        if "highest_tp" not in df_still_open.columns:
-            df_still_open["highest_tp"] = -1
-        if "quantity" not in df_still_open.columns:
-            df_still_open["quantity"] = 0.0
-        portfolio['open_positions'] = len(df_still_open)
-        save_csv(OPEN_TRADES_CSV, df_still_open)
+        df_still = pd.DataFrame(still_open)
+        for col in ["original_qty", "quantity", "highest_tp"]:
+            if col not in df_still.columns:
+                df_still[col] = 0 if col != "highest_tp" else -1
+        portfolio['open_positions'] = len(df_still)
+        save_csv(OPEN_TRADES_CSV, df_still)
     else:
         portfolio['open_positions'] = 0
         save_csv(OPEN_TRADES_CSV, pd.DataFrame())
     save_portfolio(portfolio)
 
-    if tp_alerts:
-        send_telegram("\n".join(tp_alerts))
     if alerts:
         msg = "Trade updates:\n" + "\n".join(alerts)
         send_telegram(msg)
@@ -834,21 +704,19 @@ def call_groq_reasoning(symbol, entry, atr, layers, errors=None):
         pass
     return 5, "Market structure: neutral. Catalyst: none. Risk note: automated signal."
 
-# ========== SIGNAL GENERATION (with max 5 trades limit) ==========
+# ========== SIGNAL GENERATION (max 3 risky trades) ==========
 def generate_signal(balance_usdt):
     cg_url = "https://api.coingecko.com/api/v3/coins/markets?vs_currency=usd&order=volume_desc&per_page=100&page=1"
     coins_data = fetch_coingecko(cg_url)
     if not coins_data:
         return {"action": "HOLD", "reasoning": "CoinGecko market data unavailable.", "best_candidate": None}
 
-    # ----- Count open trades that are still below breakeven (highest_tp == -1) -----
     open_symbols = set()
     risky_open_count = 0
     try:
         open_df = pd.read_csv(OPEN_TRADES_CSV)
         if not open_df.empty:
             open_symbols = set(open_df["symbol"].values)
-            # A trade is "risky" if highest_tp == -1 (TP1 not yet reached)
             if "highest_tp" in open_df.columns:
                 risky_open_count = (open_df["highest_tp"] == -1).sum()
             else:
@@ -856,9 +724,9 @@ def generate_signal(balance_usdt):
     except (FileNotFoundError, pd.errors.EmptyDataError):
         pass
 
-    # Max 5 risky trades allowed
-    if risky_open_count >= 5:
-        return {"action": "HOLD", "reasoning": f"Max 5 active risky trades reached ({risky_open_count}). Waiting for TP1 on some to free up slots.", "best_candidate": None}
+    # 👇 Changed from 5 to 3
+    if risky_open_count >= 3:
+        return {"action": "HOLD", "reasoning": f"Max 3 active risky trades reached ({risky_open_count}). Waiting for TP1 on some to free up slots.", "best_candidate": None}
 
     candidates = []
     for coin in coins_data:
@@ -1039,10 +907,9 @@ def send_trade_chart(signal, title_suffix=""):
         if df.empty or len(df) < 20:
             return
 
-        # Dark theme
         mpf_style = mpf.make_mpf_style(
             base_mpf_style='nightclouds',
-            facecolor='#000000',        # pitch black
+            facecolor='#000000',
             gridcolor='#2a2e39',
             rc={'axes.labelcolor': 'white',
                 'xtick.color': 'white',
@@ -1055,8 +922,8 @@ def send_trade_chart(signal, title_suffix=""):
         vwap = (typical * df['Volume']).cumsum() / df['Volume'].cumsum()
 
         apds = [
-            mpf.make_addplot(ema50, color='#f39c12', width=1.5, label='EMA50'),   # bright orange
-            mpf.make_addplot(vwap, color='#3498db', width=1, linestyle='--', label='VWAP')  # bright blue
+            mpf.make_addplot(ema50, color='#f39c12', width=1.5, label='EMA50'),
+            mpf.make_addplot(vwap, color='#3498db', width=1, linestyle='--', label='VWAP')
         ]
 
         title = f"{sym.replace('USDT','')} 4h"
@@ -1072,12 +939,12 @@ def send_trade_chart(signal, title_suffix=""):
         stop = signal.get('stop_loss')
         tps = signal.get('take_profits')
         if entry is not None and stop is not None:
-            ax.axhline(y=entry, color='#f1c40f', linestyle='--', linewidth=1.5, label='Entry')  # bright yellow
-            ax.axhline(y=stop, color='#e74c3c', linestyle='--', linewidth=1.5, label='Stop')     # bright red
+            ax.axhline(y=entry, color='#f1c40f', linestyle='--', linewidth=1.5, label='Entry')
+            ax.axhline(y=stop, color='#e74c3c', linestyle='--', linewidth=1.5, label='Stop')
             if tps:
                 for i, tp in enumerate(tps):
                     ax.axhline(y=tp, color='#2ecc71', linestyle='--', linewidth=1, alpha=0.8,
-                               label=f'TP{i+1}' if i==0 else None)  # bright green
+                               label=f'TP{i+1}' if i==0 else None)
             ax.legend(loc='upper left', facecolor='#000000', edgecolor='white', labelcolor='white')
 
         chart_path = f"{sym.replace('USDT','')}_chart.png"
@@ -1089,7 +956,6 @@ def send_trade_chart(signal, title_suffix=""):
             requests.post(url, data={'chat_id': CHAT_ID}, files={'photo': img})
         os.remove(chart_path)
     except ImportError:
-        # Fallback to TradingView link with EMA & VWAP
         sym = signal['symbol']
         base = sym.replace("USDT", "").upper()
         studies = "&studies[]=STD%3BEMA%3B50&studies[]=STD%3BVWAP"
@@ -1139,6 +1005,8 @@ def main():
             tps = dec.get('take_profits', [])
             conviction_str = dec.get('conviction10_str', '0/10')
 
+            sl_pct = abs(entry_price - stop_price) / entry_price * 100
+
             tp_str = " / ".join([f"{tp:,.6f}" for tp in tps])
 
             if action == "LONG":
@@ -1149,7 +1017,7 @@ def main():
             msg = (
                 f"{header}\n"
                 f"⛔Entry: {entry_price:,.6f}\n"
-                f"🛑Stop: {stop_price:,.6f}\n"
+                f"🛑Stop: {stop_price:,.6f} (-{sl_pct:.2f}%)\n"
                 f"💰Targets: {tp_str}\n"
                 f"✔️Confidence: {conviction_str}\n"
                 f"Drop your entries below if you're taking this."
