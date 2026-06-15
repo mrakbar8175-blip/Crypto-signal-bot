@@ -1,4 +1,4 @@
-import requests, json, os, traceback, re, time
+import requests, json, os, traceback, re, time, random
 import pandas as pd
 import numpy as np
 import yfinance as yf
@@ -244,7 +244,7 @@ def check_open_trades():
     if open_df.empty:
         return
 
-    # 👇 Keep only the latest entry for each symbol (fix duplicate glitches)
+    # Keep only latest entry per symbol
     if "timestamp" in open_df.columns:
         open_df = open_df.sort_values("timestamp").drop_duplicates(subset="symbol", keep="last")
     else:
@@ -655,8 +655,12 @@ def score_coin(symbol, price, volume_24h, change1h, btc_score, btc_error, macro_
     }
     return max(-3, min(3, total)), layers, ema50_distance, adx_value, trend_dir, errors
 
-# ========== AI REASONING ==========
+# ========== AI REASONING (COMPLIANT HOOK & QUESTION) ==========
 def call_groq_reasoning(symbol, entry, atr, layers, errors=None):
+    """
+    Generates a compliant 2-sentence hook that explicitly mentions EMA50 and VWAP,
+    and a community engagement question. Also returns a confidence score (kept internal).
+    """
     layer_str = "; ".join([f"{k}={v:.2f}" for k,v in layers.items()])
     err_str = ""
     if errors:
@@ -668,22 +672,21 @@ def call_groq_reasoning(symbol, entry, atr, layers, errors=None):
     alignment_strength = max(bearish_count, bullish_count)
 
     system_msg = (
-        "You are a senior institutional crypto trader. "
-        "Given a trade signal, you write a concise market note in three short parts:\n"
-        "- Market structure: what is happening on the chart (trend, support/resistance, breakout)\n"
-        "- Catalyst: what is driving the move (volume, BTC correlation, sentiment)\n"
-        "- Risk note: key invalidation level or warning\n"
-        "Write each part as one plain sentence. No indicators, no numbers, no mention of 'layers' or 'alignment'. "
-        "Use professional, direct language. Keep the entire note under 150 characters."
+        "You are a professional crypto market analyst writing a short post for Binance Square. "
+        "The chart you refer to shows the 4h candlesticks with the 50-period EMA (orange) and Anchored VWAP (blue dotted). "
+        "Write exactly 2 sentences explaining the technical reasoning behind the trade. Explicitly mention the EMA50 and VWAP, "
+        "and refer to support/resistance levels or breakouts visible on the chart. Use natural, non‑hype language. "
+        "After that, write one short, open‑ended question to encourage community engagement (avoid 'Drop your entries' or any engagement bait). "
+        "Also output a confidence score between 4 and 7 (5 if 2 metrics align, 6 if 3, 7 if 4). "
+        "Output format:\n"
+        "CONFIDENCE: 7 | HOOK: [your 2 sentences] | QUESTION: [your question]"
     )
 
     user_prompt = (
         f"Trade signal for {symbol} at {entry}. 4h ATR: {atr:.4f}. "
         f"Internal metrics: {layer_str}{err_str}. "
         f"Alignment: {alignment_strength}/4 directional metrics are strongly aligned (bullish/bearish). "
-        "Produce a confidence score between 4 and 7 (5 if 2 metrics align, 6 if 3, 7 if 4). "
-        "Then provide the reasoning in the format:\n"
-        "CONFIDENCE: 7 | MARKET STRUCTURE: [text] | CATALYST: [text] | RISK NOTE: [text]"
+        "Generate the compliant hook and question as instructed."
     )
 
     url = "https://api.groq.com/openai/v1/chat/completions"
@@ -694,21 +697,25 @@ def call_groq_reasoning(symbol, entry, atr, layers, errors=None):
             {"role": "system", "content": system_msg},
             {"role": "user", "content": user_prompt}
         ],
-        "temperature": 0.6,
-        "max_tokens": 180
+        "temperature": 0.7,
+        "max_tokens": 200
     }
     try:
         resp = requests.post(url, headers=headers, json=payload, timeout=30)
         if resp.status_code == 200:
             text = resp.json()["choices"][0]["message"]["content"]
             conf_match = re.search(r'CONFIDENCE:\s*(\d+)', text)
-            reason_text = text.split("|", 1)[1].strip() if "|" in text else text
+            hook_match = re.search(r'HOOK:\s*(.*?)(?:\||$)', text)
+            q_match = re.search(r'QUESTION:\s*(.*?)(?:\||$)', text)
             conf = int(conf_match.group(1)) if conf_match else 5
             conf = max(4, min(7, conf))
-            return conf, reason_text
+            hook = hook_match.group(1).strip() if hook_match else "Price is holding above the 50‑EMA with VWAP support, signalling bullish continuation."
+            question = q_match.group(1).strip() if q_match else "How are you positioning for this move?"
+            return conf, hook, question
     except:
         pass
-    return 5, "Market structure: neutral. Catalyst: none. Risk note: automated signal."
+    # Fallback
+    return 5, "The 4‑hour chart shows price above the 50‑EMA and VWAP, suggesting a potential continuation.", "Do you see this as a strong entry?"
 
 # ========== SIGNAL GENERATION (max 3 risky trades) ==========
 def generate_signal(balance_usdt):
@@ -722,7 +729,6 @@ def generate_signal(balance_usdt):
     try:
         open_df = pd.read_csv(OPEN_TRADES_CSV)
         if not open_df.empty:
-            # Deduplicate for counting as well (same logic)
             if "timestamp" in open_df.columns:
                 open_df = open_df.sort_values("timestamp").drop_duplicates(subset="symbol", keep="last")
             else:
@@ -870,7 +876,7 @@ def generate_signal(balance_usdt):
         else:
             tps.append(round(entry - mult * risk_per_share, 6))
 
-    conf, reason = call_groq_reasoning(best["symbol"], entry, atr, best_layers, best_errors)
+    conf, hook, question = call_groq_reasoning(best["symbol"], entry, atr, best_layers, best_errors)
     if conf < 5:
         layer_str = "; ".join([f"{k}={v:.2f}" for k,v in best_layers.items()])
         err_str = ""
@@ -879,7 +885,7 @@ def generate_signal(balance_usdt):
         display_score = round(best_score, 2)
         reason = (f"AI confidence too low ({conf}/10). Best score: {display_score:+.2f}/3 for {best['symbol']}.\n"
                   f"Layers: {layer_str}{err_str}\n"
-                  f"All coins: {coin_summary}\n{reason}")
+                  f"All coins: {coin_summary}\n{hook}")
         return {"action": "HOLD", "reasoning": reason, "best_candidate": best}
 
     conviction10 = round(best_score * 10 / 3)
@@ -896,7 +902,8 @@ def generate_signal(balance_usdt):
         "stop_loss": stop,
         "take_profits": tps,
         "confidence_score": conf,
-        "reasoning": reason,
+        "hook": hook,
+        "question": question,
         "conviction_score": round(best_score, 2),
         "conviction10_str": conviction_str,
         "layers": best_layers,
@@ -1013,24 +1020,29 @@ def main():
             entry_price = dec.get('limit_price', 0)
             stop_price = dec.get('stop_loss', 0)
             tps = dec.get('take_profits', [])
-            conviction_str = dec.get('conviction10_str', '0/10')
+            hook = dec.get('hook', 'Price is holding above the 50‑EMA with VWAP support.')
+            question = dec.get('question', 'How are you positioning for this move?')
+            # generate a simple title based on action
+            if action == "LONG":
+                title = f"📈 ${symbol_display} 4H Breakout Setup"
+            else:
+                title = f"📉 ${symbol_display} 4H Breakdown Setup"
 
             sl_pct = abs(entry_price - stop_price) / entry_price * 100
 
             tp_str = " / ".join([f"{tp:,.6f}" for tp in tps])
 
-            if action == "LONG":
-                header = f"📈${symbol_display} (LONG{direction_icon})"
-            else:
-                header = f"📉${symbol_display} (SHORT{direction_icon})"
-
+            # Binance Square compliant post
             msg = (
-                f"{header}\n"
-                f"⛔Entry: {entry_price:,.6f}\n"
-                f"🛑Stop: {stop_price:,.6f} (-{sl_pct:.2f}%)\n"
-                f"💰Targets: {tp_str}\n"
-                f"✔️Confidence: {conviction_str}\n"
-                f"Drop your entries below if you're taking this."
+                f"{title}\n"
+                f"{hook}\n\n"
+                f"Entry: {entry_price:,.6f}\n"
+                f"Stop Loss: {stop_price:,.6f} (-{sl_pct:.2f}%)\n"
+                f"Take Profit Targets: {tp_str}\n\n"
+                f"{question}\n\n"
+                f"#{symbol_display} #CryptoAnalysis #TechnicalAnalysis #DYOR\n"
+                f"*Disclaimer: This visual analysis is based on technical indicators for educational purposes only "
+                f"and does not constitute financial advice. Please manage your risk and do your own research.*"
             )
             send_telegram(msg)
             send_trade_chart(dec)
