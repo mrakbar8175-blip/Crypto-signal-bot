@@ -492,7 +492,6 @@ def check_open_trades():
         icon = "🔔" if "TP" in outcome else "🔴"
         alerts.append(f"{icon} {sym.replace('USDT','')} {direction} → {outcome} ({pnl_pct:+.2f}%)")
 
-        # Send chart (image or TradingView link with EMA+VWAP)
         send_trade_chart({
             'symbol': sym,
             'action': direction,
@@ -835,20 +834,31 @@ def call_groq_reasoning(symbol, entry, atr, layers, errors=None):
         pass
     return 5, "Market structure: neutral. Catalyst: none. Risk note: automated signal."
 
-# ========== SIGNAL GENERATION ==========
+# ========== SIGNAL GENERATION (with max 5 trades limit) ==========
 def generate_signal(balance_usdt):
     cg_url = "https://api.coingecko.com/api/v3/coins/markets?vs_currency=usd&order=volume_desc&per_page=100&page=1"
     coins_data = fetch_coingecko(cg_url)
     if not coins_data:
         return {"action": "HOLD", "reasoning": "CoinGecko market data unavailable.", "best_candidate": None}
 
+    # ----- Count open trades that are still below breakeven (highest_tp == -1) -----
     open_symbols = set()
+    risky_open_count = 0
     try:
         open_df = pd.read_csv(OPEN_TRADES_CSV)
         if not open_df.empty:
             open_symbols = set(open_df["symbol"].values)
+            # A trade is "risky" if highest_tp == -1 (TP1 not yet reached)
+            if "highest_tp" in open_df.columns:
+                risky_open_count = (open_df["highest_tp"] == -1).sum()
+            else:
+                risky_open_count = len(open_df)
     except (FileNotFoundError, pd.errors.EmptyDataError):
         pass
+
+    # Max 5 risky trades allowed
+    if risky_open_count >= 5:
+        return {"action": "HOLD", "reasoning": f"Max 5 active risky trades reached ({risky_open_count}). Waiting for TP1 on some to free up slots.", "best_candidate": None}
 
     candidates = []
     for coin in coins_data:
@@ -1016,48 +1026,44 @@ def generate_signal(balance_usdt):
         "best_candidate": best
     }
 
-# ========== CHART (with EMA+VWAP TradingView fallback) ==========
+# ========== DARK CHART (TradingView‑style) ==========
 def send_trade_chart(signal, title_suffix=""):
-    """
-    Sends a 4h chart as a Telegram photo.
-    If mplfinance fails, sends a TradingView link with EMA(50) and VWAP pre-loaded.
-    """
-    # Primary method: mplfinance image
     try:
         import matplotlib
         matplotlib.use('Agg')
         import matplotlib.pyplot as plt
         import mplfinance as mpf
-    except ImportError:
-        # Fallback to TradingView with indicators
+
         sym = signal['symbol']
-        base = sym.replace("USDT", "").upper()
-        # EMA(50) and Anchored VWAP (session)
-        studies = "&studies[]=STD%3BEMA%3B50&studies[]=STD%3BVWAP"
-        url = f"https://www.tradingview.com/chart/?symbol=BINANCE:{base}USDT&interval=240{studies}"
-        send_telegram(f"📈 Chart with EMA & VWAP: {url}")
-        return
+        df = get_yahoo_klines(sym, interval='4h', days=10)
+        if df.empty or len(df) < 20:
+            return
 
-    sym = signal['symbol']
-    df = get_yahoo_klines(sym, interval='4h', days=10)
-    if df.empty or len(df) < 20:
-        return
+        # Dark theme
+        mpf_style = mpf.make_mpf_style(
+            base_mpf_style='nightclouds',
+            facecolor='#000000',        # pitch black
+            gridcolor='#2a2e39',
+            rc={'axes.labelcolor': 'white',
+                'xtick.color': 'white',
+                'ytick.color': 'white',
+                'axes.titlecolor': 'white'}
+        )
 
-    try:
         ema50 = df['Close'].ewm(span=50, adjust=False).mean()
         typical = (df['High'] + df['Low'] + df['Close']) / 3
         vwap = (typical * df['Volume']).cumsum() / df['Volume'].cumsum()
 
         apds = [
-            mpf.make_addplot(ema50, color='orange', width=1.5, label='EMA50'),
-            mpf.make_addplot(vwap, color='blue', width=1, linestyle='--', label='VWAP')
+            mpf.make_addplot(ema50, color='#f39c12', width=1.5, label='EMA50'),   # bright orange
+            mpf.make_addplot(vwap, color='#3498db', width=1, linestyle='--', label='VWAP')  # bright blue
         ]
 
         title = f"{sym.replace('USDT','')} 4h"
         if title_suffix:
             title += title_suffix
 
-        fig, axes = mpf.plot(df, type='candle', style='charles',
+        fig, axes = mpf.plot(df, type='candle', style=mpf_style,
                              title=title, ylabel='Price', addplot=apds,
                              returnfig=True, figsize=(8,6))
         ax = axes[0]
@@ -1066,25 +1072,32 @@ def send_trade_chart(signal, title_suffix=""):
         stop = signal.get('stop_loss')
         tps = signal.get('take_profits')
         if entry is not None and stop is not None:
-            ax.axhline(y=entry, color='gold', linestyle='--', linewidth=1.5, label='Entry')
-            ax.axhline(y=stop, color='red', linestyle='--', linewidth=1.5, label='Stop')
+            ax.axhline(y=entry, color='#f1c40f', linestyle='--', linewidth=1.5, label='Entry')  # bright yellow
+            ax.axhline(y=stop, color='#e74c3c', linestyle='--', linewidth=1.5, label='Stop')     # bright red
             if tps:
                 for i, tp in enumerate(tps):
-                    ax.axhline(y=tp, color='green', linestyle='--', linewidth=1, alpha=0.6,
-                               label=f'TP{i+1}' if i==0 else None)
-            ax.legend(loc='upper left')
+                    ax.axhline(y=tp, color='#2ecc71', linestyle='--', linewidth=1, alpha=0.8,
+                               label=f'TP{i+1}' if i==0 else None)  # bright green
+            ax.legend(loc='upper left', facecolor='#000000', edgecolor='white', labelcolor='white')
 
         chart_path = f"{sym.replace('USDT','')}_chart.png"
-        fig.savefig(chart_path, dpi=150, bbox_inches='tight')
+        fig.savefig(chart_path, dpi=150, bbox_inches='tight', facecolor='black')
         plt.close(fig)
 
         url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendPhoto"
         with open(chart_path, 'rb') as img:
             requests.post(url, data={'chat_id': CHAT_ID}, files={'photo': img})
         os.remove(chart_path)
+    except ImportError:
+        # Fallback to TradingView link with EMA & VWAP
+        sym = signal['symbol']
+        base = sym.replace("USDT", "").upper()
+        studies = "&studies[]=STD%3BEMA%3B50&studies[]=STD%3BVWAP"
+        url = f"https://www.tradingview.com/chart/?symbol=BINANCE:{base}USDT&interval=240{studies}"
+        send_telegram(f"📈 Chart with EMA & VWAP: {url}")
     except Exception as e:
-        # If image creation fails, fallback to link
-        print(f"Chart render error: {e}")
+        print(f"Chart error: {e}")
+        sym = signal['symbol']
         base = sym.replace("USDT", "").upper()
         studies = "&studies[]=STD%3BEMA%3B50&studies[]=STD%3BVWAP"
         url = f"https://www.tradingview.com/chart/?symbol=BINANCE:{base}USDT&interval=240{studies}"
