@@ -1,1 +1,2 @@
-timestamp,symbol,action,entry,stop,TP1,TP2,TP3,TP4,TP5,status,hit_level,close_time,exit_price,quantity,pnl_usdt
+timestamp,symbol,action,entry,stop,TP1,TP2,TP3,TP4,TP5,status,hit_level,close_time,exit_price,quantity,pnl_usdt,highest_tp
+2026-06-15 01:22:41,OPGUSDT,LONG,0.302393304,0.273453,0.313969,0.325546,0.337122,0.348698,0.360274,open,TP3,2026-06-15 02:47:47,0.32554554719999995,345.538872,8.0,-1.0
