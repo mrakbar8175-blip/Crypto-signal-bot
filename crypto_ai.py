@@ -244,6 +244,12 @@ def check_open_trades():
     if open_df.empty:
         return
 
+    # 👇 Keep only the latest entry for each symbol (fix duplicate glitches)
+    if "timestamp" in open_df.columns:
+        open_df = open_df.sort_values("timestamp").drop_duplicates(subset="symbol", keep="last")
+    else:
+        open_df = open_df.drop_duplicates(subset="symbol", keep="last")
+
     for col in ["highest_tp", "quantity", "original_qty"]:
         if col not in open_df.columns:
             open_df[col] = 0.0 if col != "highest_tp" else -1
@@ -716,6 +722,11 @@ def generate_signal(balance_usdt):
     try:
         open_df = pd.read_csv(OPEN_TRADES_CSV)
         if not open_df.empty:
+            # Deduplicate for counting as well (same logic)
+            if "timestamp" in open_df.columns:
+                open_df = open_df.sort_values("timestamp").drop_duplicates(subset="symbol", keep="last")
+            else:
+                open_df = open_df.drop_duplicates(subset="symbol", keep="last")
             open_symbols = set(open_df["symbol"].values)
             if "highest_tp" in open_df.columns:
                 risky_open_count = (open_df["highest_tp"] == -1).sum()
@@ -724,7 +735,6 @@ def generate_signal(balance_usdt):
     except (FileNotFoundError, pd.errors.EmptyDataError):
         pass
 
-    # 👇 Changed from 5 to 3
     if risky_open_count >= 3:
         return {"action": "HOLD", "reasoning": f"Max 3 active risky trades reached ({risky_open_count}). Waiting for TP1 on some to free up slots.", "best_candidate": None}
 
