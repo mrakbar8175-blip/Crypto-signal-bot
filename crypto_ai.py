@@ -664,52 +664,62 @@ def compute_confidence(layers):
     if aligned >= 2: return 5
     return 4
 
-# ========== QWEN DEEP EVALUATOR (Binance Square style) ==========
+# ========== QWEN DEEP EVALUATOR (ANTI‑TEMPLATE, DYNAMIC) ==========
 def evaluate_deep(coin, direction, btc_score, macro_score):
     sym = coin["symbol"]
+    ticker = sym.replace("USDT", "")
     price = coin["price"]
     atr = coin["atr"]
     layers = coin["layers"]
     tech = get_technicals(sym)
     trend_dir = tech.get("trend_dir", "up")
     ema_rel = "above" if trend_dir == "up" else "below"
+    # more detailed EMA slope
+    ema_slope = "rising" if trend_dir == "up" else "falling"
     vwap_score = anchored_vwap_score(get_yahoo_klines(sym, interval='4h', days=14), price)
     vwap_rel = "above" if vwap_score > 0 else "below" if vwap_score < 0 else "near"
+    # volume trend description
+    vol_trend = "increasing" if layers["volume_trend"] > 0 else "decreasing" if layers["volume_trend"] < 0 else "flat"
+    # BTC trend text
+    btc_bullish = btc_score > 0
+    btc_text = "bullish" if btc_bullish else "bearish"
 
-    ticker = sym.replace("USDT", "")
+    # Build a varied, anti‑template prompt
     prompt = (
-        f"CRITICAL: You are a professional Crypto Analyst writing a Binance Square post. Your output must be a single message containing the COMPLIANT HOOK, HUMANISED CHART READING, RISK-MANAGED LEVELS, and ALGO-BOOSTER sections, exactly as described below.\n\n"
-        f"Symbol: {sym} ($TICKER = ${ticker})\nDirection: {direction}\nPrice: {price:.4f} | ATR: {atr:.4f}\n"
-        f"BTC Trend Score: {btc_score} (2=bullish, -2=bearish)\nMacro Score: {macro_score} (-2 risk‑off, +2 risk‑on)\n"
-        f"Internal Layers: tech={layers['tech']:.2f}, buying_press={layers['buying_press']:.2f}, intermarket={layers['intermarket']:.2f}, volume_trend={layers['volume_trend']:.2f}\n"
-        f"Price is {ema_rel} the 50‑EMA and {vwap_rel} the anchored VWAP.\n\n"
-        "Generate the following four sections IN ORDER, exactly as instructed:\n\n"
+        f"You are a professional Crypto Analyst writing a unique Binance Square post for ${ticker} (USDT pair). "
+        f"The current analysis shows a {direction} setup on the 4‑hour chart. "
+        f"Here are the SPECIFIC technical details for THIS COIN ONLY – use them to write a fresh, original post:\n\n"
+        f"• Price: {price:.4f}\n"
+        f"• EMA50: {ema_rel} price, currently {ema_slope}\n"
+        f"• Anchored VWAP: price is {vwap_rel} it\n"
+        f"• Volume trend: {vol_trend}\n"
+        f"• $BTC trend: {btc_text}\n"
+        f"• Internal conviction: {abs(coin['score']):.2f}\n\n"
+        "WRITING RULES (MUST FOLLOW):\n"
+        "1. Do NOT use the phrase 'order books are thinning out' or any generic template.\n"
+        "2. Vary the hook and the reasoning for every post. Never repeat the same structure.\n"
+        "3. Describe the specific EMA/VWAP/volume behaviour for this coin only.\n"
+        "4. Use short paragraphs (1-2 sentences) for mobile readability.\n\n"
+        "STRUCTURE THE POST IN THESE FOUR SECTIONS:\n\n"
         "1. THE COMPLIANT HOOK 🪝\n"
-        "Write a scroll‑stopping single line that uses the Cashtag ${ticker}, builds curiosity, and avoids direct buy/sell language. Example: 'Order books are thinning out on ${ticker}, and a structural breakout is starting to look imminent. ⚡'\n\n"
+        "A single scroll‑stopping line with $TICKER. Be creative, never reuse previous openings.\n\n"
         "2. THE HUMANISED CHART READING 📈\n"
-        "Translate the raw data into trader psychology. Explain what the EMA50 flattening (or sloping) means, what VWAP acting as a magnet implies, and how volume behaviour supports the move. Mention $BTC correlation explicitly. Use short, mobile‑friendly paragraphs.\n\n"
+        "Explain the setup like a trader would, referencing the EMA50 slope, VWAP location, volume dynamics, and BTC context.\n\n"
         "3. RISK-MANAGED LEVELS 🎯\n"
-        "Write exactly:\n"
-        f"🟢 {direction} Setup Structure:\n"
-        f"• Area of Interest: {price:.6f}\n"
-        f"• Technical Invalidation: [Stop loss price with percentage]%\n"
-        f"• Target Objectives: [List TP1, TP2, TP3, TP4, TP5 separated by / ]\n"
-        "You must calculate the stop loss percentage as (abs(entry - stop) / entry) * 100 and include it.\n\n"
+        "Exactly as shown (use the real values I will provide separately, but I'll insert them later).\n\n"
         "4. THE ALGO-BOOSTER (CTA) & SAFE FOOTER 💬\n"
-        "Ask an open-ended question encouraging opinion sharing (e.g., 'Are you tracking this compression on ${ticker}, or are you sitting on the sidelines until Bitcoin makes a decisive move? Let me know your bias below!'). Then add exactly:\n"
-        "#CryptoAnalysis #{ticker} #TechnicalAnalysis #BinanceSquare\n"
-        "*Disclaimer: This analysis is based on technical indicators for educational and informational purposes only. This is not financial advice. Always practice strict risk management and do your own research (DYOR).*\n\n"
-        "IMPORTANT: Output ONLY the final post text, no extra commentary."
+        "An open‑ended question encouraging engagement, plus hashtags and disclaimer.\n\n"
+        "IMPORTANT: Output ONLY the final post text. No extra commentary, no RATING prefix."
     )
 
-    def call_qwen(prompt, temp=0.8):
+    def call_qwen(prompt, temp=0.9):
         url = "https://api.groq.com/openai/v1/chat/completions"
         headers = {"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"}
         payload = {
             "model": "qwen-2.5-72b",
             "messages": [{"role": "user", "content": prompt}],
             "temperature": temp,
-            "max_tokens": 400
+            "max_tokens": 500
         }
         try:
             resp = requests.post(url, headers=headers, json=payload, timeout=60)
@@ -719,46 +729,67 @@ def evaluate_deep(coin, direction, btc_score, macro_score):
             pass
         return None
 
-    text = call_qwen(prompt, temp=0.8)
-    # If output is empty or too short, retry with higher temp
-    if not text or len(text) < 150:
+    text = call_qwen(prompt, temp=0.9)
+    # Retry if too short or if it repeats generic phrasing
+    if not text or len(text) < 200 or "order books are thinning out" in text.lower():
         text = call_qwen(prompt, temp=1.0)
 
-    # Fallback in case of failure – build the post manually
+    # Fallback: build a dynamic, non‑repetitive post manually
     if not text:
-        ticker = sym.replace("USDT", "")
-        sl_pct = abs(coin["price"] - coin.get("stop_loss", coin["price"]*0.98)) / coin["price"] * 100
+        # Build unique description based on actual values
+        if ema_slope == "rising" and vwap_rel == "above":
+            chart_desc = f"The 50‑EMA is sloping upward with price holding comfortably above it, while the anchored VWAP from the last two weeks is providing dynamic support. {vol_trend.capitalize()} volume adds confidence to the move."
+        elif ema_slope == "falling" and vwap_rel == "below":
+            chart_desc = f"The 50‑EMA is trending lower and price is struggling below it, with the anchored VWAP acting as overhead resistance. {vol_trend.capitalize()} volume reinforces the bearish pressure."
+        else:
+            chart_desc = f"The 50‑EMA is {ema_slope} while price sits {ema_rel} it, and the anchored VWAP is {vwap_rel} the current price, acting as a pivot. Volume is {vol_trend}, suggesting market indecision."
+        btc_note = f"$BTC is currently in a {btc_text} structure, which {'supports' if btc_bullish else 'weighs on'} altcoin setups like ${ticker}."
+
+        sl_pct = abs(price - coin.get("stop_loss", price*0.98)) / price * 100
         tps = []
-        risk_per_share = abs(coin["price"] - coin.get("stop_loss", coin["price"]*0.98))
+        risk_per_share = abs(price - coin.get("stop_loss", price*0.98))
         for m in [0.4, 0.8, 1.2, 1.6, 2.0]:
             if direction == "LONG":
-                tps.append(round(coin["price"] + m * risk_per_share, 6))
+                tps.append(round(price + m * risk_per_share, 6))
             else:
-                tps.append(round(coin["price"] - m * risk_per_share, 6))
+                tps.append(round(price - m * risk_per_share, 6))
         tp_str = " / ".join([f"{tp:.6f}" for tp in tps])
+
+        hooks = [
+            f"The compression on ${ticker} is becoming impossible to ignore. ⚡",
+            f"${ticker} is coiling up in a tight range – a breakout is brewing.",
+            f"Volume is starting to stir on ${ticker}. Here’s what the 4H chart is signalling.",
+            f"The EMA50 on ${ticker} just gave a critical cue. Don’t overlook it.",
+        ]
+        import random
+        hook = random.choice(hooks)
+
         text = (
-            f"Order books are thinning out on ${ticker}, and a structural breakout is starting to look imminent. ⚡\n\n"
-            f"The 50‑period EMA on {ticker}/USDT is flattening while price consolidates near it, and the anchored VWAP is acting as a magnet. Volume is declining, suggesting selling pressure is exhausting. $BTC is currently holding above its own 50‑EMA, providing a risk‑on backdrop for alts.\n\n"
+            f"{hook}\n\n"
+            f"{chart_desc}\n\n"
+            f"{btc_note}\n\n"
             f"🟢 {direction} Setup Structure:\n"
-            f"• Area of Interest: {coin['price']:.6f}\n"
-            f"• Technical Invalidation: {coin.get('stop_loss', coin['price']*0.98):.6f} ({sl_pct:.2f}%)\n"
+            f"• Area of Interest: {price:.6f}\n"
+            f"• Technical Invalidation: {coin.get('stop_loss', price*0.98):.6f} ({sl_pct:.2f}%)\n"
             f"• Target Objectives: {tp_str}\n\n"
-            f"Are you tracking this compression on ${ticker}, or are you sitting on the sidelines until Bitcoin makes a decisive move? Let me know your bias below!\n"
+            f"What’s your read on ${ticker} – are you waiting for a retest or already positioned? Let me know below!\n"
             f"#CryptoAnalysis #{ticker} #TechnicalAnalysis #BinanceSquare\n"
             f"*Disclaimer: This analysis is based on technical indicators for educational and informational purposes only. This is not financial advice. Always practice strict risk management and do your own research (DYOR).*"
         )
 
-    rating = 5  # Rating not used directly in the post, but we need it for internal scoring
-    # We'll still need a rating to filter and combine, so we'll extract it if present
+    # Qwen occasionally still prefixes with "RATING: X |" – strip it
+    text = re.sub(r'^RATING:\s*\d+\s*\|?\s*', '', text).strip()
+
+    # Rating extraction for internal scoring
+    rating = 5
     rat_match = re.search(r'RATING:\s*(\d+)', text)
-    rating = int(rat_match.group(1)) if rat_match else 5
+    if rat_match:
+        rating = int(rat_match.group(1))
     rating = max(1, min(10, rating))
-    # Remove any "RATING: X |" prefix from the text if Qwen added it
-    text = re.sub(r'RATING:\s*\d+\s*\|?\s*', '', text).strip()
 
-    return rating, text, ""  # question is now inside the text, so we don't need a separate field
+    return rating, text  # the full post
 
-# ========== SIGNAL GENERATION (with Qwen deep eval) ==========
+# ========== SIGNAL GENERATION (unchanged except post_text handling) ==========
 def generate_signal(balance_usdt):
     cg_url = "https://api.coingecko.com/api/v3/coins/markets?vs_currency=usd&order=volume_desc&per_page=100&page=1"
     coins_data = fetch_coingecko(cg_url)
@@ -825,7 +856,7 @@ def generate_signal(balance_usdt):
         if abs(coin["score"]) < 0.5:
             continue
         direction = "LONG" if coin["score"] >= 0 else "SHORT"
-        rating, reasoning, _ = evaluate_deep(coin, direction, btc_score, macro_score)
+        rating, post_text = evaluate_deep(coin, direction, btc_score, macro_score)
         if rating < 4:
             continue
         combined = abs(coin["score"]) * (rating / 5.0)
@@ -833,7 +864,7 @@ def generate_signal(balance_usdt):
             best_combined = combined
             coin["direction"] = direction
             coin["rating"] = rating
-            coin["post_text"] = reasoning  # the entire Binance Square post
+            coin["post_text"] = post_text
             coin["conviction_score"] = round(combined, 2)
             coin["conviction10_str"] = (f"+{round(combined * 10 / 3)}/10" if combined >= 0 else f"{round(combined * 10 / 3)}/10")
             best_signal = coin
@@ -844,25 +875,27 @@ def generate_signal(balance_usdt):
             return {"action": "HOLD", "reasoning": f"No strong conviction. Best internal: {best['score']:.2f}"}
         direction = "LONG" if best["score"] >= 0 else "SHORT"
         best["direction"] = direction
-        # Fallback post
+        # dynamic fallback
         ticker = best["symbol"].replace("USDT", "")
-        sl_pct = abs(best["price"] - best.get("stop_loss", best["price"]*0.98)) / best["price"] * 100
+        price = best["price"]
+        sl_pct = abs(price - best.get("stop_loss", price*0.98)) / price * 100
         tps = []
-        risk_per_share = abs(best["price"] - best.get("stop_loss", best["price"]*0.98))
+        risk_per_share = abs(price - best.get("stop_loss", price*0.98))
         for m in [0.4, 0.8, 1.2, 1.6, 2.0]:
             if direction == "LONG":
-                tps.append(round(best["price"] + m * risk_per_share, 6))
+                tps.append(round(price + m * risk_per_share, 6))
             else:
-                tps.append(round(best["price"] - m * risk_per_share, 6))
+                tps.append(round(price - m * risk_per_share, 6))
         tp_str = " / ".join([f"{tp:.6f}" for tp in tps])
         best["post_text"] = (
-            f"Order books are thinning out on ${ticker}, and a structural breakout is starting to look imminent. ⚡\n\n"
-            f"The 50‑period EMA on {ticker}/USDT is flattening while price consolidates near it, and the anchored VWAP is acting as a magnet. Volume is declining, suggesting selling pressure is exhausting. $BTC is currently holding above its own 50‑EMA, providing a risk‑on backdrop for alts.\n\n"
+            f"The compression on ${ticker} is becoming impossible to ignore. ⚡\n\n"
+            f"Price is hovering near a pivotal zone with the 50‑EMA and VWAP converging – a classic coil before a directional move. Volume is { 'rising' if best.get('layers', {}).get('volume_trend', 0) > 0 else 'fading' }, hinting at an imminent expansion.\n\n"
+            f"$BTC is providing a { 'supportive' if btc_score > 0 else 'cautious' } macro backdrop.\n\n"
             f"🟢 {direction} Setup Structure:\n"
-            f"• Area of Interest: {best['price']:.6f}\n"
-            f"• Technical Invalidation: {best.get('stop_loss', best['price']*0.98):.6f} ({sl_pct:.2f}%)\n"
+            f"• Area of Interest: {price:.6f}\n"
+            f"• Technical Invalidation: {best.get('stop_loss', price*0.98):.6f} ({sl_pct:.2f}%)\n"
             f"• Target Objectives: {tp_str}\n\n"
-            f"Are you tracking this compression on ${ticker}, or are you sitting on the sidelines until Bitcoin makes a decisive move? Let me know your bias below!\n"
+            f"Are you waiting for a clean breakout on ${ticker}, or already scaling in? Share your view!\n"
             f"#CryptoAnalysis #{ticker} #TechnicalAnalysis #BinanceSquare\n"
             f"*Disclaimer: This analysis is based on technical indicators for educational and informational purposes only. This is not financial advice. Always practice strict risk management and do your own research (DYOR).*"
         )
@@ -886,19 +919,13 @@ def generate_signal(balance_usdt):
         else:
             tps.append(round(entry_price - m * risk_per_share, 6))
 
-    # Update the post text with exact calculated levels
-    # But the post text already contains levels from Qwen; we'll replace them to ensure accuracy
-    ticker = best_signal["symbol"].replace("USDT", "")
+    # Replace placeholder levels in post_text with exact calculated levels
+    post_text = best_signal.get("post_text", "")
     sl_pct = abs(entry_price - stop) / entry_price * 100
     tp_str = " / ".join([f"{tp:.6f}" for tp in tps])
-    # We'll replace the lines starting with • Area of Interest / • Technical Invalidation / • Target Objectives
-    post_text = best_signal.get("post_text", "")
-    # If the post exists, we do a simple replace of those lines
-    import re as regex
-    post_text = regex.sub(r'• Area of Interest: .*', f'• Area of Interest: {entry_price:.6f}', post_text)
-    post_text = regex.sub(r'• Technical Invalidation: .*', f'• Technical Invalidation: {stop:.6f} ({sl_pct:.2f}%)', post_text)
-    post_text = regex.sub(r'• Target Objectives: .*', f'• Target Objectives: {tp_str}', post_text)
-    best_signal["post_text"] = post_text
+    post_text = re.sub(r'• Area of Interest: .*', f'• Area of Interest: {entry_price:.6f}', post_text)
+    post_text = re.sub(r'• Technical Invalidation: .*', f'• Technical Invalidation: {stop:.6f} ({sl_pct:.2f}%)', post_text)
+    post_text = re.sub(r'• Target Objectives: .*', f'• Target Objectives: {tp_str}', post_text)
 
     return {
         "action": best_signal["direction"],
@@ -909,7 +936,7 @@ def generate_signal(balance_usdt):
         "take_profits": tps,
         "confidence_score": compute_confidence(best_signal["layers"]),
         "conviction_score": best_signal["conviction_score"],
-        "post_text": best_signal["post_text"],
+        "post_text": post_text,
         "best_candidate": best_signal
     }
 
