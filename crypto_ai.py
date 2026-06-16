@@ -1,4 +1,4 @@
-import requests, json, os, traceback, re, time
+import requests, json, os, traceback, re, time, random
 import pandas as pd
 import numpy as np
 import yfinance as yf
@@ -674,17 +674,13 @@ def evaluate_deep(coin, direction, btc_score, macro_score):
     tech = get_technicals(sym)
     trend_dir = tech.get("trend_dir", "up")
     ema_rel = "above" if trend_dir == "up" else "below"
-    # more detailed EMA slope
     ema_slope = "rising" if trend_dir == "up" else "falling"
     vwap_score = anchored_vwap_score(get_yahoo_klines(sym, interval='4h', days=14), price)
     vwap_rel = "above" if vwap_score > 0 else "below" if vwap_score < 0 else "near"
-    # volume trend description
     vol_trend = "increasing" if layers["volume_trend"] > 0 else "decreasing" if layers["volume_trend"] < 0 else "flat"
-    # BTC trend text
     btc_bullish = btc_score > 0
     btc_text = "bullish" if btc_bullish else "bearish"
 
-    # Build a varied, anti‑template prompt
     prompt = (
         f"You are a professional Crypto Analyst writing a unique Binance Square post for ${ticker} (USDT pair). "
         f"The current analysis shows a {direction} setup on the 4‑hour chart. "
@@ -730,13 +726,10 @@ def evaluate_deep(coin, direction, btc_score, macro_score):
         return None
 
     text = call_qwen(prompt, temp=0.9)
-    # Retry if too short or if it repeats generic phrasing
     if not text or len(text) < 200 or "order books are thinning out" in text.lower():
         text = call_qwen(prompt, temp=1.0)
 
-    # Fallback: build a dynamic, non‑repetitive post manually
     if not text:
-        # Build unique description based on actual values
         if ema_slope == "rising" and vwap_rel == "above":
             chart_desc = f"The 50‑EMA is sloping upward with price holding comfortably above it, while the anchored VWAP from the last two weeks is providing dynamic support. {vol_trend.capitalize()} volume adds confidence to the move."
         elif ema_slope == "falling" and vwap_rel == "below":
@@ -761,7 +754,6 @@ def evaluate_deep(coin, direction, btc_score, macro_score):
             f"Volume is starting to stir on ${ticker}. Here’s what the 4H chart is signalling.",
             f"The EMA50 on ${ticker} just gave a critical cue. Don’t overlook it.",
         ]
-        import random
         hook = random.choice(hooks)
 
         text = (
@@ -777,19 +769,16 @@ def evaluate_deep(coin, direction, btc_score, macro_score):
             f"*Disclaimer: This analysis is based on technical indicators for educational and informational purposes only. This is not financial advice. Always practice strict risk management and do your own research (DYOR).*"
         )
 
-    # Qwen occasionally still prefixes with "RATING: X |" – strip it
     text = re.sub(r'^RATING:\s*\d+\s*\|?\s*', '', text).strip()
-
-    # Rating extraction for internal scoring
     rating = 5
     rat_match = re.search(r'RATING:\s*(\d+)', text)
     if rat_match:
         rating = int(rat_match.group(1))
     rating = max(1, min(10, rating))
 
-    return rating, text  # the full post
+    return rating, text
 
-# ========== SIGNAL GENERATION (unchanged except post_text handling) ==========
+# ========== SIGNAL GENERATION ==========
 def generate_signal(balance_usdt):
     cg_url = "https://api.coingecko.com/api/v3/coins/markets?vs_currency=usd&order=volume_desc&per_page=100&page=1"
     coins_data = fetch_coingecko(cg_url)
@@ -819,8 +808,10 @@ def generate_signal(balance_usdt):
     candidates = []
     for coin in coins_data:
         sym = coin.get("symbol", "").upper() + "USDT"
-        if coin.get("current_price", 0) > 0 and sym not in open_symbols:
-            candidates.append({"symbol": sym, "price": coin["current_price"], "volume": coin.get("total_volume", 0)})
+        price = coin.get("current_price")
+        # ✅ fix: only add if price is not None and > 0
+        if price is not None and price > 0 and sym not in open_symbols:
+            candidates.append({"symbol": sym, "price": price, "volume": coin.get("total_volume", 0)})
     candidates.sort(key=lambda x: x["volume"], reverse=True)
     candidates = candidates[:50]
 
@@ -875,7 +866,6 @@ def generate_signal(balance_usdt):
             return {"action": "HOLD", "reasoning": f"No strong conviction. Best internal: {best['score']:.2f}"}
         direction = "LONG" if best["score"] >= 0 else "SHORT"
         best["direction"] = direction
-        # dynamic fallback
         ticker = best["symbol"].replace("USDT", "")
         price = best["price"]
         sl_pct = abs(price - best.get("stop_loss", price*0.98)) / price * 100
@@ -919,7 +909,6 @@ def generate_signal(balance_usdt):
         else:
             tps.append(round(entry_price - m * risk_per_share, 6))
 
-    # Replace placeholder levels in post_text with exact calculated levels
     post_text = best_signal.get("post_text", "")
     sl_pct = abs(entry_price - stop) / entry_price * 100
     tp_str = " / ".join([f"{tp:.6f}" for tp in tps])
@@ -1043,12 +1032,10 @@ def main():
             portfolio['open_positions'] += 1
             save_portfolio(portfolio)
 
-            # Send the ready-to-publish Binance Square post
             post_text = dec.get('post_text', '')
             if post_text:
                 send_telegram(post_text)
 
-            # Send chart separately
             send_trade_chart(dec)
         else:
             msg = f"HOLD\n{dec.get('reasoning', 'No signal')}"
