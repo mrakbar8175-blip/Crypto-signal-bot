@@ -258,7 +258,7 @@ def check_open_trades():
     alerts = []
     now = datetime.now()
     mults = [0.4, 0.8, 1.2, 1.6, 2.0]
-    fractions = [0.20, 0.20, 0.30]  # TP1, TP2, TP3
+    fractions = [0.20, 0.20, 0.30]
 
     for idx, trade in open_df.iterrows():
         sym = trade["symbol"]
@@ -311,7 +311,7 @@ def check_open_trades():
                     if remaining_qty <= 0:
                         break
 
-                    if i <= 2:  # TP1, TP2, TP3
+                    if i <= 2:
                         fraction = fractions[i]
                         exit_qty = original_qty * fraction
                         if exit_qty > remaining_qty:
@@ -333,7 +333,7 @@ def check_open_trades():
                                 current_stop = entry
                         alerts.append(f"🚀 {sym.replace('USDT','')} {direction} TP{i+1} hit — {fraction*100:.0f}% closed, SL now {'BE' if i==0 else 'at entry'}")
 
-                    elif i == 4:  # TP5
+                    elif i == 4:
                         if remaining_qty > 0:
                             exit_price = tps[4]
                             pnl = (exit_price - entry) * remaining_qty if direction == "LONG" else (entry - exit_price) * remaining_qty
@@ -715,7 +715,7 @@ def evaluate_deep(coin, direction, btc_score, macro_score):
         pass
     return 5, "Price is near the 50‑EMA and VWAP, awaiting confirmation.", "What's your outlook?"
 
-# ========== SIGNAL GENERATION (with Qwen deep eval) ==========
+# ========== SIGNAL GENERATION (with Qwen deep eval, fixed conviction_score) ==========
 def generate_signal(balance_usdt):
     cg_url = "https://api.coingecko.com/api/v3/coins/markets?vs_currency=usd&order=volume_desc&per_page=100&page=1"
     coins_data = fetch_coingecko(cg_url)
@@ -773,7 +773,6 @@ def generate_signal(balance_usdt):
         coin["errors"] = errors
         all_scored.append(coin)
 
-    # Keep top 5 by absolute internal score for deep evaluation
     top_candidates = sorted(all_scored, key=lambda x: abs(x["score"]), reverse=True)[:5]
 
     best_combined = -999
@@ -793,6 +792,9 @@ def generate_signal(balance_usdt):
             coin["rating"] = rating
             coin["hook"] = reasoning
             coin["question"] = question
+            # Store conviction_score for logging
+            coin["conviction_score"] = round(combined, 2)
+            coin["conviction10_str"] = (f"+{round(combined * 10 / 3)}/10" if combined >= 0 else f"{round(combined * 10 / 3)}/10")
             best_signal = coin
 
     if best_signal is None:
@@ -803,16 +805,13 @@ def generate_signal(balance_usdt):
         best["direction"] = direction
         best["hook"] = "Price is reacting to key technical levels."
         best["question"] = "How are you reading this setup?"
+        best["rating"] = 5
+        best["conviction_score"] = abs(best["score"])  # fallback
+        best["conviction10_str"] = "0/10"
         best_signal = best
-        best_signal["rating"] = 5
-        best_signal["conviction10_str"] = "0/10"
     else:
-        conv = best_signal["score"] * (best_signal["rating"] / 5.0)
-        conv10 = round(conv * 10 / 3)
-        if conv10 >= 0:
-            best_signal["conviction10_str"] = f"+{conv10}/10"
-        else:
-            best_signal["conviction10_str"] = f"{conv10}/10"
+        # Already populated in loop
+        pass
 
     entry_price = best_signal.get("bid", best_signal["price"] * 0.999) if best_signal["direction"] == "LONG" else best_signal.get("ask", best_signal["price"] * 1.001)
     atr = best_signal["atr"]
@@ -837,6 +836,7 @@ def generate_signal(balance_usdt):
         "stop_loss": stop,
         "take_profits": tps,
         "confidence_score": compute_confidence(best_signal["layers"]),
+        "conviction_score": best_signal["conviction_score"],
         "hook": best_signal["hook"],
         "question": best_signal["question"],
         "conviction10_str": best_signal.get("conviction10_str", "0/10"),
@@ -844,7 +844,7 @@ def generate_signal(balance_usdt):
         "best_candidate": best_signal
     }
 
-# ========== DARK CHART (TradingView‑style) ==========
+# ========== DARK CHART ==========
 def send_trade_chart(signal, title_suffix=""):
     try:
         import matplotlib
