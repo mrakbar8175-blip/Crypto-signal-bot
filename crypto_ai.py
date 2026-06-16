@@ -1,4 +1,4 @@
-import requests, json, os, traceback, re, time, random
+import requests, json, os, traceback, re, time
 import pandas as pd
 import numpy as np
 import yfinance as yf
@@ -233,7 +233,7 @@ def refined_buying_pressure(symbol_usdt):
 
     return short_press, long_press
 
-# ========== TRAILING STOP LOGIC (simplified for partial exits) ==========
+# ========== TRAILING STOP LOGIC (partial exits) ==========
 
 def check_open_trades():
     try:
@@ -244,7 +244,6 @@ def check_open_trades():
     if open_df.empty:
         return
 
-    # Keep only latest entry per symbol
     if "timestamp" in open_df.columns:
         open_df = open_df.sort_values("timestamp").drop_duplicates(subset="symbol", keep="last")
     else:
@@ -655,77 +654,76 @@ def score_coin(symbol, price, volume_24h, change1h, btc_score, btc_error, macro_
     }
     return max(-3, min(3, total)), layers, ema50_distance, adx_value, trend_dir, errors
 
-# ========== AI REASONING (COMPLIANT HOOK & QUESTION) ==========
-def call_groq_reasoning(symbol, entry, atr, layers, errors=None):
-    """
-    Generates a compliant 2-sentence hook that explicitly mentions EMA50 and VWAP,
-    and a community engagement question. Also returns a confidence score (kept internal).
-    """
-    layer_str = "; ".join([f"{k}={v:.2f}" for k,v in layers.items()])
-    err_str = ""
-    if errors:
-        err_str = " | Data issues: " + "; ".join(errors)
+def compute_confidence(layers):
+    scores = [layers["tech"], layers["buying_press"], layers["intermarket"], layers["volume_trend"]]
+    bearish = sum(1 for s in scores if s < -0.5)
+    bullish = sum(1 for s in scores if s > 0.5)
+    aligned = max(bearish, bullish)
+    if aligned >= 4: return 7
+    if aligned >= 3: return 6
+    if aligned >= 2: return 5
+    return 4
 
-    directional_scores = [layers["tech"], layers["buying_press"], layers["intermarket"], layers["volume_trend"]]
-    bearish_count = sum(1 for s in directional_scores if s < -0.5)
-    bullish_count = sum(1 for s in directional_scores if s > 0.5)
-    alignment_strength = max(bearish_count, bullish_count)
+# ========== QWEN DEEP EVALUATOR ==========
+def evaluate_deep(coin, direction, btc_score, macro_score):
+    sym = coin["symbol"]
+    price = coin["price"]
+    atr = coin["atr"]
+    layers = coin["layers"]
+    tech = get_technicals(sym)
+    trend_dir = tech.get("trend_dir", "up")
+    ema_rel = "above" if trend_dir == "up" else "below"
+    vwap_score = anchored_vwap_score(get_yahoo_klines(sym, interval='4h', days=14), price)
+    vwap_rel = "above" if vwap_score > 0 else "below" if vwap_score < 0 else "near"
 
-    system_msg = (
-        "You are a professional crypto market analyst writing a short post for Binance Square. "
-        "The chart you refer to shows the 4h candlesticks with the 50-period EMA (orange) and Anchored VWAP (blue dotted). "
-        "Write exactly 2 sentences explaining the technical reasoning behind the trade. Explicitly mention the EMA50 and VWAP, "
-        "and refer to support/resistance levels or breakouts visible on the chart. Use natural, non‑hype language. "
-        "After that, write one short, open‑ended question to encourage community engagement (avoid 'Drop your entries' or any engagement bait). "
-        "Also output a confidence score between 4 and 7 (5 if 2 metrics align, 6 if 3, 7 if 4). "
+    prompt = (
+        f"Symbol: {sym} | Direction: {direction}\n"
+        f"Price: {price:.4f} | ATR: {atr:.4f}\n"
+        f"BTC 4h Trend Score (2=bullish, -2=bearish): {btc_score}\n"
+        f"Macro Score (-2 to +2): {macro_score}\n"
+        f"Internal conviction layers: tech={layers['tech']:.2f}, buying_press={layers['buying_press']:.2f}, "
+        f"intermarket={layers['intermarket']:.2f}, volume_trend={layers['volume_trend']:.2f}\n"
+        f"Price is {ema_rel} the 50‑period EMA and {vwap_rel} the anchored VWAP.\n\n"
+        "Analyze this setup as a senior crypto analyst. Give a quality rating from 1 to 10. "
+        "Then provide a two‑sentence technical reasoning explicitly mentioning EMA50 and VWAP. "
+        "Finally, write an open‑ended question to engage the community (no engagement bait).\n"
         "Output format:\n"
-        "CONFIDENCE: 7 | HOOK: [your 2 sentences] | QUESTION: [your question]"
-    )
-
-    user_prompt = (
-        f"Trade signal for {symbol} at {entry}. 4h ATR: {atr:.4f}. "
-        f"Internal metrics: {layer_str}{err_str}. "
-        f"Alignment: {alignment_strength}/4 directional metrics are strongly aligned (bullish/bearish). "
-        "Generate the compliant hook and question as instructed."
+        "RATING: 8 | REASONING: [two sentences] | QUESTION: [question]"
     )
 
     url = "https://api.groq.com/openai/v1/chat/completions"
     headers = {"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"}
     payload = {
-        "model": "llama-3.3-70b-versatile",
-        "messages": [
-            {"role": "system", "content": system_msg},
-            {"role": "user", "content": user_prompt}
-        ],
-        "temperature": 0.7,
-        "max_tokens": 200
+        "model": "qwen-2.5-72b",
+        "messages": [{"role": "user", "content": prompt}],
+        "temperature": 0.6,
+        "max_tokens": 250
     }
     try:
-        resp = requests.post(url, headers=headers, json=payload, timeout=30)
+        resp = requests.post(url, headers=headers, json=payload, timeout=40)
         if resp.status_code == 200:
             text = resp.json()["choices"][0]["message"]["content"]
-            conf_match = re.search(r'CONFIDENCE:\s*(\d+)', text)
-            hook_match = re.search(r'HOOK:\s*(.*?)(?:\||$)', text)
+            rat_match = re.search(r'RATING:\s*(\d+)', text)
+            reason_match = re.search(r'REASONING:\s*(.*?)(?:\||$)', text)
             q_match = re.search(r'QUESTION:\s*(.*?)(?:\||$)', text)
-            conf = int(conf_match.group(1)) if conf_match else 5
-            conf = max(4, min(7, conf))
-            hook = hook_match.group(1).strip() if hook_match else "Price is holding above the 50‑EMA with VWAP support, signalling bullish continuation."
+            rating = int(rat_match.group(1)) if rat_match else 5
+            rating = max(1, min(10, rating))
+            reason = reason_match.group(1).strip() if reason_match else "Price is reacting to key technical levels."
             question = q_match.group(1).strip() if q_match else "How are you positioning for this move?"
-            return conf, hook, question
+            return rating, reason, question
     except:
         pass
-    # Fallback
-    return 5, "The 4‑hour chart shows price above the 50‑EMA and VWAP, suggesting a potential continuation.", "Do you see this as a strong entry?"
+    return 5, "Price is near the 50‑EMA and VWAP, awaiting confirmation.", "What's your outlook?"
 
-# ========== SIGNAL GENERATION (max 3 risky trades) ==========
+# ========== SIGNAL GENERATION (with Qwen deep eval) ==========
 def generate_signal(balance_usdt):
     cg_url = "https://api.coingecko.com/api/v3/coins/markets?vs_currency=usd&order=volume_desc&per_page=100&page=1"
     coins_data = fetch_coingecko(cg_url)
     if not coins_data:
-        return {"action": "HOLD", "reasoning": "CoinGecko market data unavailable.", "best_candidate": None}
+        return {"action": "HOLD", "reasoning": "CoinGecko market data unavailable."}
 
     open_symbols = set()
-    risky_open_count = 0
+    risky_count = 0
     try:
         open_df = pd.read_csv(OPEN_TRADES_CSV)
         if not open_df.empty:
@@ -735,180 +733,115 @@ def generate_signal(balance_usdt):
                 open_df = open_df.drop_duplicates(subset="symbol", keep="last")
             open_symbols = set(open_df["symbol"].values)
             if "highest_tp" in open_df.columns:
-                risky_open_count = (open_df["highest_tp"] == -1).sum()
+                risky_count = (open_df["highest_tp"] == -1).sum()
             else:
-                risky_open_count = len(open_df)
-    except (FileNotFoundError, pd.errors.EmptyDataError):
+                risky_count = len(open_df)
+    except:
         pass
 
-    if risky_open_count >= 3:
-        return {"action": "HOLD", "reasoning": f"Max 3 active risky trades reached ({risky_open_count}). Waiting for TP1 on some to free up slots.", "best_candidate": None}
+    if risky_count >= 3:
+        return {"action": "HOLD", "reasoning": f"Max 3 risky trades ({risky_count}). Waiting for TP1."}
 
     candidates = []
     for coin in coins_data:
         sym = coin.get("symbol", "").upper() + "USDT"
-        price = coin.get("current_price", 0)
-        volume = coin.get("total_volume", 0)
-        if price > 0 and sym not in open_symbols:
-            candidates.append({"symbol": sym, "price": price, "volume": volume})
-
+        if coin.get("current_price", 0) > 0 and sym not in open_symbols:
+            candidates.append({"symbol": sym, "price": coin["current_price"], "volume": coin.get("total_volume", 0)})
     candidates.sort(key=lambda x: x["volume"], reverse=True)
     candidates = candidates[:50]
 
     if not candidates:
-        return {"action": "HOLD", "reasoning": "No liquid coins available (all coins with open trades skipped).", "best_candidate": None}
+        return {"action": "HOLD", "reasoning": "No liquid coins available."}
 
     btc_score, btc_error = btc_trend_score()
     macro_score = institutional_macro_filter()
 
     all_scored = []
-    best = None
-    best_score = 0
-    best_layers = None
-    best_ema_distance = 0.0
-    best_adx = 0
-    best_trend_dir = None
-    best_errors = []
-
     for coin in candidates:
-        sym = coin["symbol"]
-        price = coin["price"]
-        volume = coin["volume"]
-
-        total_score, layers, ema_dist, adx_val, trend_dir, errors = score_coin(
-            sym, price, volume, 0, btc_score, btc_error, macro_score
+        total, layers, ema_dist, adx, trend_dir, errors = score_coin(
+            coin["symbol"], coin["price"], coin["volume"], 0, btc_score, btc_error, macro_score
         )
-        atr, _ = get_4h_atr(sym, price)
-        if atr / price > 0.07:
-            total_score = 0.0
-            errors.append("volatility cap triggered (ATR>7%)")
-        coin["score"] = total_score
+        atr, _ = get_4h_atr(coin["symbol"], coin["price"])
+        if atr / coin["price"] > 0.07:
+            total = 0.0
+            errors.append("volatility cap (>7%)")
+        coin["score"] = total
         coin["atr"] = atr
-        coin["bid"] = price * 0.999
-        coin["ask"] = price * 1.001
         coin["layers"] = layers
-        coin["ema_distance"] = ema_dist
-        coin["adx_value"] = adx_val
+        coin["adx"] = adx
         coin["trend_dir"] = trend_dir
         coin["errors"] = errors
-
         all_scored.append(coin)
 
-        if best is None or abs(total_score) > abs(best_score):
-            best = coin
-            best_score = total_score
-            best_layers = layers
-            best_ema_distance = ema_dist
-            best_adx = adx_val
-            best_trend_dir = trend_dir
-            best_errors = errors
+    # Keep top 5 by absolute internal score for deep evaluation
+    top_candidates = sorted(all_scored, key=lambda x: abs(x["score"]), reverse=True)[:5]
 
-    if btc_error:
-        best_errors.append(f"intermarket: {btc_error}")
+    best_combined = -999
+    best_signal = None
 
-    all_scored_sorted = sorted(all_scored, key=lambda x: abs(x["score"]), reverse=True)
-    coin_summary_list = []
-    for c in all_scored_sorted:
-        coin_summary_list.append(f"{c['symbol'].replace('USDT','')}: {c['score']:.2f}")
-    coin_summary = " | ".join(coin_summary_list)
+    for coin in top_candidates:
+        if abs(coin["score"]) < 0.5:
+            continue
+        direction = "LONG" if coin["score"] >= 0 else "SHORT"
+        rating, reasoning, question = evaluate_deep(coin, direction, btc_score, macro_score)
+        if rating < 4:
+            continue
+        combined = abs(coin["score"]) * (rating / 5.0)
+        if combined > best_combined:
+            best_combined = combined
+            coin["direction"] = direction
+            coin["rating"] = rating
+            coin["hook"] = reasoning
+            coin["question"] = question
+            best_signal = coin
 
-    if best is None or abs(best_score) < 1.49:
-        best_sym = best["symbol"] if best else "none"
-        layer_str = "; ".join([f"{k}={v:.2f}" for k,v in best_layers.items()])
-        err_str = ""
-        if best_errors:
-            err_str = " | Errors: " + "; ".join(best_errors)
-        display_score = round(best_score, 2)
-        reason = (f"No strong conviction. Best score: {display_score:+.2f}/3 for {best_sym}.\n"
-                  f"Layers: {layer_str}{err_str}\n"
-                  f"All coins: {coin_summary}")
-        return {"action": "HOLD", "reasoning": reason, "best_candidate": best}
+    if best_signal is None:
+        best = max(all_scored, key=lambda x: abs(x["score"]))
+        if abs(best["score"]) < 1.49:
+            return {"action": "HOLD", "reasoning": f"No strong conviction. Best internal: {best['score']:.2f}"}
+        direction = "LONG" if best["score"] >= 0 else "SHORT"
+        best["direction"] = direction
+        best["hook"] = "Price is reacting to key technical levels."
+        best["question"] = "How are you reading this setup?"
+        best_signal = best
+        best_signal["rating"] = 5
+        best_signal["conviction10_str"] = "0/10"
+    else:
+        conv = best_signal["score"] * (best_signal["rating"] / 5.0)
+        conv10 = round(conv * 10 / 3)
+        if conv10 >= 0:
+            best_signal["conviction10_str"] = f"+{conv10}/10"
+        else:
+            best_signal["conviction10_str"] = f"{conv10}/10"
 
-    direction = "LONG" if best_score >= 0 else "SHORT"
-
-    if best_trend_dir:
-        if (direction == "LONG" and best_trend_dir == "down") or \
-           (direction == "SHORT" and best_trend_dir == "up"):
-            best_sym = best["symbol"]
-            layer_str = "; ".join([f"{k}={v:.2f}" for k,v in best_layers.items()])
-            err_str = ""
-            if best_errors:
-                err_str = " | Errors: " + "; ".join(best_errors)
-            display_score = round(best_score, 2)
-            reason = (f"Signal {direction} rejected due to 4h trend filter ({best_trend_dir}). "
-                      f"Best score: {display_score:+.2f}/3 for {best_sym}.\n"
-                      f"Layers: {layer_str}{err_str}\n"
-                      f"All coins: {coin_summary}")
-            return {"action": "HOLD", "reasoning": reason, "best_candidate": best}
-
-    best_score += trend_strength_bonus(best_adx, best_score)
-    momentum_bonus = momentum_alignment_score(best["symbol"], direction, best_layers)
-    best_score += momentum_bonus
-
-    if abs(best_score) < 1.49:
-        best_sym = best["symbol"]
-        layer_str = "; ".join([f"{k}={v:.2f}" for k,v in best_layers.items()])
-        err_str = ""
-        if best_errors:
-            err_str = " | Errors: " + "; ".join(best_errors)
-        display_score = round(best_score, 2)
-        reason = (f"No strong conviction after bonuses. Best score: {display_score:+.2f}/3 for {best_sym}.\n"
-                  f"Layers: {layer_str}{err_str}\n"
-                  f"All coins: {coin_summary}")
-        return {"action": "HOLD", "reasoning": reason, "best_candidate": best}
-
-    entry = best["bid"] if direction == "LONG" else best["ask"]
-    atr = best["atr"]
-    min_stop_distance = max(1.5 * atr, entry * 0.01)
-    stop = entry - min_stop_distance if direction == "LONG" else entry + min_stop_distance
-    stop = round(stop, 6)
-    risk_per_share = abs(entry - stop)
-
-    risk_percent = 0.01
-    risk_amount = balance_usdt * risk_percent
-    qty = round(risk_amount / risk_per_share, 6)
+    entry_price = best_signal.get("bid", best_signal["price"] * 0.999) if best_signal["direction"] == "LONG" else best_signal.get("ask", best_signal["price"] * 1.001)
+    atr = best_signal["atr"]
+    min_stop = max(1.5 * atr, entry_price * 0.01)
+    stop = entry_price - min_stop if best_signal["direction"] == "LONG" else entry_price + min_stop
+    risk_per_share = abs(entry_price - stop)
+    qty = round((balance_usdt * 0.01) / risk_per_share, 6)
 
     mults = [0.4, 0.8, 1.2, 1.6, 2.0]
     tps = []
-    for mult in mults:
-        if direction == "LONG":
-            tps.append(round(entry + mult * risk_per_share, 6))
+    for m in mults:
+        if best_signal["direction"] == "LONG":
+            tps.append(round(entry_price + m * risk_per_share, 6))
         else:
-            tps.append(round(entry - mult * risk_per_share, 6))
-
-    conf, hook, question = call_groq_reasoning(best["symbol"], entry, atr, best_layers, best_errors)
-    if conf < 5:
-        layer_str = "; ".join([f"{k}={v:.2f}" for k,v in best_layers.items()])
-        err_str = ""
-        if best_errors:
-            err_str = " | Errors: " + "; ".join(best_errors)
-        display_score = round(best_score, 2)
-        reason = (f"AI confidence too low ({conf}/10). Best score: {display_score:+.2f}/3 for {best['symbol']}.\n"
-                  f"Layers: {layer_str}{err_str}\n"
-                  f"All coins: {coin_summary}\n{hook}")
-        return {"action": "HOLD", "reasoning": reason, "best_candidate": best}
-
-    conviction10 = round(best_score * 10 / 3)
-    if conviction10 >= 0:
-        conviction_str = f"+{conviction10}/10"
-    else:
-        conviction_str = f"{conviction10}/10"
+            tps.append(round(entry_price - m * risk_per_share, 6))
 
     return {
-        "action": direction,
-        "symbol": best["symbol"],
+        "action": best_signal["direction"],
+        "symbol": best_signal["symbol"],
         "quantity": qty,
-        "limit_price": entry,
+        "limit_price": entry_price,
         "stop_loss": stop,
         "take_profits": tps,
-        "confidence_score": conf,
-        "hook": hook,
-        "question": question,
-        "conviction_score": round(best_score, 2),
-        "conviction10_str": conviction_str,
-        "layers": best_layers,
-        "errors": best_errors,
-        "best_candidate": best
+        "confidence_score": compute_confidence(best_signal["layers"]),
+        "hook": best_signal["hook"],
+        "question": best_signal["question"],
+        "conviction10_str": best_signal.get("conviction10_str", "0/10"),
+        "rating": best_signal["rating"],
+        "best_candidate": best_signal
     }
 
 # ========== DARK CHART (TradingView‑style) ==========
@@ -1016,23 +949,19 @@ def main():
 
             raw_symbol = dec.get('symbol', '')
             symbol_display = raw_symbol.replace("USDT", "")
-            direction_icon = "🟢" if action == "LONG" else "🔴"
             entry_price = dec.get('limit_price', 0)
             stop_price = dec.get('stop_loss', 0)
             tps = dec.get('take_profits', [])
             hook = dec.get('hook', 'Price is holding above the 50‑EMA with VWAP support.')
             question = dec.get('question', 'How are you positioning for this move?')
-            # generate a simple title based on action
             if action == "LONG":
                 title = f"📈 ${symbol_display} 4H Breakout Setup"
             else:
                 title = f"📉 ${symbol_display} 4H Breakdown Setup"
 
             sl_pct = abs(entry_price - stop_price) / entry_price * 100
-
             tp_str = " / ".join([f"{tp:,.6f}" for tp in tps])
 
-            # Binance Square compliant post
             msg = (
                 f"{title}\n"
                 f"{hook}\n\n"
