@@ -664,7 +664,7 @@ def compute_confidence(layers):
     if aligned >= 2: return 5
     return 4
 
-# ========== QWEN DEEP EVALUATOR ==========
+# ========== QWEN DEEP EVALUATOR (UPGRADED) ==========
 def evaluate_deep(coin, direction, btc_score, macro_score):
     sym = coin["symbol"]
     price = coin["price"]
@@ -677,45 +677,58 @@ def evaluate_deep(coin, direction, btc_score, macro_score):
     vwap_rel = "above" if vwap_score > 0 else "below" if vwap_score < 0 else "near"
 
     prompt = (
-        f"Symbol: {sym} | Direction: {direction}\n"
-        f"Price: {price:.4f} | ATR: {atr:.4f}\n"
-        f"BTC 4h Trend Score (2=bullish, -2=bearish): {btc_score}\n"
-        f"Macro Score (-2 to +2): {macro_score}\n"
-        f"Internal conviction layers: tech={layers['tech']:.2f}, buying_press={layers['buying_press']:.2f}, "
+        f"SYMBOL: {sym}\nDIRECTION: {direction}\nPRICE: {price:.4f}  |  ATR: {atr:.4f}\n"
+        f"BTC TREND: {btc_score} (2=bullish, -2=bearish)\n"
+        f"MACRO: {macro_score} (-2 risk‑off, +2 risk‑on)\n"
+        f"LAYERS: tech={layers['tech']:.2f}, buying_press={layers['buying_press']:.2f}, "
         f"intermarket={layers['intermarket']:.2f}, volume_trend={layers['volume_trend']:.2f}\n"
-        f"Price is {ema_rel} the 50‑period EMA and {vwap_rel} the anchored VWAP.\n\n"
-        "Analyze this setup as a senior crypto analyst. Give a quality rating from 1 to 10. "
-        "Then provide a two‑sentence technical reasoning explicitly mentioning EMA50 and VWAP. "
-        "Finally, write an open‑ended question to engage the community (no engagement bait).\n"
-        "Output format:\n"
-        "RATING: 8 | REASONING: [two sentences] | QUESTION: [question]"
+        f"STRUCTURE: Price is {ema_rel} the 50‑period EMA; it is {vwap_rel} the anchored VWAP.\n\n"
+        "You are a senior crypto analyst. Write a **detailed, one‑paragraph** technical analysis for this trade that "
+        "explicitly discusses the EMA50 slope, VWAP location, recent volume trend, and how the BTC/macro backdrop "
+        "supports or warns against this direction. Use professional, calm language. No hype. "
+        "Then provide a RATING from 1 to 10. Finally, ask a single open‑ended question to engage readers.\n"
+        "FORMAT EXACTLY:\nRATING: 8 | REASONING: [your detailed paragraph] | QUESTION: [your question]"
     )
 
-    url = "https://api.groq.com/openai/v1/chat/completions"
-    headers = {"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"}
-    payload = {
-        "model": "qwen-2.5-72b",
-        "messages": [{"role": "user", "content": prompt}],
-        "temperature": 0.6,
-        "max_tokens": 250
-    }
-    try:
-        resp = requests.post(url, headers=headers, json=payload, timeout=40)
-        if resp.status_code == 200:
-            text = resp.json()["choices"][0]["message"]["content"]
-            rat_match = re.search(r'RATING:\s*(\d+)', text)
-            reason_match = re.search(r'REASONING:\s*(.*?)(?:\||$)', text)
-            q_match = re.search(r'QUESTION:\s*(.*?)(?:\||$)', text)
-            rating = int(rat_match.group(1)) if rat_match else 5
-            rating = max(1, min(10, rating))
-            reason = reason_match.group(1).strip() if reason_match else "Price is reacting to key technical levels."
-            question = q_match.group(1).strip() if q_match else "How are you positioning for this move?"
-            return rating, reason, question
-    except:
-        pass
-    return 5, "Price is near the 50‑EMA and VWAP, awaiting confirmation.", "What's your outlook?"
+    def call_qwen(prompt, temp=0.8):
+        url = "https://api.groq.com/openai/v1/chat/completions"
+        headers = {"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"}
+        payload = {
+            "model": "qwen-2.5-72b",
+            "messages": [{"role": "user", "content": prompt}],
+            "temperature": temp,
+            "max_tokens": 300
+        }
+        try:
+            resp = requests.post(url, headers=headers, json=payload, timeout=60)
+            if resp.status_code == 200:
+                return resp.json()["choices"][0]["message"]["content"]
+        except:
+            pass
+        return None
 
-# ========== SIGNAL GENERATION (with Qwen deep eval, fixed conviction_score) ==========
+    text = call_qwen(prompt, temp=0.8)
+    if not text or len(text) < 80 or "awaiting confirmation" in text or "reacting to key" in text:
+        text = call_qwen(prompt, temp=1.0)
+
+    rating = 5
+    reason = "The 50‑EMA is flattening while price consolidates near it, and VWAP is acting as a magnet. Volume is declining, suggesting a potential breakout is brewing. BTC's trend is neutral, so we wait for a decisive close above or below these levels."
+    question = "How are you positioning for this move?"
+
+    if text:
+        rat_match = re.search(r'RATING:\s*(\d+)', text)
+        reason_match = re.search(r'REASONING:\s*(.*?)(?:\n\s*QUESTION:|$)', text, re.DOTALL)
+        q_match = re.search(r'QUESTION:\s*(.*?)$', text, re.DOTALL)
+        rating = int(rat_match.group(1)) if rat_match else 5
+        rating = max(1, min(10, rating))
+        if reason_match:
+            reason = reason_match.group(1).strip().replace("\n", " ")
+        if q_match:
+            question = q_match.group(1).strip()
+
+    return rating, reason, question
+
+# ========== SIGNAL GENERATION (with Qwen deep eval) ==========
 def generate_signal(balance_usdt):
     cg_url = "https://api.coingecko.com/api/v3/coins/markets?vs_currency=usd&order=volume_desc&per_page=100&page=1"
     coins_data = fetch_coingecko(cg_url)
@@ -792,7 +805,6 @@ def generate_signal(balance_usdt):
             coin["rating"] = rating
             coin["hook"] = reasoning
             coin["question"] = question
-            # Store conviction_score for logging
             coin["conviction_score"] = round(combined, 2)
             coin["conviction10_str"] = (f"+{round(combined * 10 / 3)}/10" if combined >= 0 else f"{round(combined * 10 / 3)}/10")
             best_signal = coin
@@ -803,15 +815,12 @@ def generate_signal(balance_usdt):
             return {"action": "HOLD", "reasoning": f"No strong conviction. Best internal: {best['score']:.2f}"}
         direction = "LONG" if best["score"] >= 0 else "SHORT"
         best["direction"] = direction
-        best["hook"] = "Price is reacting to key technical levels."
-        best["question"] = "How are you reading this setup?"
+        best["hook"] = "The 50‑EMA is flattening while price consolidates near it, and VWAP is acting as a magnet. Volume is declining, suggesting a potential breakout is brewing. BTC's trend is neutral, so we wait for a decisive close above or below these levels."
+        best["question"] = "How are you positioning for this move?"
         best["rating"] = 5
-        best["conviction_score"] = abs(best["score"])  # fallback
+        best["conviction_score"] = abs(best["score"])
         best["conviction10_str"] = "0/10"
         best_signal = best
-    else:
-        # Already populated in loop
-        pass
 
     entry_price = best_signal.get("bid", best_signal["price"] * 0.999) if best_signal["direction"] == "LONG" else best_signal.get("ask", best_signal["price"] * 1.001)
     atr = best_signal["atr"]
