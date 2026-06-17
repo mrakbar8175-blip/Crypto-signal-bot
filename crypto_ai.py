@@ -228,7 +228,7 @@ def get_technicals(symbol_usdt):
     try:
         df = get_yahoo_klines(symbol_usdt, interval='4h', days=14)
         if df.empty or len(df) < 50:
-            return {"combined":0, "trend_dir":"up", "adx":0}
+            return {"combined":0, "trend_dir":"up", "adx":0, "di_plus":0, "di_minus":0}
         closes = df['Close']
         highs, lows = df['High'], df['Low']
         ema50 = safe_ema(closes, 50)
@@ -248,7 +248,9 @@ def get_technicals(symbol_usdt):
             return safe_ema(dx, span=period), di_plus, di_minus
         adx_s, di_p, di_m = adx(highs, lows, closes)
         adx_now = adx_s.iloc[-1] if not adx_s.empty else 0
-        adx_score = 2.5 if adx_now>25 and di_p.iloc[-1]>di_m.iloc[-1] else (-2.5 if adx_now>25 else (1.0 if adx_now>20 and di_p.iloc[-1]>di_m.iloc[-1] else (-1.0 if adx_now>20 else 0)))
+        di_plus_now = di_p.iloc[-1] if not di_p.empty else 0
+        di_minus_now = di_m.iloc[-1] if not di_m.empty else 0
+        adx_score = 2.5 if adx_now>25 and di_plus_now>di_minus_now else (-2.5 if adx_now>25 else (1.0 if adx_now>20 and di_plus_now>di_minus_now else (-1.0 if adx_now>20 else 0)))
         window=7; lookback=min(50,len(highs))
         rh=highs.iloc[-lookback:]; rl=lows.iloc[-lookback:]
         sh, sl = [], []
@@ -265,10 +267,10 @@ def get_technicals(symbol_usdt):
         structure = max(-3, min(3, structure))
         combined = trend*0.30 + adx_score*0.25 + structure*0.45
         trend_dir = "up" if current > ema50.iloc[-1] else "down"
-        return {"combined":combined, "trend_dir":trend_dir, "adx":adx_now}
+        return {"combined":combined, "trend_dir":trend_dir, "adx":adx_now, "di_plus":di_plus_now, "di_minus":di_minus_now}
     except Exception as e:
         print(f"tech error {symbol_usdt}: {e}")
-        return {"combined":0, "trend_dir":"up", "adx":0}
+        return {"combined":0, "trend_dir":"up", "adx":0, "di_plus":0, "di_minus":0}
 
 def get_4h_atr(symbol_usdt, current_price):
     try:
@@ -309,7 +311,7 @@ def btc_trend_score():
     except:
         return 0, "BTC error"
 
-# ========== CANDLE STRENGTH (bonus) ==========
+# ========== EXISTING BONUS: CANDLE STRENGTH ==========
 def candle_strength_score(symbol_usdt, direction, atr):
     try:
         df = get_yahoo_klines(symbol_usdt, interval='4h', days=2)
@@ -323,7 +325,39 @@ def candle_strength_score(symbol_usdt, direction, atr):
         pass
     return 0
 
-# ========== SCORING ENGINE ==========
+# ========== NEW BONUSES: MOMENTUM & CANDLE CONVICTION ==========
+def momentum_bonus(tech, direction):
+    try:
+        adx = tech.get("adx", 0)
+        di_plus = tech.get("di_plus", 0)
+        di_minus = tech.get("di_minus", 0)
+        if adx > 25:
+            if direction == "LONG" and di_plus > di_minus:
+                return 0.15
+            if direction == "SHORT" and di_minus > di_plus:
+                return 0.15
+    except:
+        pass
+    return 0
+
+def candle_conviction_bonus(symbol_usdt, direction):
+    try:
+        df = get_yahoo_klines(symbol_usdt, interval='4h', days=2)
+        if df.empty or len(df) < 1: return 0
+        last = df.iloc[-1]
+        candle_range = last['High'] - last['Low']
+        if candle_range <= 0: return 0
+        if direction == "LONG":
+            close_pct = (last['Close'] - last['Low']) / candle_range
+            if close_pct >= 0.60: return 0.10
+        else:  # SHORT
+            close_pct = (last['High'] - last['Close']) / candle_range
+            if close_pct >= 0.60: return 0.10
+    except:
+        pass
+    return 0
+
+# ========== SCORING ENGINE (with new bonuses) ==========
 def score_coin(symbol, price, volume, btc_score, btc_err, macro_score):
     try:
         tech = get_technicals(symbol)
@@ -342,6 +376,9 @@ def score_coin(symbol, price, volume, btc_score, btc_err, macro_score):
         total += vwap_score * 0.1
         direction = "LONG" if total >= 0 else "SHORT"
         total += candle_strength_score(symbol, direction, atr_val)
+        # New bonuses for 0.5R win rate
+        total += momentum_bonus(tech, direction)
+        total += candle_conviction_bonus(symbol, direction)
         layers = {
             "tech": tech_combined,
             "buying_press": buying_score,
@@ -362,7 +399,7 @@ def compute_confidence(layers):
     if aligned>=2: return 5
     return 4
 
-# ========== VIRAL BINANCE SQUARE POST (ANTI‑TEMPLATE) ==========
+# ========== VIRAL BINANCE SQUARE POST ==========
 def generate_post(coin, direction, entry, stop, tps, sl_pct):
     sym = coin["symbol"]; ticker = sym.replace("USDT","")
     price = coin["price"]; atr = coin["atr"]; layers = coin["layers"]
@@ -375,7 +412,6 @@ def generate_post(coin, direction, entry, stop, tps, sl_pct):
     btc_bullish = btc_trend_score()[0] > 0
     btc_text = "bullish" if btc_bullish else "bearish"
 
-    # TP string
     tp_str = f"{tps[0]:.6f} (0.5R) / {tps[1]:.6f} (1R) / {tps[2]:.6f} (2R) / {tps[3]:.6f} (3R) / {tps[4]:.6f} (5R)"
 
     system_msg = (
@@ -427,7 +463,6 @@ def generate_post(coin, direction, entry, stop, tps, sl_pct):
     if not text or len(text) < 150:
         text = call_qwen(system_msg, user_prompt, 1.1)
 
-    # Fallback (extremely rare) – now varied per coin
     if not text:
         hooks = [
             f"I've been watching ${ticker} closely – the technicals just lined up in a way I can't ignore. ⚡",
@@ -558,7 +593,7 @@ def check_open_trades():
     save_portfolio(portfolio)
     if alerts: send_telegram("\n".join(alerts))
 
-# ========== SIGNAL GENERATION (threshold 1.49, 5 TPs) ==========
+# ========== SIGNAL GENERATION (threshold 1.49) ==========
 def generate_signal(balance_usdt):
     try:
         coins_data = fetch_coingecko("https://api.coingecko.com/api/v3/coins/markets?vs_currency=usd&order=volume_desc&per_page=100&page=1")
