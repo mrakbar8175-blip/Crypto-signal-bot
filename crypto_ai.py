@@ -48,7 +48,7 @@ TRADE_LOG_CSV = "trade_log.csv"
 OPEN_TRADES_CSV = "open_trades.csv"
 TRADE_RESULTS_CSV = "trade_results.csv"
 
-# ========== DATA HELPERS (bulletproof) ==========
+# ========== DATA HELPERS ==========
 def fetch_coingecko(url, retries=2):
     for attempt in range(retries):
         try:
@@ -159,14 +159,13 @@ def update_portfolio(trade_result):
     portfolio['realized_pnl'] += trade_result['pnl_usdt']
     save_portfolio(portfolio)
 
-# ========== SAFE INDICATORS ==========
+# ========== SIMPLIFIED INDICATORS (noise removed) ==========
 def safe_ema(series, span):
     try:
         return series.ewm(span=span, adjust=False).mean()
     except:
         return pd.Series(index=series.index)
 
-# ========== MACRO & TECHNICALS (all try‑wrapped) ==========
 def institutional_macro_filter():
     try:
         df_btc = get_yahoo_klines("BTCUSDT", interval='4h', days=14)
@@ -284,7 +283,8 @@ def get_volatility_score(symbol_usdt, price):
     try:
         atr = get_4h_atr(symbol_usdt, price)
         atr_pct = atr/price*100
-        return -1 if atr_pct<2 or atr_pct>7 else 1
+        if atr_pct > 7: return -1   # only penalise extreme volatility
+        return 1
     except:
         return 0
 
@@ -302,44 +302,7 @@ def btc_trend_score():
     except:
         return 0, "BTC error"
 
-def volume_trend_score(symbol_usdt, direction=None):
-    try:
-        df = get_yahoo_klines(symbol_usdt, interval='4h', days=5)
-        if df.empty or len(df)<12: return 0,"vol data insufficient"
-        recent = df['Volume'].tail(6)
-        first, second = recent[:3].mean(), recent[3:].mean()
-        if second > first*1.05: return -2 if direction=="down" else 2
-        elif second < first*0.95: return -2 if direction=="up" else -2
-        return 0,None
-    except:
-        return 0, "vol error"
-
-def momentum_alignment_score(symbol_usdt, direction, layers):
-    try:
-        df = get_yahoo_klines(symbol_usdt, interval='4h', days=2)
-        if df.empty or len(df)<2: return 0
-        last = df.iloc[-1]
-        agrees = (direction=="LONG" and last['Close']>last['Open']) or (direction=="SHORT" and last['Close']<last['Open'])
-        if not agrees: return 0
-        support=0
-        if direction=="LONG":
-            if layers.get("buying_press",0)>0.5: support+=1
-            if layers.get("intermarket",0)>0.5: support+=1
-            if layers.get("volume_trend",0)>0.5: support+=1
-        else:
-            if layers.get("buying_press",0)<-0.5: support+=1
-            if layers.get("intermarket",0)<-0.5: support+=1
-            if layers.get("volume_trend",0)<-0.5: support+=1
-        return 0.20 if support>=2 and direction=="LONG" else (-0.20 if support>=2 else 0)
-    except:
-        return 0
-
-def trend_strength_bonus(adx, base):
-    if adx>35 and abs(base)>0.5: return 0.30*(1 if base>0 else -1)
-    elif adx>30 and abs(base)>0.5: return 0.20*(1 if base>0 else -1)
-    return 0
-
-# ========== NEW LAYERS ==========
+# ========== CANDLE STRENGTH (only extra layer) ==========
 def candle_strength_score(symbol_usdt, direction, atr):
     try:
         df = get_yahoo_klines(symbol_usdt, interval='4h', days=2)
@@ -353,43 +316,7 @@ def candle_strength_score(symbol_usdt, direction, atr):
         pass
     return 0
 
-def volume_spike_score(symbol_usdt, direction):
-    try:
-        df = get_yahoo_klines(symbol_usdt, interval='4h', days=5)
-        if df.empty or len(df) < 20: return 0
-        avg_vol = df['Volume'].tail(20).mean()
-        last_vol = df['Volume'].iloc[-1]
-        if last_vol < 1.5*avg_vol: return 0
-        last = df.iloc[-1]
-        if direction == "LONG" and last['Close'] > last['Open']: return 0.10
-        if direction == "SHORT" and last['Close'] < last['Open']: return 0.10
-    except:
-        pass
-    return 0
-
-def level_proximity_score(symbol_usdt, price, atr, direction):
-    try:
-        df = get_yahoo_klines(symbol_usdt, interval='4h', days=14)
-        if df.empty or len(df) < 50: return 0
-        highs = df['High']; lows = df['Low']
-        window=7; lookback=min(50,len(highs))
-        rh=highs.iloc[-lookback:]; rl=lows.iloc[-lookback:]
-        sh, sl = [], []
-        for i in range(window, len(rh)-window):
-            if all(rh.iloc[i] >= rh.iloc[i-window:i+window+1]): sh.append(rh.iloc[i])
-            if all(rl.iloc[i] <= rl.iloc[i-window:i+window+1]): sl.append(rl.iloc[i])
-        if not sh or not sl: return 0
-        nearest_high = max(sh) if sh else price
-        nearest_low = min(sl) if sl else price
-        if direction == "LONG":
-            if price - nearest_low < atr: return 0.10
-        else:
-            if nearest_high - price < atr: return 0.10
-    except:
-        pass
-    return 0
-
-# ========== SCORING ENGINE ==========
+# ========== SCORING ENGINE (clean) ==========
 def score_coin(symbol, price, volume, btc_score, btc_err, macro_score):
     try:
         tech = get_technicals(symbol)
@@ -397,25 +324,32 @@ def score_coin(symbol, price, volume, btc_score, btc_err, macro_score):
         buying_score, _ = get_buying_pressure(symbol)
         vol_score = get_volatility_score(symbol, price)
         intermarket = btc_score if btc_score else 0
-        vol_trend_s, _ = volume_trend_score(symbol, trend_dir)
         df_vwap = get_yahoo_klines(symbol, interval='4h', days=14)
         vwap_score = anchored_vwap_score(df_vwap, price)
         atr_val = get_4h_atr(symbol, price)
-        total = 0.20*tech_combined + 0.45*buying_score + 0.05*vol_score + 0.25*intermarket + 0.05*vol_trend_s
-        total *= (1 + 0.15*macro_score)
-        total += vwap_score*0.1
+        # Weights unchanged
+        total = (0.20 * tech_combined +
+                 0.45 * buying_score +
+                 0.05 * vol_score +
+                 0.25 * intermarket)
+        # no volume_trend
+        total *= (1 + 0.15 * macro_score)
+        total += vwap_score * 0.1
         direction = "LONG" if total >= 0 else "SHORT"
         total += candle_strength_score(symbol, direction, atr_val)
-        total += volume_spike_score(symbol, direction)
-        total += level_proximity_score(symbol, price, atr_val, direction)
-        layers = {"tech":tech_combined,"buying_press":buying_score,"volatility":vol_score,"intermarket":intermarket,"volume_trend":vol_trend_s}
+        layers = {
+            "tech": tech_combined,
+            "buying_press": buying_score,
+            "volatility": vol_score,
+            "intermarket": intermarket
+        }
         return max(-3, min(3, total)), layers, trend_dir, adx
     except Exception as e:
         print(f"score_coin error {symbol}: {e}")
-        return 0, {"tech":0,"buying_press":0,"volatility":0,"intermarket":0,"volume_trend":0}, "up", 0
+        return 0, {"tech":0,"buying_press":0,"volatility":0,"intermarket":0}, "up", 0
 
 def compute_confidence(layers):
-    scores = [layers[k] for k in ["tech","buying_press","intermarket","volume_trend"]]
+    scores = [layers.get("tech",0), layers.get("buying_press",0), layers.get("intermarket",0)]
     bear = sum(1 for s in scores if s<-0.5); bull = sum(1 for s in scores if s>0.5)
     aligned = max(bear,bull)
     if aligned>=4: return 7
@@ -432,13 +366,13 @@ def generate_post(coin, direction, btc_score, macro_score):
     ema_slope = "rising" if trend_dir=="up" else "falling"
     vwap_score = anchored_vwap_score(get_yahoo_klines(sym, interval='4h', days=14), price)
     vwap_rel = "above" if vwap_score>0 else "below" if vwap_score<0 else "near"
-    vol_trend = "increasing" if layers["volume_trend"]>0 else "decreasing" if layers["volume_trend"]<0 else "flat"
+    vol_desc = "increasing" if candle_strength_score(sym,direction,atr) else "steady"
     btc_bullish = btc_score>0
     btc_text = "bullish" if btc_bullish else "bearish"
 
     prompt = (
         f"Write a unique Binance Square post for ${ticker} ({direction} setup). "
-        f"Chart: 4h, EMA50 {ema_rel} & {ema_slope}, VWAP {vwap_rel}, volume {vol_trend}, BTC {btc_text}. "
+        f"Chart: 4h, EMA50 {ema_rel} & {ema_slope}, VWAP {vwap_rel}, volume {vol_desc}, BTC {btc_text}. "
         "Never reuse previous hooks. Structure: 1. Hook, 2. Chart reading, 3. Risk levels, 4. CTA & footer. Output only the post."
     )
 
@@ -462,7 +396,7 @@ def generate_post(coin, direction, btc_score, macro_score):
             hook = f"${ticker} is losing steam at resistance."
         text = (
             f"{hook}\n\n"
-            f"EMA50 is {ema_slope}, price {ema_rel} it. VWAP acts as {vwap_rel}. Volume {vol_trend}. "
+            f"EMA50 is {ema_slope}, price {ema_rel} it. VWAP acts as {vwap_rel}. Volume {vol_desc}. "
             f"BTC is {btc_text}, {'supporting' if btc_bullish else 'weighing on'} altcoins.\n\n"
             f"🟢 {direction} Setup Structure:\n"
             f"• Area of Interest: [insert]\n"
@@ -535,7 +469,7 @@ def check_open_trades():
     save_portfolio(portfolio)
     if alerts: send_telegram("\n".join(alerts))
 
-# ========== SIGNAL GENERATION (with TP2, layer details, error flags) ==========
+# ========== SIGNAL GENERATION (threshold 1.49, clean layers) ==========
 def generate_signal(balance_usdt):
     try:
         coins_data = fetch_coingecko("https://api.coingecko.com/api/v3/coins/markets?vs_currency=usd&order=volume_desc&per_page=100&page=1")
@@ -565,7 +499,6 @@ def generate_signal(balance_usdt):
         for coin in candidates:
             total, layers, trend_dir, adx = score_coin(coin["symbol"], coin["price"], coin["volume"], btc_score, btc_err, macro)
             atr = get_4h_atr(coin["symbol"], coin["price"])
-            if atr/coin["price"] > 0.07: total = 0
             coin["score"] = total; coin["atr"] = atr; coin["layers"] = layers; coin["trend_dir"] = trend_dir; coin["adx"] = adx
             all_scored.append(coin)
         if not all_scored: return {"action":"HOLD","reasoning":"No valid scores.","summary":""}
