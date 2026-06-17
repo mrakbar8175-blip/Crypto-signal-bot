@@ -75,6 +75,9 @@ def get_yahoo_klines(symbol_usdt, interval='4h', days=60, start=None, end=None):
             return pd.DataFrame()
         if isinstance(df.columns, pd.MultiIndex):
             df.columns = df.columns.get_level_values(0)
+        # Ensure required columns exist
+        if not {'Open','High','Low','Close','Volume'}.issubset(df.columns):
+            return pd.DataFrame()
         return df
     except:
         return pd.DataFrame()
@@ -155,7 +158,7 @@ def update_portfolio(trade_result):
     portfolio['realized_pnl'] += trade_result['pnl_usdt']
     save_portfolio(portfolio)
 
-# ========== MACRO & TECHNICALS ==========
+# ========== MACRO & TECHNICALS (all safe) ==========
 def institutional_macro_filter():
     df_btc = get_yahoo_klines("BTCUSDT", interval='4h', days=14)
     if df_btc.empty or len(df_btc) < 50: return 0
@@ -176,79 +179,93 @@ def institutional_macro_filter():
     return max(-2, min(2, macro))
 
 def anchored_vwap_score(df, current_price):
-    if len(df) < 50: return 0
-    typical = (df['High'] + df['Low'] + df['Close']) / 3
-    df['vpv'] = typical * df['Volume']
-    total_vol = df['Volume'].sum()
-    if total_vol == 0: return 0
-    vwap = df['vpv'].sum() / total_vol
-    dev = (current_price - vwap) / vwap * 100
-    return 1 if dev > 1 else (-1 if dev < -1 else 0)
+    if df.empty or len(df) < 50: return 0
+    try:
+        typical = (df['High'] + df['Low'] + df['Close']) / 3
+        df = df.copy()
+        df['vpv'] = typical * df['Volume']
+        total_vol = df['Volume'].sum()
+        if total_vol == 0: return 0
+        vwap = df['vpv'].sum() / total_vol
+        dev = (current_price - vwap) / vwap * 100
+        return 1 if dev > 1 else (-1 if dev < -1 else 0)
+    except:
+        return 0
 
 def refined_buying_pressure(symbol_usdt):
     df = get_yahoo_klines(symbol_usdt, interval='4h', days=10)
     if df.empty or len(df) < 48: return 0,0
-    short = df.tail(12)
-    s_buy = short.loc[short['Close'] > short['Open'], 'Volume'].sum()
-    s_sell = short.loc[short['Close'] <= short['Open'], 'Volume'].sum()
-    s_tot = s_buy + s_sell
-    sp = (s_buy - s_sell)/s_tot if s_tot > 0 else 0
-    long = df.tail(48)
-    l_buy = long.loc[long['Close'] > long['Open'], 'Volume'].sum()
-    l_sell = long.loc[long['Close'] <= long['Open'], 'Volume'].sum()
-    l_tot = l_buy + l_sell
-    lp = (l_buy - l_sell)/l_tot if l_tot > 0 else 0
-    return sp, lp
+    try:
+        short = df.tail(12)
+        s_buy = short.loc[short['Close'] > short['Open'], 'Volume'].sum()
+        s_sell = short.loc[short['Close'] <= short['Open'], 'Volume'].sum()
+        s_tot = s_buy + s_sell
+        sp = (s_buy - s_sell)/s_tot if s_tot > 0 else 0
+        long = df.tail(48)
+        l_buy = long.loc[long['Close'] > long['Open'], 'Volume'].sum()
+        l_sell = long.loc[long['Close'] <= long['Open'], 'Volume'].sum()
+        l_tot = l_buy + l_sell
+        lp = (l_buy - l_sell)/l_tot if l_tot > 0 else 0
+        return sp, lp
+    except:
+        return 0, 0
 
 def get_technicals(symbol_usdt):
     df = get_yahoo_klines(symbol_usdt, interval='4h', days=14)
     if df.empty or len(df) < 50:
-        return {"combined":0, "trend_dir":"up", "error":"insufficient data"}
-    closes = df['Close']
-    highs, lows = df['High'], df['Low']
-    ema50 = closes.ewm(span=50, adjust=False).mean()
-    ema200 = closes.ewm(span=200, adjust=False).mean() if len(closes) >= 200 else ema50
-    current = closes.iloc[-1]
-    trend = 1.5 if current > ema50.iloc[-1] else -1.5
-    trend += 1.5 if ema50.iloc[-1] > ema200.iloc[-1] else -1.5
-    trend = max(-3, min(3, trend))
-    def adx(high, low, close, period=14):
-        dm_plus = high.diff(); dm_minus = -low.diff()
-        dm_plus[dm_plus<0]=0; dm_minus[dm_minus<0]=0
-        tr = pd.concat([high-low, (high-close.shift()).abs(), (low-close.shift()).abs()], axis=1).max(axis=1)
-        atr = tr.ewm(alpha=1/period, adjust=False).mean()
-        di_plus = 100 * (dm_plus.ewm(alpha=1/period, adjust=False).mean() / atr)
-        di_minus = 100 * (dm_minus.ewm(alpha=1/period, adjust=False).mean() / atr)
-        dx = 100 * (di_plus - di_minus).abs() / (di_plus + di_minus)
-        return dx.ewm(alpha=1/period, adjust=False).mean(), di_plus, di_minus
-    adx_s, di_p, di_m = adx(highs, lows, closes)
-    adx_now = adx_s.iloc[-1]
-    adx_score = 2.5 if adx_now>25 and di_p.iloc[-1]>di_m.iloc[-1] else (-2.5 if adx_now>25 else (1.0 if adx_now>20 and di_p.iloc[-1]>di_m.iloc[-1] else (-1.0 if adx_now>20 else 0)))
-    window=7; lookback=min(50,len(highs))
-    rh=highs.iloc[-lookback:]; rl=lows.iloc[-lookback:]
-    sh, sl = [], []
-    for i in range(window,len(rh)-window):
-        if all(rh.iloc[i] >= rh.iloc[i-window:i+window+1]): sh.append((i,rh.iloc[i]))
-        if all(rl.iloc[i] <= rl.iloc[i-window:i+window+1]): sl.append((i,rl.iloc[i]))
-    structure=0
-    if len(sh)>=2 and len(sl)>=2:
-        last_hh = sh[-1][1] > sh[-2][1]; last_hl = sl[-1][1] > sl[-2][1]
-        if last_hh and last_hl:
-            structure = 3.0 if (len(sh)>=3 and sh[-2][1]>sh[-3][1] and len(sl)>=3 and sl[-2][1]>sl[-3][1]) else 2.0
-        elif not last_hh and not last_hl:
-            structure = -3.0 if (len(sh)>=3 and sh[-2][1]<sh[-3][1] and len(sl)>=3 and sl[-2][1]<sl[-3][1]) else -2.0
-    structure = max(-3, min(3, structure))
-    combined = trend*0.30 + adx_score*0.25 + structure*0.45
-    trend_dir = "up" if current > ema50.iloc[-1] else "down"
-    return {"combined":combined, "trend_dir":trend_dir, "adx":adx_now, "error":None}
+        return {"combined":0, "trend_dir":"up", "adx":0, "error":"insufficient data"}
+    try:
+        closes = df['Close']
+        highs, lows = df['High'], df['Low']
+        ema50 = closes.ewm(span=50, adjust=False).mean()
+        ema200 = closes.ewm(span=200, adjust=False).mean() if len(closes) >= 200 else ema50
+        current = closes.iloc[-1]
+        trend = 1.5 if current > ema50.iloc[-1] else -1.5
+        trend += 1.5 if ema50.iloc[-1] > ema200.iloc[-1] else -1.5
+        trend = max(-3, min(3, trend))
+        def adx(high, low, close, period=14):
+            dm_plus = high.diff(); dm_minus = -low.diff()
+            dm_plus[dm_plus<0]=0; dm_minus[dm_minus<0]=0
+            tr = pd.concat([high-low, (high-close.shift()).abs(), (low-close.shift()).abs()], axis=1).max(axis=1)
+            atr = tr.ewm(alpha=1/period, adjust=False).mean()
+            di_plus = 100 * (dm_plus.ewm(alpha=1/period, adjust=False).mean() / atr)
+            di_minus = 100 * (dm_minus.ewm(alpha=1/period, adjust=False).mean() / atr)
+            dx = 100 * (di_plus - di_minus).abs() / (di_plus + di_minus)
+            return dx.ewm(alpha=1/period, adjust=False).mean(), di_plus, di_minus
+        adx_s, di_p, di_m = adx(highs, lows, closes)
+        adx_now = adx_s.iloc[-1]
+        adx_score = 2.5 if adx_now>25 and di_p.iloc[-1]>di_m.iloc[-1] else (-2.5 if adx_now>25 else (1.0 if adx_now>20 and di_p.iloc[-1]>di_m.iloc[-1] else (-1.0 if adx_now>20 else 0)))
+        window=7; lookback=min(50,len(highs))
+        rh=highs.iloc[-lookback:]; rl=lows.iloc[-lookback:]
+        sh, sl = [], []
+        for i in range(window,len(rh)-window):
+            if all(rh.iloc[i] >= rh.iloc[i-window:i+window+1]): sh.append((i,rh.iloc[i]))
+            if all(rl.iloc[i] <= rl.iloc[i-window:i+window+1]): sl.append((i,rl.iloc[i]))
+        structure=0
+        if len(sh)>=2 and len(sl)>=2:
+            last_hh = sh[-1][1] > sh[-2][1]; last_hl = sl[-1][1] > sl[-2][1]
+            if last_hh and last_hl:
+                structure = 3.0 if (len(sh)>=3 and sh[-2][1]>sh[-3][1] and len(sl)>=3 and sl[-2][1]>sl[-3][1]) else 2.0
+            elif not last_hh and not last_hl:
+                structure = -3.0 if (len(sh)>=3 and sh[-2][1]<sh[-3][1] and len(sl)>=3 and sl[-2][1]<sl[-3][1]) else -2.0
+        structure = max(-3, min(3, structure))
+        combined = trend*0.30 + adx_score*0.25 + structure*0.45
+        trend_dir = "up" if current > ema50.iloc[-1] else "down"
+        return {"combined":combined, "trend_dir":trend_dir, "adx":adx_now, "error":None}
+    except Exception as e:
+        print(f"tech error {symbol_usdt}: {e}")
+        return {"combined":0, "trend_dir":"up", "adx":0, "error":str(e)}
 
 def get_4h_atr(symbol_usdt, current_price):
     df = get_yahoo_klines(symbol_usdt, interval='4h', days=14)
     if df.empty or len(df) < 14: return current_price*0.02
-    high,low,close = df['High'],df['Low'],df['Close']
-    tr = pd.concat([high-low, (high-close.shift()).abs(), (low-close.shift()).abs()], axis=1).max(axis=1)
-    atr = tr.rolling(14).mean().iloc[-1]
-    return atr if not pd.isna(atr) else current_price*0.02
+    try:
+        high,low,close = df['High'],df['Low'],df['Close']
+        tr = pd.concat([high-low, (high-close.shift()).abs(), (low-close.shift()).abs()], axis=1).max(axis=1)
+        atr = tr.rolling(14).mean().iloc[-1]
+        return atr if not pd.isna(atr) else current_price*0.02
+    except:
+        return current_price*0.02
 
 def get_buying_pressure(symbol_usdt):
     sp,lp = refined_buying_pressure(symbol_usdt)
@@ -302,68 +319,80 @@ def trend_strength_bonus(adx, base):
     elif adx>30 and abs(base)>0.5: return 0.20*(1 if base>0 else -1)
     return 0
 
-# ========== NEW LAYERS ==========
+# ========== NEW LAYERS (safe) ==========
 def candle_strength_score(symbol_usdt, direction, atr):
     df = get_yahoo_klines(symbol_usdt, interval='4h', days=2)
     if df.empty or len(df) < 1: return 0
-    last = df.iloc[-1]
-    candle_range = last['High'] - last['Low']
-    if candle_range < 0.5*atr: return 0
-    if direction == "LONG" and last['Close'] > last['Open']: return 0.10
-    if direction == "SHORT" and last['Close'] < last['Open']: return 0.10
+    try:
+        last = df.iloc[-1]
+        candle_range = last['High'] - last['Low']
+        if candle_range < 0.5*atr: return 0
+        if direction == "LONG" and last['Close'] > last['Open']: return 0.10
+        if direction == "SHORT" and last['Close'] < last['Open']: return 0.10
+    except:
+        pass
     return 0
 
 def volume_spike_score(symbol_usdt, direction):
     df = get_yahoo_klines(symbol_usdt, interval='4h', days=5)
     if df.empty or len(df) < 20: return 0
-    avg_vol = df['Volume'].tail(20).mean()
-    last_vol = df['Volume'].iloc[-1]
-    if last_vol < 1.5*avg_vol: return 0
-    last = df.iloc[-1]
-    if direction == "LONG" and last['Close'] > last['Open']: return 0.10
-    if direction == "SHORT" and last['Close'] < last['Open']: return 0.10
+    try:
+        avg_vol = df['Volume'].tail(20).mean()
+        last_vol = df['Volume'].iloc[-1]
+        if last_vol < 1.5*avg_vol: return 0
+        last = df.iloc[-1]
+        if direction == "LONG" and last['Close'] > last['Open']: return 0.10
+        if direction == "SHORT" and last['Close'] < last['Open']: return 0.10
+    except:
+        pass
     return 0
 
 def level_proximity_score(symbol_usdt, price, atr, direction):
     df = get_yahoo_klines(symbol_usdt, interval='4h', days=14)
     if df.empty or len(df) < 50: return 0
-    highs = df['High']; lows = df['Low']
-    window=7; lookback=min(50,len(highs))
-    rh=highs.iloc[-lookback:]; rl=lows.iloc[-lookback:]
-    sh, sl = [], []
-    for i in range(window, len(rh)-window):
-        if all(rh.iloc[i] >= rh.iloc[i-window:i+window+1]): sh.append(rh.iloc[i])
-        if all(rl.iloc[i] <= rl.iloc[i-window:i+window+1]): sl.append(rl.iloc[i])
-    if not sh or not sl: return 0
-    nearest_high = max(sh) if sh else price
-    nearest_low = min(sl) if sl else price
-    if direction == "LONG":
-        if price - nearest_low < atr: return 0.10
-    else:
-        if nearest_high - price < atr: return 0.10
+    try:
+        highs = df['High']; lows = df['Low']
+        window=7; lookback=min(50,len(highs))
+        rh=highs.iloc[-lookback:]; rl=lows.iloc[-lookback:]
+        sh, sl = [], []
+        for i in range(window, len(rh)-window):
+            if all(rh.iloc[i] >= rh.iloc[i-window:i+window+1]): sh.append(rh.iloc[i])
+            if all(rl.iloc[i] <= rl.iloc[i-window:i+window+1]): sl.append(rl.iloc[i])
+        if not sh or not sl: return 0
+        nearest_high = max(sh) if sh else price
+        nearest_low = min(sl) if sl else price
+        if direction == "LONG":
+            if price - nearest_low < atr: return 0.10
+        else:
+            if nearest_high - price < atr: return 0.10
+    except:
+        pass
     return 0
 
-# ========== SCORING (with new layers) ==========
+# ========== SCORING ENGINE (robust) ==========
 def score_coin(symbol, price, volume, btc_score, btc_err, macro_score):
-    errors = []
-    tech = get_technicals(symbol)
-    tech_combined = tech["combined"]; trend_dir = tech["trend_dir"]; adx = tech.get("adx",0)
-    buying_score, _ = get_buying_pressure(symbol)
-    vol_score = get_volatility_score(symbol, price)
-    intermarket = btc_score
-    vol_trend_s, _ = volume_trend_score(symbol, trend_dir)
-    df_vwap = get_yahoo_klines(symbol, interval='4h', days=14)
-    vwap_score = anchored_vwap_score(df_vwap, price)
-    atr_val = get_4h_atr(symbol, price)
-    total = 0.20*tech_combined + 0.45*buying_score + 0.05*vol_score + 0.25*intermarket + 0.05*vol_trend_s
-    total *= (1 + 0.15*macro_score)
-    total += vwap_score*0.1
-    direction = "LONG" if total >= 0 else "SHORT"
-    total += candle_strength_score(symbol, direction, atr_val)
-    total += volume_spike_score(symbol, direction)
-    total += level_proximity_score(symbol, price, atr_val, direction)
-    layers = {"tech":tech_combined,"buying_press":buying_score,"volatility":vol_score,"intermarket":intermarket,"volume_trend":vol_trend_s}
-    return max(-3, min(3, total)), layers, trend_dir, adx
+    try:
+        tech = get_technicals(symbol)
+        tech_combined = tech.get("combined",0); trend_dir = tech.get("trend_dir","up"); adx = tech.get("adx",0)
+        buying_score, _ = get_buying_pressure(symbol)
+        vol_score = get_volatility_score(symbol, price)
+        intermarket = btc_score if btc_score else 0
+        vol_trend_s, _ = volume_trend_score(symbol, trend_dir)
+        df_vwap = get_yahoo_klines(symbol, interval='4h', days=14)
+        vwap_score = anchored_vwap_score(df_vwap, price)
+        atr_val = get_4h_atr(symbol, price)
+        total = 0.20*tech_combined + 0.45*buying_score + 0.05*vol_score + 0.25*intermarket + 0.05*vol_trend_s
+        total *= (1 + 0.15*macro_score)
+        total += vwap_score*0.1
+        direction = "LONG" if total >= 0 else "SHORT"
+        total += candle_strength_score(symbol, direction, atr_val)
+        total += volume_spike_score(symbol, direction)
+        total += level_proximity_score(symbol, price, atr_val, direction)
+        layers = {"tech":tech_combined,"buying_press":buying_score,"volatility":vol_score,"intermarket":intermarket,"volume_trend":vol_trend_s}
+        return max(-3, min(3, total)), layers, trend_dir, adx
+    except Exception as e:
+        print(f"score_coin error {symbol}: {e}")
+        return 0, {"tech":0,"buying_press":0,"volatility":0,"intermarket":0,"volume_trend":0}, "up", 0
 
 def compute_confidence(layers):
     scores = [layers[k] for k in ["tech","buying_press","intermarket","volume_trend"]]
@@ -374,11 +403,11 @@ def compute_confidence(layers):
     if aligned>=2: return 5
     return 4
 
-# ========== QWEN POST (MORE VARIETY) ==========
+# ========== QWEN POST (high variety) ==========
 def generate_post(coin, direction, btc_score, macro_score):
     sym = coin["symbol"]; ticker = sym.replace("USDT","")
     price = coin["price"]; atr = coin["atr"]; layers = coin["layers"]
-    tech = get_technicals(sym); trend_dir = tech["trend_dir"]
+    tech = get_technicals(sym); trend_dir = tech.get("trend_dir","up")
     ema_rel = "above" if trend_dir=="up" else "below"
     ema_slope = "rising" if trend_dir=="up" else "falling"
     vwap_score = anchored_vwap_score(get_yahoo_klines(sym, interval='4h', days=14), price)
@@ -387,62 +416,43 @@ def generate_post(coin, direction, btc_score, macro_score):
     btc_bullish = btc_score>0
     btc_text = "bullish" if btc_bullish else "bearish"
 
-    # Stronger anti-template prompt
     prompt = (
-        f"You are a professional Crypto Analyst writing a unique Binance Square post for ${ticker} ({direction} setup). "
-        f"The 4‑hour chart shows: price is {ema_rel} the 50‑EMA and the EMA is {ema_slope}. "
-        f"Anchored VWAP is {vwap_rel} price. Volume is {vol_trend}. $BTC is {btc_text} on its 4‑hour chart. "
-        "CRITICAL INSTRUCTIONS: Never start with the same phrase twice. Vary your vocabulary, sentence structure, and hook completely. "
-        "Write the 4 sections: 1. Compliant Hook, 2. Humanised Chart Reading (explain the EMA, VWAP, volume, BTC context), "
-        "3. Risk‑Managed Levels (use the placeholder lines), 4. CTA & Footer with hashtags. "
-        "Do not include any RATING prefix. Output only the final post."
+        f"Write a unique Binance Square post for ${ticker} ({direction} setup). "
+        f"Chart: 4h, EMA50 {ema_rel} & {ema_slope}, VWAP {vwap_rel}, volume {vol_trend}, BTC {btc_text}. "
+        "Never reuse previous hooks. Structure: 1. Hook, 2. Chart reading, 3. Risk levels, 4. CTA & footer. Output only the post."
     )
 
-    def call_qwen(p, t=0.95):
+    def call_qwen(p, t=1.0):
         url = "https://api.groq.com/openai/v1/chat/completions"
         headers = {"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"}
-        payload = {
-            "model": "qwen-2.5-72b",
-            "messages": [{"role": "user", "content": p}],
-            "temperature": t,
-            "max_tokens": 500
-        }
+        payload = {"model": "qwen-2.5-72b", "messages": [{"role":"user","content":p}], "temperature":t, "max_tokens":500}
         try:
             r = requests.post(url, headers=headers, json=payload, timeout=60)
-            if r.status_code == 200:
-                return r.json()["choices"][0]["message"]["content"]
-        except:
-            pass
+            if r.status_code==200: return r.json()["choices"][0]["message"]["content"]
+        except: pass
         return None
 
-    text = call_qwen(prompt, 0.95)
-    if not text or len(text) < 200:
-        text = call_qwen(prompt, 1.0)
-
+    text = call_qwen(prompt, 1.0)
+    if not text or len(text)<150:
+        text = call_qwen(prompt, 1.1)
     if not text:
-        # fallback that's slightly varied
-        if direction == "LONG":
-            hook = f"${ticker} is showing renewed strength as buyers step in near a key zone."
+        if direction=="LONG":
+            hook = f"${ticker} shows a clean bounce from support."
         else:
-            hook = f"Sellers are keeping pressure on ${ticker} as it struggles below the 50‑EMA."
+            hook = f"${ticker} is losing steam at resistance."
         text = (
             f"{hook}\n\n"
-            f"The 50‑EMA is {ema_slope} and price is hovering {ema_rel} it, while the anchored VWAP is acting as a {vwap_rel} reference. "
-            f"Volume has been {vol_trend}, suggesting { 'conviction' if vol_trend=='increasing' else 'a lack of momentum' }. "
-            f"$BTC is {btc_text}, which typically {'provides a tailwind' if btc_bullish else 'adds caution'} for altcoins like ${ticker}.\n\n"
+            f"EMA50 is {ema_slope}, price {ema_rel} it. VWAP acts as {vwap_rel}. Volume {vol_trend}. "
+            f"BTC is {btc_text}, {'supporting' if btc_bullish else 'weighing on'} altcoins.\n\n"
             f"🟢 {direction} Setup Structure:\n"
             f"• Area of Interest: {price:.6f}\n"
             f"• Technical Invalidation: [insert]\n"
             f"• Target Objectives: [insert]\n\n"
-            f"What’s your take on ${ticker} right now? Let me know in the comments!\n"
+            f"What’s your read on ${ticker}?\n"
             f"#CryptoAnalysis #{ticker} #TechnicalAnalysis #BinanceSquare\n"
-            f"*Disclaimer: This analysis is based on technical indicators for educational and informational purposes only. "
-            f"This is not financial advice. Always practice strict risk management and do your own research (DYOR).*"
+            f"*Disclaimer: This analysis is for educational purposes only and does not constitute financial advice. Always DYOR.*"
         )
-
-    # remove any accidental RATING prefix
-    text = re.sub(r'^RATING:\s*\d+\s*\|?\s*', '', text).strip()
-    return text
+    return text.strip()
 
 # ========== TRADE MANAGER (50% at TP1 0.5R, 34‑EMA trail) ==========
 def check_open_trades():
@@ -531,7 +541,6 @@ def generate_signal(balance_usdt):
         price = c.get("current_price")
         if price and price>0 and sym not in open_symbols:
             candidates.append({"symbol":sym,"price":price,"volume":c.get("total_volume",0)})
-    # FIX: sort in-place then slice
     candidates.sort(key=lambda x: x["volume"], reverse=True)
     candidates = candidates[:50]
     if not candidates: return {"action":"HOLD"}
@@ -544,6 +553,7 @@ def generate_signal(balance_usdt):
         if atr/coin["price"] > 0.07: total = 0
         coin["score"] = total; coin["atr"] = atr; coin["layers"] = layers; coin["trend_dir"] = trend_dir; coin["adx"] = adx
         all_scored.append(coin)
+    if not all_scored: return {"action":"HOLD","reasoning":"No valid coins after scoring."}
     best = max(all_scored, key=lambda x: abs(x["score"]))
     if abs(best["score"]) < 1.49: return {"action":"HOLD","reasoning":f"Best score {best['score']:.2f}"}
     direction = "LONG" if best["score"]>=0 else "SHORT"
