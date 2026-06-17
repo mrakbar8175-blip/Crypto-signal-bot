@@ -100,11 +100,12 @@ def save_csv(filepath, df):
 
 def initialize_trade_files():
     init_csv(TRADE_LOG_CSV, ["timestamp", "symbol", "action", "entry", "stop",
-                             "TP1", "TP2", "conviction", "ai_confidence"])
+                             "TP1", "TP2", "TP3", "TP4", "TP5", "conviction", "ai_confidence"])
     init_csv(OPEN_TRADES_CSV, ["timestamp", "symbol", "action", "entry", "stop",
-                               "TP1", "TP2", "status", "quantity", "original_qty", "tp1_hit"])
+                               "TP1", "TP2", "TP3", "TP4", "TP5", "status",
+                               "quantity", "original_qty", "highest_tp"])
     init_csv(TRADE_RESULTS_CSV, ["timestamp", "symbol", "action", "entry", "stop",
-                                 "TP1", "TP2", "status", "hit_level",
+                                 "TP1", "TP2", "TP3", "TP4", "TP5", "status", "hit_level",
                                  "close_time", "exit_price", "quantity", "pnl_usdt"])
 
 def log_signal(signal):
@@ -114,8 +115,11 @@ def log_signal(signal):
         "action": signal["action"],
         "entry": signal["limit_price"],
         "stop": signal["stop_loss"],
-        "TP1": signal["take_profits"][0],
+        "TP1": signal["take_profits"][0] if len(signal["take_profits"]) > 0 else "",
         "TP2": signal["take_profits"][1] if len(signal["take_profits"]) > 1 else "",
+        "TP3": signal["take_profits"][2] if len(signal["take_profits"]) > 2 else "",
+        "TP4": signal["take_profits"][3] if len(signal["take_profits"]) > 3 else "",
+        "TP5": signal["take_profits"][4] if len(signal["take_profits"]) > 4 else "",
         "conviction": signal["conviction_score"],
         "ai_confidence": signal["confidence_score"],
     }
@@ -130,11 +134,14 @@ def add_open_trade(signal):
         "entry": signal["limit_price"],
         "stop": signal["stop_loss"],
         "TP1": signal["take_profits"][0],
-        "TP2": signal["take_profits"][1] if len(signal["take_profits"]) > 1 else "",
+        "TP2": signal["take_profits"][1],
+        "TP3": signal["take_profits"][2],
+        "TP4": signal["take_profits"][3],
+        "TP5": signal["take_profits"][4],
         "status": "open",
         "quantity": signal["quantity"],
         "original_qty": signal["quantity"],
-        "tp1_hit": "no"
+        "highest_tp": -1
     }
     df = pd.DataFrame([row])
     append_csv(OPEN_TRADES_CSV, df)
@@ -159,7 +166,7 @@ def update_portfolio(trade_result):
     portfolio['realized_pnl'] += trade_result['pnl_usdt']
     save_portfolio(portfolio)
 
-# ========== SIMPLIFIED INDICATORS (noise removed) ==========
+# ========== SIMPLIFIED INDICATORS ==========
 def safe_ema(series, span):
     try:
         return series.ewm(span=span, adjust=False).mean()
@@ -283,7 +290,7 @@ def get_volatility_score(symbol_usdt, price):
     try:
         atr = get_4h_atr(symbol_usdt, price)
         atr_pct = atr/price*100
-        if atr_pct > 7: return -1   # only penalise extreme volatility
+        if atr_pct > 7: return -1
         return 1
     except:
         return 0
@@ -302,7 +309,7 @@ def btc_trend_score():
     except:
         return 0, "BTC error"
 
-# ========== CANDLE STRENGTH (only extra layer) ==========
+# ========== CANDLE STRENGTH (bonus) ==========
 def candle_strength_score(symbol_usdt, direction, atr):
     try:
         df = get_yahoo_klines(symbol_usdt, interval='4h', days=2)
@@ -327,12 +334,10 @@ def score_coin(symbol, price, volume, btc_score, btc_err, macro_score):
         df_vwap = get_yahoo_klines(symbol, interval='4h', days=14)
         vwap_score = anchored_vwap_score(df_vwap, price)
         atr_val = get_4h_atr(symbol, price)
-        # Weights unchanged
         total = (0.20 * tech_combined +
                  0.45 * buying_score +
                  0.05 * vol_score +
                  0.25 * intermarket)
-        # no volume_trend
         total *= (1 + 0.15 * macro_score)
         total += vwap_score * 0.1
         direction = "LONG" if total >= 0 else "SHORT"
@@ -357,8 +362,8 @@ def compute_confidence(layers):
     if aligned>=2: return 5
     return 4
 
-# ========== QWEN POST ==========
-def generate_post(coin, direction, btc_score, macro_score):
+# ========== VIRAL BINANCE SQUARE POST GENERATOR ==========
+def generate_post(coin, direction, entry, stop, tps, sl_pct):
     sym = coin["symbol"]; ticker = sym.replace("USDT","")
     price = coin["price"]; atr = coin["atr"]; layers = coin["layers"]
     tech = get_technicals(sym); trend_dir = tech.get("trend_dir","up")
@@ -366,49 +371,77 @@ def generate_post(coin, direction, btc_score, macro_score):
     ema_slope = "rising" if trend_dir=="up" else "falling"
     vwap_score = anchored_vwap_score(get_yahoo_klines(sym, interval='4h', days=14), price)
     vwap_rel = "above" if vwap_score>0 else "below" if vwap_score<0 else "near"
-    vol_desc = "increasing" if candle_strength_score(sym,direction,atr) else "steady"
-    btc_bullish = btc_score>0
+    vol_desc = "increasing" if candle_strength_score(sym, direction, atr) > 0 else "steady"
+    btc_bullish = btc_trend_score()[0] > 0
     btc_text = "bullish" if btc_bullish else "bearish"
 
-    prompt = (
-        f"Write a unique Binance Square post for ${ticker} ({direction} setup). "
-        f"Chart: 4h, EMA50 {ema_rel} & {ema_slope}, VWAP {vwap_rel}, volume {vol_desc}, BTC {btc_text}. "
-        "Never reuse previous hooks. Structure: 1. Hook, 2. Chart reading, 3. Risk levels, 4. CTA & footer. Output only the post."
+    # Build TP list as string: TP1 (0.5R), TP2 (1R), TP3 (2R), TP4 (3R), TP5 (5R)
+    tp_str = f"{tps[0]:.6f} (0.5R) / {tps[1]:.6f} (1R) / {tps[2]:.6f} (2R) / {tps[3]:.6f} (3R) / {tps[4]:.6f} (5R)"
+
+    system_msg = (
+        "You are the best crypto analyst on Binance Square. Your posts are detailed, educational, "
+        "and sound like a real human trader sharing a high‑conviction setup. They consistently go viral because they provide "
+        "clear technical reasoning, exact levels, and an engaging tone. Never use generic phrases. "
+        "Always start with a unique, scroll‑stopping hook using the cashtag. "
+        "Then give a thorough chart analysis explaining what the EMA50, VWAP, volume, and BTC correlation mean for this trade. "
+        "List the risk‑managed levels with precise numbers. End with an open‑ended question and hashtags. "
+        "Use emojis sparingly but effectively. Keep paragraphs short for mobile readability."
     )
 
-    def call_qwen(p, t=1.0):
-        url = "https://api.groq.com/openai/v1/chat/completions"
-        headers = {"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"}
-        payload = {"model": "qwen-2.5-72b", "messages": [{"role":"user","content":p}], "temperature":t, "max_tokens":500}
-        try:
-            r = requests.post(url, headers=headers, json=payload, timeout=60)
-            if r.status_code==200: return r.json()["choices"][0]["message"]["content"]
-        except: pass
-        return None
+    user_prompt = (
+        f"Write a Binance Square post for a {direction} setup on ${ticker} (USDT pair, 4‑hour chart).\n\n"
+        f"Technical context:\n"
+        f"- Price: {price:.4f}\n"
+        f"- 50‑period EMA is {ema_slope} and price is {ema_rel} it.\n"
+        f"- Anchored VWAP is {vwap_rel} the current price.\n"
+        f"- Volume is {vol_desc}.\n"
+        f"- $BTC is {btc_text}, which {'supports' if btc_bullish else 'weighs on'} altcoins.\n\n"
+        f"Risk‑managed levels:\n"
+        f"- Area of Interest: {entry:.6f}\n"
+        f"- Technical Invalidation: {stop:.6f} ({sl_pct:.2f}%)\n"
+        f"- Target Objectives: {tp_str}\n\n"
+        "Include the exact levels in the post exactly as given. "
+        "Make the hook unique and eye‑catching. Explain the reasoning behind the setup. "
+        "Ask a question that encourages comments. Use these hashtags: #CryptoAnalysis #{ticker} #TechnicalAnalysis #BinanceSquare. "
+        "Add the standard disclaimer about educational purposes and DYOR."
+    )
 
-    text = call_qwen(prompt, 1.0)
-    if not text or len(text)<150:
-        text = call_qwen(prompt, 1.1)
-    if not text:
-        if direction=="LONG":
-            hook = f"${ticker} shows a clean bounce from support."
-        else:
-            hook = f"${ticker} is losing steam at resistance."
-        text = (
-            f"{hook}\n\n"
-            f"EMA50 is {ema_slope}, price {ema_rel} it. VWAP acts as {vwap_rel}. Volume {vol_desc}. "
-            f"BTC is {btc_text}, {'supporting' if btc_bullish else 'weighing on'} altcoins.\n\n"
-            f"🟢 {direction} Setup Structure:\n"
-            f"• Area of Interest: [insert]\n"
-            f"• Technical Invalidation: [insert]\n"
-            f"• Target Objectives: [insert]\n\n"
-            f"What’s your read on ${ticker}?\n"
-            f"#CryptoAnalysis #{ticker} #TechnicalAnalysis #BinanceSquare\n"
-            f"*Disclaimer: This analysis is for educational purposes only and does not constitute financial advice. Always DYOR.*"
-        )
-    return text.strip()
+    url = "https://api.groq.com/openai/v1/chat/completions"
+    headers = {"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"}
+    payload = {
+        "model": "qwen-2.5-72b",
+        "messages": [
+            {"role": "system", "content": system_msg},
+            {"role": "user", "content": user_prompt}
+        ],
+        "temperature": 0.9,
+        "max_tokens": 600
+    }
+    try:
+        resp = requests.post(url, headers=headers, json=payload, timeout=60)
+        if resp.status_code == 200:
+            text = resp.json()["choices"][0]["message"]["content"]
+            if text and len(text) > 100:
+                return text
+    except:
+        pass
 
-# ========== TRADE MANAGER (TP1 only, no trail) ==========
+    # Fallback (should rarely trigger)
+    direction_icon = "📈" if direction=="LONG" else "📉"
+    return (
+        f"${ticker} is showing strong technical signs of a {direction.lower()} continuation. {direction_icon}\n\n"
+        f"The 50‑EMA is {ema_slope} while price holds {ema_rel} it, and the anchored VWAP is {vwap_rel} price, reinforcing the bias. "
+        f"Volume is {vol_desc}, and with $BTC in a {btc_text} structure, altcoins are getting a clear tailwind.\n\n"
+        f"🎯 Risk‑Managed Levels:\n"
+        f"• Area of Interest: {entry:.6f}\n"
+        f"• Technical Invalidation: {stop:.6f} ({sl_pct:.2f}%)\n"
+        f"• Target Objectives: {tp_str}\n\n"
+        f"What’s your take on ${ticker} right now? Share your thoughts below!\n"
+        f"#CryptoAnalysis #{ticker} #TechnicalAnalysis #BinanceSquare\n"
+        f"*Disclaimer: This analysis is for educational purposes only and does not constitute financial advice. Always DYOR.*"
+    )
+
+# ========== TRADE MANAGER (20% partials, BE after TP1, auto close) ==========
 def check_open_trades():
     try:
         open_df = pd.read_csv(OPEN_TRADES_CSV)
@@ -418,44 +451,95 @@ def check_open_trades():
     else: open_df = open_df.drop_duplicates("symbol", keep="last")
     results = []; still_open = []; alerts = []
     now = datetime.now()
+    fractions = [0.20, 0.20, 0.20, 0.20, 0.20]  # TP1..TP5
     for _, trade in open_df.iterrows():
         try:
             sym = trade["symbol"]; direction = trade["action"]
             entry = float(trade["entry"]); stop_orig = float(trade["stop"])
-            qty = float(trade["quantity"]); orig_qty = float(trade.get("original_qty", qty))
-            tp1 = float(trade["TP1"])
-            tp1_hit = trade.get("tp1_hit", "no") == "yes"
-            remaining = qty
+            orig_qty = float(trade.get("original_qty", trade["quantity"]))
+            remaining_qty = float(trade.get("quantity", orig_qty))
+            highest_tp_idx = int(trade.get("highest_tp", -1))
+            tps = []
+            for i in range(1,6):
+                tps.append(float(trade[f"TP{i}"]))
             df_1h = get_yahoo_klines(sym, interval='1h', start=datetime.strptime(trade["timestamp"],"%Y-%m-%d %H:%M:%S"), end=now)
             if df_1h.empty: still_open.append(trade); continue
-            current_stop = entry if tp1_hit else stop_orig
+            current_stop = entry if highest_tp_idx >= 0 else stop_orig
             outcome = None; exit_price = None
             for _, candle in df_1h.iterrows():
                 high, low = candle['High'], candle['Low']
-                if not tp1_hit:
-                    if (direction == "LONG" and high >= tp1) or (direction == "SHORT" and low <= tp1):
-                        exit_qty = orig_qty * 0.50
-                        pnl = (tp1 - entry) * exit_qty if direction=="LONG" else (entry - tp1) * exit_qty
-                        partial = trade.to_dict(); partial["hit_level"] = "TP1 (50%)"
-                        partial["close_time"] = now.strftime("%Y-%m-%d %H:%M:%S"); partial["exit_price"] = tp1
-                        partial["quantity"] = exit_qty; partial["pnl_usdt"] = round(pnl,4)
-                        results.append(partial); update_portfolio({'pnl_usdt': pnl})
-                        remaining -= exit_qty; tp1_hit = True; current_stop = entry
-                        alerts.append(f"🚀 {sym.replace('USDT','')} {direction} TP1 hit — 50% closed, SL now BE")
-                if remaining > 0:
+                # Check for new TP hits (only if higher than last hit)
+                new_tp_idx = None
+                if direction == "LONG":
+                    for i in range(len(tps)-1, -1, -1):
+                        if high >= tps[i] and i > highest_tp_idx:
+                            new_tp_idx = i
+                            break
+                else:
+                    for i in range(len(tps)-1, -1, -1):
+                        if low <= tps[i] and i > highest_tp_idx:
+                            new_tp_idx = i
+                            break
+                if new_tp_idx is not None:
+                    # Process all freshly reached TPs up to new_tp_idx
+                    for i in range(highest_tp_idx+1, new_tp_idx+1):
+                        if remaining_qty <= 0: break
+                        if i == 0:  # TP1
+                            current_stop = entry  # move to BE
+                        fraction = fractions[i]
+                        exit_qty = orig_qty * fraction
+                        if exit_qty > remaining_qty: exit_qty = remaining_qty
+                        if exit_qty > 0:
+                            exit_price = tps[i]
+                            pnl = (exit_price - entry) * exit_qty if direction=="LONG" else (entry - exit_price) * exit_qty
+                            partial = trade.to_dict()
+                            partial["hit_level"] = f"TP{i+1} (partial)"
+                            partial["close_time"] = now.strftime("%Y-%m-%d %H:%M:%S")
+                            partial["exit_price"] = exit_price
+                            partial["quantity"] = exit_qty
+                            partial["pnl_usdt"] = round(pnl,4)
+                            results.append(partial)
+                            update_portfolio({'pnl_usdt': pnl})
+                            remaining_qty -= exit_qty
+                            highest_tp_idx = i
+                            alerts.append(f"🚀 {sym.replace('USDT','')} {direction} TP{i+1} hit — {fraction*100:.0f}% closed")
+                        if i == 4:  # TP5 reached, remaining closed
+                            if remaining_qty > 0:
+                                final_exit_qty = remaining_qty
+                                pnl = (tps[4] - entry) * final_exit_qty if direction=="LONG" else (entry - tps[4]) * final_exit_qty
+                                final = trade.to_dict()
+                                final["hit_level"] = "TP5 (final)"
+                                final["close_time"] = now.strftime("%Y-%m-%d %H:%M:%S")
+                                final["exit_price"] = tps[4]
+                                final["quantity"] = final_exit_qty
+                                final["pnl_usdt"] = round(pnl,4)
+                                results.append(final)
+                                update_portfolio({'pnl_usdt': pnl})
+                                remaining_qty = 0
+                                alerts.append(f"🔔 {sym.replace('USDT','')} {direction} TP5 hit — remaining closed")
+                            break
+                    # end for
+                # Check stop loss
+                if remaining_qty > 0:
                     sl_hit = (low <= current_stop) if direction=="LONG" else (high >= current_stop)
                     if sl_hit:
-                        exit_qty = remaining; exit_price = current_stop
+                        exit_qty = remaining_qty; exit_price = current_stop
                         pnl = (exit_price - entry) * exit_qty if direction=="LONG" else (entry - exit_price) * exit_qty
-                        final = trade.to_dict(); desc = "STOP LOSS" if not tp1_hit else "BE STOP"
-                        final["hit_level"] = desc; final["close_time"] = now.strftime("%Y-%m-%d %H:%M:%S")
-                        final["exit_price"] = exit_price; final["quantity"] = exit_qty; final["pnl_usdt"] = round(pnl,4)
-                        results.append(final); update_portfolio({'pnl_usdt': pnl})
-                        remaining = 0; alerts.append(f"🔴 {sym.replace('USDT','')} {direction} → {desc} (remaining closed)")
+                        final = trade.to_dict()
+                        desc = "STOP LOSS" if highest_tp_idx == -1 else "BE STOP"
+                        final["hit_level"] = desc
+                        final["close_time"] = now.strftime("%Y-%m-%d %H:%M:%S")
+                        final["exit_price"] = exit_price
+                        final["quantity"] = exit_qty
+                        final["pnl_usdt"] = round(pnl,4)
+                        results.append(final)
+                        update_portfolio({'pnl_usdt': pnl})
+                        remaining_qty = 0
+                        alerts.append(f"🔴 {sym.replace('USDT','')} {direction} → {desc} (remaining closed)")
                         break
-            if remaining > 0:
-                trade["quantity"] = remaining
-                trade["tp1_hit"] = "yes" if tp1_hit else "no"
+            if remaining_qty > 0:
+                trade["quantity"] = remaining_qty
+                trade["highest_tp"] = highest_tp_idx
                 still_open.append(trade)
         except Exception as e:
             print(f"Trade check error {trade['symbol']}: {e}")
@@ -469,7 +553,7 @@ def check_open_trades():
     save_portfolio(portfolio)
     if alerts: send_telegram("\n".join(alerts))
 
-# ========== SIGNAL GENERATION (threshold 1.49, clean layers) ==========
+# ========== SIGNAL GENERATION (threshold 1.49, 5 TPs, 20% partials) ==========
 def generate_signal(balance_usdt):
     try:
         coins_data = fetch_coingecko("https://api.coingecko.com/api/v3/coins/markets?vs_currency=usd&order=volume_desc&per_page=100&page=1")
@@ -481,7 +565,7 @@ def generate_signal(balance_usdt):
             if not odf.empty:
                 odf = odf.sort_values("timestamp").drop_duplicates("symbol",keep="last") if "timestamp" in odf.columns else odf.drop_duplicates("symbol",keep="last")
                 open_symbols = set(odf["symbol"])
-                risky = sum(odf["tp1_hit"]=="no") if "tp1_hit" in odf.columns else len(odf)
+                risky = sum(odf["highest_tp"] == -1) if "highest_tp" in odf.columns else len(odf)
         except: pass
         if risky >= 3: return {"action":"HOLD","reasoning":f"Max 3 risky trades ({risky}).","summary":""}
         candidates = []
@@ -534,20 +618,23 @@ def generate_signal(balance_usdt):
         stop = entry - min_stop if direction=="LONG" else entry + min_stop
         risk_per_share = abs(entry - stop)
         qty = round((balance_usdt * 0.01) / risk_per_share, 6)
-        tp1 = round(entry + 0.5*risk_per_share, 6) if direction=="LONG" else round(entry - 0.5*risk_per_share, 6)
-        tp2 = round(entry + 5*risk_per_share, 6) if direction=="LONG" else round(entry - 5*risk_per_share, 6)
-        post = generate_post(best, direction, btc_score, macro)
+        # New TP multipliers
+        mults = [0.5, 1.0, 2.0, 3.0, 5.0]
+        tps = []
+        for m in mults:
+            if direction == "LONG":
+                tps.append(round(entry + m * risk_per_share, 6))
+            else:
+                tps.append(round(entry - m * risk_per_share, 6))
         sl_pct = abs(entry - stop)/entry*100
-        post = re.sub(r'• Area of Interest: .*', f'• Area of Interest: {entry:.6f}', post)
-        post = re.sub(r'• Technical Invalidation: .*', f'• Technical Invalidation: {stop:.6f} ({sl_pct:.2f}%)', post)
-        post = re.sub(r'• Target Objectives: .*', f'• Target Objectives: TP1 {tp1:.6f} (0.5R) / TP2 {tp2:.6f} (5R, manual trail)', post)
+        post = generate_post(best, direction, entry, stop, tps, sl_pct)
         return {
             "action": direction,
             "symbol": best["symbol"],
             "quantity": qty,
             "limit_price": entry,
             "stop_loss": stop,
-            "take_profits": [tp1, tp2],
+            "take_profits": tps,
             "confidence_score": compute_confidence(best["layers"]),
             "conviction_score": abs(best["score"]),
             "post_text": post,
@@ -557,7 +644,7 @@ def generate_signal(balance_usdt):
         print(f"generate_signal error: {e}")
         return {"action":"HOLD","reasoning":f"Internal error: {e}","summary":""}
 
-# ========== CHART & TELEGRAM ==========
+# ========== DARK CHART (all TPs drawn) ==========
 def send_trade_chart(signal):
     try:
         import matplotlib; matplotlib.use('Agg'); import matplotlib.pyplot as plt; import mplfinance as mpf
@@ -576,9 +663,9 @@ def send_trade_chart(signal):
             ax.axhline(y=entry,color='#f1c40f',linestyle='--',linewidth=1.5,label='Entry')
             ax.axhline(y=stop,color='#e74c3c',linestyle='--',linewidth=1.5,label='Stop')
             if tps:
+                labels = ['TP1 (0.5R)', 'TP2 (1R)', 'TP3 (2R)', 'TP4 (3R)', 'TP5 (5R)']
                 for i,tp in enumerate(tps):
-                    ax.axhline(y=tp,color='#2ecc71',linestyle='--',linewidth=1,alpha=0.8,
-                               label=f'TP{i+1} ({("0.5R" if i==0 else "5R")})')
+                    ax.axhline(y=tp,color='#2ecc71',linestyle='--',linewidth=1,alpha=0.8,label=labels[i])
             ax.legend(loc='upper left',facecolor='#000000',edgecolor='white',labelcolor='white')
         path=f"{sym.replace('USDT','')}_chart.png"
         fig.savefig(path,dpi=150,bbox_inches='tight',facecolor='black'); plt.close(fig)
