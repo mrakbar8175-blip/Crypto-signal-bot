@@ -1,1 +1,2 @@
-timestamp,symbol,action,entry,stop,TP1,TP2,TP3,TP4,TP5,status,hit_level,close_time,exit_price,quantity,pnl_usdt
+timestamp,symbol,action,entry,stop,TP1,TP2,TP3,TP4,TP5,status,hit_level,close_time,exit_price,quantity,pnl_usdt,original_qty,highest_tp
+2026-06-17 08:58:40,XRPUSDT,LONG,1.1988,1.1646574375823766,1.215871,1.232943,1.267085,1.301228,1.369513,open,TP1 (partial),2026-06-17 17:11:29,1.215871,58.57791160000001,1.0,292.889558,-1.0

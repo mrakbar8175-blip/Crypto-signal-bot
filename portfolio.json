@@ -1,6 +1,6 @@
 {
-  "balance_usdt": 1000.0,
-  "realized_pnl": 0.0,
-  "open_positions": 1,
+  "balance_usdt": 1000.9999835289236,
+  "realized_pnl": 0.9999835289235905,
+  "open_positions": 2,
   "daily_loss_limit": -20
 }
