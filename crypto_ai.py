@@ -48,7 +48,7 @@ TRADE_LOG_CSV = "trade_log.csv"
 OPEN_TRADES_CSV = "open_trades.csv"
 TRADE_RESULTS_CSV = "trade_results.csv"
 
-# ========== DATA HELPERS ==========
+# ========== DATA HELPERS (bulletproof) ==========
 def fetch_coingecko(url, retries=2):
     for attempt in range(retries):
         try:
@@ -75,7 +75,6 @@ def get_yahoo_klines(symbol_usdt, interval='4h', days=60, start=None, end=None):
             return pd.DataFrame()
         if isinstance(df.columns, pd.MultiIndex):
             df.columns = df.columns.get_level_values(0)
-        # Ensure required columns exist
         if not {'Open','High','Low','Close','Volume'}.issubset(df.columns):
             return pd.DataFrame()
         return df
@@ -101,11 +100,11 @@ def save_csv(filepath, df):
 
 def initialize_trade_files():
     init_csv(TRADE_LOG_CSV, ["timestamp", "symbol", "action", "entry", "stop",
-                             "TP1", "conviction", "ai_confidence"])
+                             "TP1", "TP2", "conviction", "ai_confidence"])
     init_csv(OPEN_TRADES_CSV, ["timestamp", "symbol", "action", "entry", "stop",
-                               "TP1", "status", "quantity", "original_qty", "ema_trail"])
+                               "TP1", "TP2", "status", "quantity", "original_qty", "tp1_hit"])
     init_csv(TRADE_RESULTS_CSV, ["timestamp", "symbol", "action", "entry", "stop",
-                                 "TP1", "status", "hit_level",
+                                 "TP1", "TP2", "status", "hit_level",
                                  "close_time", "exit_price", "quantity", "pnl_usdt"])
 
 def log_signal(signal):
@@ -116,6 +115,7 @@ def log_signal(signal):
         "entry": signal["limit_price"],
         "stop": signal["stop_loss"],
         "TP1": signal["take_profits"][0],
+        "TP2": signal["take_profits"][1] if len(signal["take_profits"]) > 1 else "",
         "conviction": signal["conviction_score"],
         "ai_confidence": signal["confidence_score"],
     }
@@ -130,10 +130,11 @@ def add_open_trade(signal):
         "entry": signal["limit_price"],
         "stop": signal["stop_loss"],
         "TP1": signal["take_profits"][0],
+        "TP2": signal["take_profits"][1] if len(signal["take_profits"]) > 1 else "",
         "status": "open",
         "quantity": signal["quantity"],
         "original_qty": signal["quantity"],
-        "ema_trail": ""
+        "tp1_hit": "no"
     }
     df = pd.DataFrame([row])
     append_csv(OPEN_TRADES_CSV, df)
@@ -158,29 +159,36 @@ def update_portfolio(trade_result):
     portfolio['realized_pnl'] += trade_result['pnl_usdt']
     save_portfolio(portfolio)
 
-# ========== MACRO & TECHNICALS (all safe) ==========
-def institutional_macro_filter():
-    df_btc = get_yahoo_klines("BTCUSDT", interval='4h', days=14)
-    if df_btc.empty or len(df_btc) < 50: return 0
-    closes = df_btc['Close']
-    ema50 = closes.ewm(span=50, adjust=False).mean()
-    current = closes.iloc[-1]
-    btc_bullish = current > ema50.iloc[-1]
+# ========== SAFE INDICATORS ==========
+def safe_ema(series, span):
     try:
+        return series.ewm(span=span, adjust=False).mean()
+    except:
+        return pd.Series(index=series.index)
+
+# ========== MACRO & TECHNICALS (all try‑wrapped) ==========
+def institutional_macro_filter():
+    try:
+        df_btc = get_yahoo_klines("BTCUSDT", interval='4h', days=14)
+        if df_btc.empty or len(df_btc) < 50: return 0
+        closes = df_btc['Close']
+        ema50 = safe_ema(closes, 50)
+        current = closes.iloc[-1]
+        btc_bullish = current > ema50.iloc[-1]
         data = fetch_coingecko("https://api.coingecko.com/api/v3/global")
         usdt_dom = data['data'].get('market_cap_percentage', {}).get('usdt', 5) if data and 'data' in data else 5
+        macro = 0
+        if btc_bullish: macro += 1
+        if usdt_dom < 4.5: macro += 1
+        if not btc_bullish: macro -= 1
+        if usdt_dom > 6.5: macro -= 1
+        return max(-2, min(2, macro))
     except:
-        usdt_dom = 5
-    macro = 0
-    if btc_bullish: macro += 1
-    if usdt_dom < 4.5: macro += 1
-    if not btc_bullish: macro -= 1
-    if usdt_dom > 6.5: macro -= 1
-    return max(-2, min(2, macro))
+        return 0
 
 def anchored_vwap_score(df, current_price):
-    if df.empty or len(df) < 50: return 0
     try:
+        if df.empty or len(df) < 50: return 0
         typical = (df['High'] + df['Low'] + df['Close']) / 3
         df = df.copy()
         df['vpv'] = typical * df['Volume']
@@ -193,9 +201,9 @@ def anchored_vwap_score(df, current_price):
         return 0
 
 def refined_buying_pressure(symbol_usdt):
-    df = get_yahoo_klines(symbol_usdt, interval='4h', days=10)
-    if df.empty or len(df) < 48: return 0,0
     try:
+        df = get_yahoo_klines(symbol_usdt, interval='4h', days=10)
+        if df.empty or len(df) < 48: return 0,0
         short = df.tail(12)
         s_buy = short.loc[short['Close'] > short['Open'], 'Volume'].sum()
         s_sell = short.loc[short['Close'] <= short['Open'], 'Volume'].sum()
@@ -208,17 +216,17 @@ def refined_buying_pressure(symbol_usdt):
         lp = (l_buy - l_sell)/l_tot if l_tot > 0 else 0
         return sp, lp
     except:
-        return 0, 0
+        return 0,0
 
 def get_technicals(symbol_usdt):
-    df = get_yahoo_klines(symbol_usdt, interval='4h', days=14)
-    if df.empty or len(df) < 50:
-        return {"combined":0, "trend_dir":"up", "adx":0, "error":"insufficient data"}
     try:
+        df = get_yahoo_klines(symbol_usdt, interval='4h', days=14)
+        if df.empty or len(df) < 50:
+            return {"combined":0, "trend_dir":"up", "adx":0}
         closes = df['Close']
         highs, lows = df['High'], df['Low']
-        ema50 = closes.ewm(span=50, adjust=False).mean()
-        ema200 = closes.ewm(span=200, adjust=False).mean() if len(closes) >= 200 else ema50
+        ema50 = safe_ema(closes, 50)
+        ema200 = safe_ema(closes, 200) if len(closes) >= 200 else ema50
         current = closes.iloc[-1]
         trend = 1.5 if current > ema50.iloc[-1] else -1.5
         trend += 1.5 if ema50.iloc[-1] > ema200.iloc[-1] else -1.5
@@ -227,13 +235,13 @@ def get_technicals(symbol_usdt):
             dm_plus = high.diff(); dm_minus = -low.diff()
             dm_plus[dm_plus<0]=0; dm_minus[dm_minus<0]=0
             tr = pd.concat([high-low, (high-close.shift()).abs(), (low-close.shift()).abs()], axis=1).max(axis=1)
-            atr = tr.ewm(alpha=1/period, adjust=False).mean()
-            di_plus = 100 * (dm_plus.ewm(alpha=1/period, adjust=False).mean() / atr)
-            di_minus = 100 * (dm_minus.ewm(alpha=1/period, adjust=False).mean() / atr)
+            atr = safe_ema(tr, span=period)
+            di_plus = 100 * (safe_ema(dm_plus, span=period) / atr)
+            di_minus = 100 * (safe_ema(dm_minus, span=period) / atr)
             dx = 100 * (di_plus - di_minus).abs() / (di_plus + di_minus)
-            return dx.ewm(alpha=1/period, adjust=False).mean(), di_plus, di_minus
+            return safe_ema(dx, span=period), di_plus, di_minus
         adx_s, di_p, di_m = adx(highs, lows, closes)
-        adx_now = adx_s.iloc[-1]
+        adx_now = adx_s.iloc[-1] if not adx_s.empty else 0
         adx_score = 2.5 if adx_now>25 and di_p.iloc[-1]>di_m.iloc[-1] else (-2.5 if adx_now>25 else (1.0 if adx_now>20 and di_p.iloc[-1]>di_m.iloc[-1] else (-1.0 if adx_now>20 else 0)))
         window=7; lookback=min(50,len(highs))
         rh=highs.iloc[-lookback:]; rl=lows.iloc[-lookback:]
@@ -251,18 +259,18 @@ def get_technicals(symbol_usdt):
         structure = max(-3, min(3, structure))
         combined = trend*0.30 + adx_score*0.25 + structure*0.45
         trend_dir = "up" if current > ema50.iloc[-1] else "down"
-        return {"combined":combined, "trend_dir":trend_dir, "adx":adx_now, "error":None}
+        return {"combined":combined, "trend_dir":trend_dir, "adx":adx_now}
     except Exception as e:
         print(f"tech error {symbol_usdt}: {e}")
-        return {"combined":0, "trend_dir":"up", "adx":0, "error":str(e)}
+        return {"combined":0, "trend_dir":"up", "adx":0}
 
 def get_4h_atr(symbol_usdt, current_price):
-    df = get_yahoo_klines(symbol_usdt, interval='4h', days=14)
-    if df.empty or len(df) < 14: return current_price*0.02
     try:
+        df = get_yahoo_klines(symbol_usdt, interval='4h', days=14)
+        if df.empty or len(df) < 14: return current_price*0.02
         high,low,close = df['High'],df['Low'],df['Close']
         tr = pd.concat([high-low, (high-close.shift()).abs(), (low-close.shift()).abs()], axis=1).max(axis=1)
-        atr = tr.rolling(14).mean().iloc[-1]
+        atr = safe_ema(tr, span=14).iloc[-1]
         return atr if not pd.isna(atr) else current_price*0.02
     except:
         return current_price*0.02
@@ -273,57 +281,69 @@ def get_buying_pressure(symbol_usdt):
     else: return (sp+lp)/2*3*0.3, None
 
 def get_volatility_score(symbol_usdt, price):
-    atr = get_4h_atr(symbol_usdt, price)
-    atr_pct = atr/price*100
-    return -1 if atr_pct<2 or atr_pct>7 else 1
+    try:
+        atr = get_4h_atr(symbol_usdt, price)
+        atr_pct = atr/price*100
+        return -1 if atr_pct<2 or atr_pct>7 else 1
+    except:
+        return 0
 
 def btc_trend_score():
-    df = get_yahoo_klines("BTCUSDT", interval='4h', days=14)
-    if df.empty or len(df)<50: return 0,"BTC unavailable"
-    closes = df['Close']; ema50 = closes.ewm(span=50, adjust=False).mean()
-    cur = closes.iloc[-1]; ema_now = ema50.iloc[-1]
-    slope_up = ema_now > ema50.iloc[-7] if len(ema50)>=7 else True
-    price_above = cur > ema_now
-    if price_above and slope_up: return 2,None
-    elif not price_above and not slope_up: return -2,None
-    else: return 0,None
+    try:
+        df = get_yahoo_klines("BTCUSDT", interval='4h', days=14)
+        if df.empty or len(df)<50: return 0,"BTC unavailable"
+        closes = df['Close']; ema50 = safe_ema(closes, 50)
+        cur = closes.iloc[-1]; ema_now = ema50.iloc[-1]
+        slope_up = ema_now > ema50.iloc[-7] if len(ema50)>=7 else True
+        price_above = cur > ema_now
+        if price_above and slope_up: return 2,None
+        elif not price_above and not slope_up: return -2,None
+        else: return 0,None
+    except:
+        return 0, "BTC error"
 
 def volume_trend_score(symbol_usdt, direction=None):
-    df = get_yahoo_klines(symbol_usdt, interval='4h', days=5)
-    if df.empty or len(df)<12: return 0,"vol data insufficient"
-    recent = df['Volume'].tail(6)
-    first, second = recent[:3].mean(), recent[3:].mean()
-    if second > first*1.05: return -2 if direction=="down" else 2
-    elif second < first*0.95: return -2 if direction=="up" else -2
-    return 0,None
+    try:
+        df = get_yahoo_klines(symbol_usdt, interval='4h', days=5)
+        if df.empty or len(df)<12: return 0,"vol data insufficient"
+        recent = df['Volume'].tail(6)
+        first, second = recent[:3].mean(), recent[3:].mean()
+        if second > first*1.05: return -2 if direction=="down" else 2
+        elif second < first*0.95: return -2 if direction=="up" else -2
+        return 0,None
+    except:
+        return 0, "vol error"
 
 def momentum_alignment_score(symbol_usdt, direction, layers):
-    df = get_yahoo_klines(symbol_usdt, interval='4h', days=2)
-    if df.empty or len(df)<2: return 0
-    last = df.iloc[-1]
-    agrees = (direction=="LONG" and last['Close']>last['Open']) or (direction=="SHORT" and last['Close']<last['Open'])
-    if not agrees: return 0
-    support=0
-    if direction=="LONG":
-        if layers.get("buying_press",0)>0.5: support+=1
-        if layers.get("intermarket",0)>0.5: support+=1
-        if layers.get("volume_trend",0)>0.5: support+=1
-    else:
-        if layers.get("buying_press",0)<-0.5: support+=1
-        if layers.get("intermarket",0)<-0.5: support+=1
-        if layers.get("volume_trend",0)<-0.5: support+=1
-    return 0.20 if support>=2 and direction=="LONG" else (-0.20 if support>=2 else 0)
+    try:
+        df = get_yahoo_klines(symbol_usdt, interval='4h', days=2)
+        if df.empty or len(df)<2: return 0
+        last = df.iloc[-1]
+        agrees = (direction=="LONG" and last['Close']>last['Open']) or (direction=="SHORT" and last['Close']<last['Open'])
+        if not agrees: return 0
+        support=0
+        if direction=="LONG":
+            if layers.get("buying_press",0)>0.5: support+=1
+            if layers.get("intermarket",0)>0.5: support+=1
+            if layers.get("volume_trend",0)>0.5: support+=1
+        else:
+            if layers.get("buying_press",0)<-0.5: support+=1
+            if layers.get("intermarket",0)<-0.5: support+=1
+            if layers.get("volume_trend",0)<-0.5: support+=1
+        return 0.20 if support>=2 and direction=="LONG" else (-0.20 if support>=2 else 0)
+    except:
+        return 0
 
 def trend_strength_bonus(adx, base):
     if adx>35 and abs(base)>0.5: return 0.30*(1 if base>0 else -1)
     elif adx>30 and abs(base)>0.5: return 0.20*(1 if base>0 else -1)
     return 0
 
-# ========== NEW LAYERS (safe) ==========
+# ========== NEW LAYERS ==========
 def candle_strength_score(symbol_usdt, direction, atr):
-    df = get_yahoo_klines(symbol_usdt, interval='4h', days=2)
-    if df.empty or len(df) < 1: return 0
     try:
+        df = get_yahoo_klines(symbol_usdt, interval='4h', days=2)
+        if df.empty or len(df) < 1: return 0
         last = df.iloc[-1]
         candle_range = last['High'] - last['Low']
         if candle_range < 0.5*atr: return 0
@@ -334,9 +354,9 @@ def candle_strength_score(symbol_usdt, direction, atr):
     return 0
 
 def volume_spike_score(symbol_usdt, direction):
-    df = get_yahoo_klines(symbol_usdt, interval='4h', days=5)
-    if df.empty or len(df) < 20: return 0
     try:
+        df = get_yahoo_klines(symbol_usdt, interval='4h', days=5)
+        if df.empty or len(df) < 20: return 0
         avg_vol = df['Volume'].tail(20).mean()
         last_vol = df['Volume'].iloc[-1]
         if last_vol < 1.5*avg_vol: return 0
@@ -348,9 +368,9 @@ def volume_spike_score(symbol_usdt, direction):
     return 0
 
 def level_proximity_score(symbol_usdt, price, atr, direction):
-    df = get_yahoo_klines(symbol_usdt, interval='4h', days=14)
-    if df.empty or len(df) < 50: return 0
     try:
+        df = get_yahoo_klines(symbol_usdt, interval='4h', days=14)
+        if df.empty or len(df) < 50: return 0
         highs = df['High']; lows = df['Low']
         window=7; lookback=min(50,len(highs))
         rh=highs.iloc[-lookback:]; rl=lows.iloc[-lookback:]
@@ -369,7 +389,7 @@ def level_proximity_score(symbol_usdt, price, atr, direction):
         pass
     return 0
 
-# ========== SCORING ENGINE (robust) ==========
+# ========== SCORING ENGINE ==========
 def score_coin(symbol, price, volume, btc_score, btc_err, macro_score):
     try:
         tech = get_technicals(symbol)
@@ -403,7 +423,7 @@ def compute_confidence(layers):
     if aligned>=2: return 5
     return 4
 
-# ========== QWEN POST (high variety) ==========
+# ========== QWEN POST ==========
 def generate_post(coin, direction, btc_score, macro_score):
     sym = coin["symbol"]; ticker = sym.replace("USDT","")
     price = coin["price"]; atr = coin["atr"]; layers = coin["layers"]
@@ -445,7 +465,7 @@ def generate_post(coin, direction, btc_score, macro_score):
             f"EMA50 is {ema_slope}, price {ema_rel} it. VWAP acts as {vwap_rel}. Volume {vol_trend}. "
             f"BTC is {btc_text}, {'supporting' if btc_bullish else 'weighing on'} altcoins.\n\n"
             f"🟢 {direction} Setup Structure:\n"
-            f"• Area of Interest: {price:.6f}\n"
+            f"• Area of Interest: [insert]\n"
             f"• Technical Invalidation: [insert]\n"
             f"• Target Objectives: [insert]\n\n"
             f"What’s your read on ${ticker}?\n"
@@ -454,7 +474,7 @@ def generate_post(coin, direction, btc_score, macro_score):
         )
     return text.strip()
 
-# ========== TRADE MANAGER (50% at TP1 0.5R, 34‑EMA trail) ==========
+# ========== TRADE MANAGER (simplified: TP1 only, no trail) ==========
 def check_open_trades():
     try:
         open_df = pd.read_csv(OPEN_TRADES_CSV)
@@ -465,52 +485,46 @@ def check_open_trades():
     results = []; still_open = []; alerts = []
     now = datetime.now()
     for _, trade in open_df.iterrows():
-        sym = trade["symbol"]; direction = trade["action"]
-        entry = float(trade["entry"]); stop_orig = float(trade["stop"])
-        qty = float(trade["quantity"]); orig_qty = float(trade.get("original_qty", qty))
-        tp1 = float(trade["TP1"])
-        tp1_hit = trade.get("ema_trail", "") != "" or float(trade.get("quantity",0)) < orig_qty
-        remaining = qty
-        df_1h = get_yahoo_klines(sym, interval='1h', start=datetime.strptime(trade["timestamp"],"%Y-%m-%d %H:%M:%S"), end=now)
-        if df_1h.empty: still_open.append(trade); continue
-        if tp1_hit:
-            current_stop = entry
-            df_4h = get_yahoo_klines(sym, interval='4h', days=5)
-            if not df_4h.empty:
-                ema34 = df_4h['Close'].ewm(span=34, adjust=False).mean().iloc[-1]
-                atr_val = get_4h_atr(sym, entry)
-                buffer = 0.5 * atr_val
-                if direction == "LONG": current_stop = max(current_stop, ema34 - buffer)
-                else: current_stop = min(current_stop, ema34 + buffer)
-        else:
-            current_stop = stop_orig
-        outcome = None; exit_price = None
-        for _, candle in df_1h.iterrows():
-            high, low = candle['High'], candle['Low']
-            if not tp1_hit:
-                if (direction == "LONG" and high >= tp1) or (direction == "SHORT" and low <= tp1):
-                    exit_qty = orig_qty * 0.50
-                    pnl = (tp1 - entry) * exit_qty if direction=="LONG" else (entry - tp1) * exit_qty
-                    partial = trade.to_dict(); partial["hit_level"] = "TP1 (50%)"
-                    partial["close_time"] = now.strftime("%Y-%m-%d %H:%M:%S"); partial["exit_price"] = tp1
-                    partial["quantity"] = exit_qty; partial["pnl_usdt"] = round(pnl,4)
-                    results.append(partial); update_portfolio({'pnl_usdt': pnl})
-                    remaining -= exit_qty; tp1_hit = True; current_stop = entry
-                    alerts.append(f"🚀 {sym.replace('USDT','')} {direction} TP1 hit — 50% closed, SL now BE")
+        try:
+            sym = trade["symbol"]; direction = trade["action"]
+            entry = float(trade["entry"]); stop_orig = float(trade["stop"])
+            qty = float(trade["quantity"]); orig_qty = float(trade.get("original_qty", qty))
+            tp1 = float(trade["TP1"])
+            tp1_hit = trade.get("tp1_hit", "no") == "yes"
+            remaining = qty
+            df_1h = get_yahoo_klines(sym, interval='1h', start=datetime.strptime(trade["timestamp"],"%Y-%m-%d %H:%M:%S"), end=now)
+            if df_1h.empty: still_open.append(trade); continue
+            current_stop = entry if tp1_hit else stop_orig
+            outcome = None; exit_price = None
+            for _, candle in df_1h.iterrows():
+                high, low = candle['High'], candle['Low']
+                if not tp1_hit:
+                    if (direction == "LONG" and high >= tp1) or (direction == "SHORT" and low <= tp1):
+                        exit_qty = orig_qty * 0.50
+                        pnl = (tp1 - entry) * exit_qty if direction=="LONG" else (entry - tp1) * exit_qty
+                        partial = trade.to_dict(); partial["hit_level"] = "TP1 (50%)"
+                        partial["close_time"] = now.strftime("%Y-%m-%d %H:%M:%S"); partial["exit_price"] = tp1
+                        partial["quantity"] = exit_qty; partial["pnl_usdt"] = round(pnl,4)
+                        results.append(partial); update_portfolio({'pnl_usdt': pnl})
+                        remaining -= exit_qty; tp1_hit = True; current_stop = entry
+                        alerts.append(f"🚀 {sym.replace('USDT','')} {direction} TP1 hit — 50% closed, SL now BE")
+                if remaining > 0:
+                    sl_hit = (low <= current_stop) if direction=="LONG" else (high >= current_stop)
+                    if sl_hit:
+                        exit_qty = remaining; exit_price = current_stop
+                        pnl = (exit_price - entry) * exit_qty if direction=="LONG" else (entry - exit_price) * exit_qty
+                        final = trade.to_dict(); desc = "STOP LOSS" if not tp1_hit else "BE STOP"
+                        final["hit_level"] = desc; final["close_time"] = now.strftime("%Y-%m-%d %H:%M:%S")
+                        final["exit_price"] = exit_price; final["quantity"] = exit_qty; final["pnl_usdt"] = round(pnl,4)
+                        results.append(final); update_portfolio({'pnl_usdt': pnl})
+                        remaining = 0; alerts.append(f"🔴 {sym.replace('USDT','')} {direction} → {desc} (remaining closed)")
+                        break
             if remaining > 0:
-                sl_hit = (low <= current_stop) if direction=="LONG" else (high >= current_stop)
-                if sl_hit:
-                    exit_qty = remaining; exit_price = current_stop
-                    pnl = (exit_price - entry) * exit_qty if direction=="LONG" else (entry - exit_price) * exit_qty
-                    final = trade.to_dict(); desc = "STOP LOSS" if not tp1_hit else "TRAILING STOP"
-                    final["hit_level"] = desc; final["close_time"] = now.strftime("%Y-%m-%d %H:%M:%S")
-                    final["exit_price"] = exit_price; final["quantity"] = exit_qty; final["pnl_usdt"] = round(pnl,4)
-                    results.append(final); update_portfolio({'pnl_usdt': pnl})
-                    remaining = 0; alerts.append(f"🔴 {sym.replace('USDT','')} {direction} → {desc} (remaining closed)")
-                    break
-        if remaining > 0:
-            trade["quantity"] = remaining
-            trade["ema_trail"] = "active" if tp1_hit else ""
+                trade["quantity"] = remaining
+                trade["tp1_hit"] = "yes" if tp1_hit else "no"
+                still_open.append(trade)
+        except Exception as e:
+            print(f"Trade check error {trade['symbol']}: {e}")
             still_open.append(trade)
     if results:
         dfr = pd.DataFrame(results); append_csv(TRADE_RESULTS_CSV, dfr)
@@ -521,72 +535,82 @@ def check_open_trades():
     save_portfolio(portfolio)
     if alerts: send_telegram("\n".join(alerts))
 
-# ========== SIGNAL GENERATION ==========
+# ========== SIGNAL GENERATION (with TP2 & coin summary) ==========
 def generate_signal(balance_usdt):
-    coins_data = fetch_coingecko("https://api.coingecko.com/api/v3/coins/markets?vs_currency=usd&order=volume_desc&per_page=100&page=1")
-    if not coins_data: return {"action":"HOLD"}
-    open_symbols = set()
-    risky = 0
     try:
-        odf = pd.read_csv(OPEN_TRADES_CSV)
-        if not odf.empty:
-            odf = odf.sort_values("timestamp").drop_duplicates("symbol",keep="last") if "timestamp" in odf.columns else odf.drop_duplicates("symbol",keep="last")
-            open_symbols = set(odf["symbol"])
-            risky = sum((odf["ema_trail"]=="") & (odf["quantity"]>0)) if "ema_trail" in odf.columns else len(odf)
-    except: pass
-    if risky >= 3: return {"action":"HOLD","reasoning":"Max 3 risky trades."}
-    candidates = []
-    for c in coins_data:
-        sym = c.get("symbol","").upper()+"USDT"
-        price = c.get("current_price")
-        if price and price>0 and sym not in open_symbols:
-            candidates.append({"symbol":sym,"price":price,"volume":c.get("total_volume",0)})
-    candidates.sort(key=lambda x: x["volume"], reverse=True)
-    candidates = candidates[:50]
-    if not candidates: return {"action":"HOLD"}
-    btc_score, btc_err = btc_trend_score()
-    macro = institutional_macro_filter()
-    all_scored = []
-    for coin in candidates:
-        total, layers, trend_dir, adx = score_coin(coin["symbol"], coin["price"], coin["volume"], btc_score, btc_err, macro)
-        atr = get_4h_atr(coin["symbol"], coin["price"])
-        if atr/coin["price"] > 0.07: total = 0
-        coin["score"] = total; coin["atr"] = atr; coin["layers"] = layers; coin["trend_dir"] = trend_dir; coin["adx"] = adx
-        all_scored.append(coin)
-    if not all_scored: return {"action":"HOLD","reasoning":"No valid coins after scoring."}
-    best = max(all_scored, key=lambda x: abs(x["score"]))
-    if abs(best["score"]) < 1.49: return {"action":"HOLD","reasoning":f"Best score {best['score']:.2f}"}
-    direction = "LONG" if best["score"]>=0 else "SHORT"
-    entry = best.get("bid", best["price"]*0.999) if direction=="LONG" else best.get("ask", best["price"]*1.001)
-    atr = best["atr"]
-    df_1h_recent = get_yahoo_klines(best["symbol"], interval='1h', days=2)
-    confirm = False
-    if not df_1h_recent.empty:
-        last_candle = df_1h_recent.iloc[-1]
-        if direction=="LONG" and last_candle['Close'] > last_candle['Open']: confirm = True
-        elif direction=="SHORT" and last_candle['Close'] < last_candle['Open']: confirm = True
-    stop_mult = 1.2 if confirm else 1.5
-    min_stop = max(stop_mult * atr, entry * 0.01)
-    stop = entry - min_stop if direction=="LONG" else entry + min_stop
-    risk_per_share = abs(entry - stop)
-    qty = round((balance_usdt * 0.01) / risk_per_share, 6)
-    tp1 = round(entry + 0.5*risk_per_share, 6) if direction=="LONG" else round(entry - 0.5*risk_per_share, 6)
-    post = generate_post(best, direction, btc_score, macro)
-    sl_pct = abs(entry - stop)/entry*100
-    post = re.sub(r'• Area of Interest: .*', f'• Area of Interest: {entry:.6f}', post)
-    post = re.sub(r'• Technical Invalidation: .*', f'• Technical Invalidation: {stop:.6f} ({sl_pct:.2f}%)', post)
-    post = re.sub(r'• Target Objectives: .*', f'• Target Objectives: {tp1:.6f} (then trail with 34‑EMA)', post)
-    return {
-        "action": direction,
-        "symbol": best["symbol"],
-        "quantity": qty,
-        "limit_price": entry,
-        "stop_loss": stop,
-        "take_profits": [tp1],
-        "confidence_score": compute_confidence(best["layers"]),
-        "conviction_score": abs(best["score"]),
-        "post_text": post
-    }
+        coins_data = fetch_coingecko("https://api.coingecko.com/api/v3/coins/markets?vs_currency=usd&order=volume_desc&per_page=100&page=1")
+        if not coins_data: return {"action":"HOLD","reasoning":"CoinGecko unavailable.","summary":""}
+        open_symbols = set()
+        risky = 0
+        try:
+            odf = pd.read_csv(OPEN_TRADES_CSV)
+            if not odf.empty:
+                odf = odf.sort_values("timestamp").drop_duplicates("symbol",keep="last") if "timestamp" in odf.columns else odf.drop_duplicates("symbol",keep="last")
+                open_symbols = set(odf["symbol"])
+                risky = sum(odf["tp1_hit"]=="no") if "tp1_hit" in odf.columns else len(odf)
+        except: pass
+        if risky >= 3: return {"action":"HOLD","reasoning":f"Max 3 risky trades ({risky}).","summary":""}
+        candidates = []
+        for c in coins_data:
+            sym = c.get("symbol","").upper()+"USDT"
+            price = c.get("current_price")
+            if price and price>0 and sym not in open_symbols:
+                candidates.append({"symbol":sym,"price":price,"volume":c.get("total_volume",0)})
+        candidates.sort(key=lambda x: x["volume"], reverse=True)
+        candidates = candidates[:50]
+        if not candidates: return {"action":"HOLD","reasoning":"No liquid coins.","summary":""}
+        btc_score, btc_err = btc_trend_score()
+        macro = institutional_macro_filter()
+        all_scored = []
+        for coin in candidates:
+            total, layers, trend_dir, adx = score_coin(coin["symbol"], coin["price"], coin["volume"], btc_score, btc_err, macro)
+            atr = get_4h_atr(coin["symbol"], coin["price"])
+            if atr/coin["price"] > 0.07: total = 0
+            coin["score"] = total; coin["atr"] = atr; coin["layers"] = layers; coin["trend_dir"] = trend_dir; coin["adx"] = adx
+            all_scored.append(coin)
+        if not all_scored: return {"action":"HOLD","reasoning":"No valid scores.","summary":""}
+        # build summary
+        all_scored_sorted = sorted(all_scored, key=lambda x: abs(x["score"]), reverse=True)
+        summary = " | ".join([f"{c['symbol'].replace('USDT','')}: {c['score']:.2f}" for c in all_scored_sorted[:30]])
+        best = all_scored_sorted[0]
+        if abs(best["score"]) < 1.49:
+            return {"action":"HOLD","reasoning":f"No strong conviction. Best score {best['score']:.2f} for {best['symbol']}.","summary":summary}
+        direction = "LONG" if best["score"]>=0 else "SHORT"
+        entry = best.get("bid", best["price"]*0.999) if direction=="LONG" else best.get("ask", best["price"]*1.001)
+        atr = best["atr"]
+        df_1h_recent = get_yahoo_klines(best["symbol"], interval='1h', days=2)
+        confirm = False
+        if not df_1h_recent.empty:
+            last_candle = df_1h_recent.iloc[-1]
+            if direction=="LONG" and last_candle['Close'] > last_candle['Open']: confirm = True
+            elif direction=="SHORT" and last_candle['Close'] < last_candle['Open']: confirm = True
+        stop_mult = 1.2 if confirm else 1.5
+        min_stop = max(stop_mult * atr, entry * 0.01)
+        stop = entry - min_stop if direction=="LONG" else entry + min_stop
+        risk_per_share = abs(entry - stop)
+        qty = round((balance_usdt * 0.01) / risk_per_share, 6)
+        tp1 = round(entry + 0.5*risk_per_share, 6) if direction=="LONG" else round(entry - 0.5*risk_per_share, 6)
+        tp2 = round(entry + 5*risk_per_share, 6) if direction=="LONG" else round(entry - 5*risk_per_share, 6)
+        post = generate_post(best, direction, btc_score, macro)
+        sl_pct = abs(entry - stop)/entry*100
+        post = re.sub(r'• Area of Interest: .*', f'• Area of Interest: {entry:.6f}', post)
+        post = re.sub(r'• Technical Invalidation: .*', f'• Technical Invalidation: {stop:.6f} ({sl_pct:.2f}%)', post)
+        post = re.sub(r'• Target Objectives: .*', f'• Target Objectives: TP1 {tp1:.6f} (0.5R) / TP2 {tp2:.6f} (5R, manual trail)', post)
+        return {
+            "action": direction,
+            "symbol": best["symbol"],
+            "quantity": qty,
+            "limit_price": entry,
+            "stop_loss": stop,
+            "take_profits": [tp1, tp2],
+            "confidence_score": compute_confidence(best["layers"]),
+            "conviction_score": abs(best["score"]),
+            "post_text": post,
+            "summary": summary
+        }
+    except Exception as e:
+        print(f"generate_signal error: {e}")
+        return {"action":"HOLD","reasoning":f"Internal error: {e}","summary":""}
 
 # ========== CHART & TELEGRAM ==========
 def send_trade_chart(signal):
@@ -607,7 +631,9 @@ def send_trade_chart(signal):
             ax.axhline(y=entry,color='#f1c40f',linestyle='--',linewidth=1.5,label='Entry')
             ax.axhline(y=stop,color='#e74c3c',linestyle='--',linewidth=1.5,label='Stop')
             if tps:
-                for i,tp in enumerate(tps): ax.axhline(y=tp,color='#2ecc71',linestyle='--',linewidth=1,alpha=0.8,label=f'TP{i+1}')
+                for i,tp in enumerate(tps):
+                    ax.axhline(y=tp,color='#2ecc71',linestyle='--',linewidth=1,alpha=0.8,
+                               label=f'TP{i+1} ({("0.5R" if i==0 else "5R")})')
             ax.legend(loc='upper left',facecolor='#000000',edgecolor='white',labelcolor='white')
         path=f"{sym.replace('USDT','')}_chart.png"
         fig.savefig(path,dpi=150,bbox_inches='tight',facecolor='black'); plt.close(fig)
@@ -637,7 +663,10 @@ def main():
             send_telegram(dec['post_text'])
             send_trade_chart(dec)
         else:
-            send_telegram(f"HOLD\n{dec.get('reasoning','No signal')}")
+            msg = f"HOLD\n{dec.get('reasoning','No signal')}"
+            summ = dec.get('summary','')
+            if summ: msg += f"\n\nTop coins: {summ}"
+            send_telegram(msg)
     except Exception as e:
         err = f"Bot crashed: {traceback.format_exc()}"
         print(err); send_telegram(err[:500])
