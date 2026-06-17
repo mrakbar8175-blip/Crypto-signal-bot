@@ -256,7 +256,7 @@ def get_buying_pressure(symbol_usdt):
     else: return (sp+lp)/2*3*0.3, None
 
 def get_volatility_score(symbol_usdt, price):
-    atr, _ = get_4h_atr(symbol_usdt, price), None
+    atr = get_4h_atr(symbol_usdt, price)
     atr_pct = atr/price*100
     return -1 if atr_pct<2 or atr_pct>7 else 1
 
@@ -331,7 +331,6 @@ def level_proximity_score(symbol_usdt, price, atr, direction):
     df = get_yahoo_klines(symbol_usdt, interval='4h', days=14)
     if df.empty or len(df) < 50: return 0
     highs = df['High']; lows = df['Low']
-    # simple swing detection (same as get_technicals)
     window=7; lookback=min(50,len(highs))
     rh=highs.iloc[-lookback:]; rl=lows.iloc[-lookback:]
     sh, sl = [], []
@@ -342,7 +341,6 @@ def level_proximity_score(symbol_usdt, price, atr, direction):
     nearest_high = max(sh) if sh else price
     nearest_low = min(sl) if sl else price
     if direction == "LONG":
-        # check proximity to recent low (support) – we want price near support, aiming to bounce
         if price - nearest_low < atr: return 0.10
     else: # SHORT
         if nearest_high - price < atr: return 0.10
@@ -438,7 +436,7 @@ def check_open_trades():
             df_4h = get_yahoo_klines(sym, interval='4h', days=5)
             if not df_4h.empty:
                 ema34 = df_4h['Close'].ewm(span=34, adjust=False).mean().iloc[-1]
-                atr_val, _ = get_4h_atr(sym, entry)
+                atr_val = get_4h_atr(sym, entry)  # ✅ FIXED: single float, no unpacking
                 buffer = 0.5 * atr_val
                 if direction == "LONG": current_stop = max(current_stop, ema34 - buffer)
                 else: current_stop = min(current_stop, ema34 + buffer)
