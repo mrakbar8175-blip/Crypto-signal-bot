@@ -304,7 +304,6 @@ def trend_strength_bonus(adx, base):
 
 # ========== NEW LAYERS ==========
 def candle_strength_score(symbol_usdt, direction, atr):
-    """+0.10 if the last 4h candle closed in the signal direction and its range >= 0.5*ATR"""
     df = get_yahoo_klines(symbol_usdt, interval='4h', days=2)
     if df.empty or len(df) < 1: return 0
     last = df.iloc[-1]
@@ -315,7 +314,6 @@ def candle_strength_score(symbol_usdt, direction, atr):
     return 0
 
 def volume_spike_score(symbol_usdt, direction):
-    """+0.10 if last 4h volume > 1.5x average and candle closed in signal direction"""
     df = get_yahoo_klines(symbol_usdt, interval='4h', days=5)
     if df.empty or len(df) < 20: return 0
     avg_vol = df['Volume'].tail(20).mean()
@@ -327,7 +325,6 @@ def volume_spike_score(symbol_usdt, direction):
     return 0
 
 def level_proximity_score(symbol_usdt, price, atr, direction):
-    """+0.10 if entry is within 1 ATR of a recent swing high/low and direction aims towards breaking it"""
     df = get_yahoo_klines(symbol_usdt, interval='4h', days=14)
     if df.empty or len(df) < 50: return 0
     highs = df['High']; lows = df['Low']
@@ -342,7 +339,7 @@ def level_proximity_score(symbol_usdt, price, atr, direction):
     nearest_low = min(sl) if sl else price
     if direction == "LONG":
         if price - nearest_low < atr: return 0.10
-    else: # SHORT
+    else:
         if nearest_high - price < atr: return 0.10
     return 0
 
@@ -358,12 +355,10 @@ def score_coin(symbol, price, volume, btc_score, btc_err, macro_score):
     df_vwap = get_yahoo_klines(symbol, interval='4h', days=14)
     vwap_score = anchored_vwap_score(df_vwap, price)
     atr_val = get_4h_atr(symbol, price)
-    # original total
     total = 0.20*tech_combined + 0.45*buying_score + 0.05*vol_score + 0.25*intermarket + 0.05*vol_trend_s
     total *= (1 + 0.15*macro_score)
     total += vwap_score*0.1
-    # new layers (direction-dependent)
-    direction = "LONG" if total >= 0 else "SHORT"  # rough direction for bonus
+    direction = "LONG" if total >= 0 else "SHORT"
     total += candle_strength_score(symbol, direction, atr_val)
     total += volume_spike_score(symbol, direction)
     total += level_proximity_score(symbol, price, atr_val, direction)
@@ -379,7 +374,7 @@ def compute_confidence(layers):
     if aligned>=2: return 5
     return 4
 
-# ========== QWEN POST ==========
+# ========== QWEN POST (MORE VARIETY) ==========
 def generate_post(coin, direction, btc_score, macro_score):
     sym = coin["symbol"]; ticker = sym.replace("USDT","")
     price = coin["price"]; atr = coin["atr"]; layers = coin["layers"]
@@ -391,25 +386,62 @@ def generate_post(coin, direction, btc_score, macro_score):
     vol_trend = "increasing" if layers["volume_trend"]>0 else "decreasing" if layers["volume_trend"]<0 else "flat"
     btc_bullish = btc_score>0
     btc_text = "bullish" if btc_bullish else "bearish"
+
+    # Stronger anti-template prompt
     prompt = (
-        f"You are a Crypto Analyst. Write a unique Binance Square post for ${ticker} ({direction} setup). "
-        f"Specific data: Price {price:.4f}, EMA50 {ema_rel} and {ema_slope}, VWAP {vwap_rel}, Volume {vol_trend}, "
-        f"BTC {btc_text}. Do NOT reuse old hooks. Output the 4 sections exactly as before."
+        f"You are a professional Crypto Analyst writing a unique Binance Square post for ${ticker} ({direction} setup). "
+        f"The 4‑hour chart shows: price is {ema_rel} the 50‑EMA and the EMA is {ema_slope}. "
+        f"Anchored VWAP is {vwap_rel} price. Volume is {vol_trend}. $BTC is {btc_text} on its 4‑hour chart. "
+        "CRITICAL INSTRUCTIONS: Never start with the same phrase twice. Vary your vocabulary, sentence structure, and hook completely. "
+        "Write the 4 sections: 1. Compliant Hook, 2. Humanised Chart Reading (explain the EMA, VWAP, volume, BTC context), "
+        "3. Risk‑Managed Levels (use the placeholder lines), 4. CTA & Footer with hashtags. "
+        "Do not include any RATING prefix. Output only the final post."
     )
-    def call_qwen(p,t=0.9):
-        url="https://api.groq.com/openai/v1/chat/completions"
-        headers={"Authorization":f"Bearer {GROQ_API_KEY}","Content-Type":"application/json"}
-        payload={"model":"qwen-2.5-72b","messages":[{"role":"user","content":p}],"temperature":t,"max_tokens":500}
+
+    def call_qwen(p, t=0.95):
+        url = "https://api.groq.com/openai/v1/chat/completions"
+        headers = {"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"}
+        payload = {
+            "model": "qwen-2.5-72b",
+            "messages": [{"role": "user", "content": p}],
+            "temperature": t,
+            "max_tokens": 500
+        }
         try:
-            r=requests.post(url,headers=headers,json=payload,timeout=60)
-            if r.status_code==200: return r.json()["choices"][0]["message"]["content"]
-        except: pass
+            r = requests.post(url, headers=headers, json=payload, timeout=60)
+            if r.status_code == 200:
+                return r.json()["choices"][0]["message"]["content"]
+        except:
+            pass
         return None
-    text = call_qwen(prompt,0.9)
-    if not text or len(text)<200: text = call_qwen(prompt,1.0)
+
+    text = call_qwen(prompt, 0.95)
+    if not text or len(text) < 200:
+        text = call_qwen(prompt, 1.0)
+
     if not text:
-        hooks = [f"${ticker} is setting up for a {direction.lower()} continuation.","Volatility is compressing on ${ticker}. A breakout looks likely."]
-        text = f"{random.choice(hooks)}\n\nThe 50‑EMA is {ema_slope} while price holds {ema_rel} it, and VWAP is {vwap_rel}. Volume {vol_trend}. $BTC is {btc_text}.\n\n🟢 {direction} Setup Structure:\n• Area of Interest: {price:.6f}\n• Technical Invalidation: [insert] \n• Target Objectives: [insert]\n\nWhat’s your view on ${ticker}?\n#CryptoAnalysis #{ticker} #TechnicalAnalysis #BinanceSquare\n*Disclaimer: ...*"
+        # fallback that's slightly varied
+        if direction == "LONG":
+            hook = f"${ticker} is showing renewed strength as buyers step in near a key zone."
+        else:
+            hook = f"Sellers are keeping pressure on ${ticker} as it struggles below the 50‑EMA."
+        text = (
+            f"{hook}\n\n"
+            f"The 50‑EMA is {ema_slope} and price is hovering {ema_rel} it, while the anchored VWAP is acting as a {vwap_rel} reference. "
+            f"Volume has been {vol_trend}, suggesting { 'conviction' if vol_trend=='increasing' else 'a lack of momentum' }. "
+            f"$BTC is {btc_text}, which typically {'provides a tailwind' if btc_bullish else 'adds caution'} for altcoins like ${ticker}.\n\n"
+            f"🟢 {direction} Setup Structure:\n"
+            f"• Area of Interest: {price:.6f}\n"
+            f"• Technical Invalidation: [insert]\n"
+            f"• Target Objectives: [insert]\n\n"
+            f"What’s your take on ${ticker} right now? Let me know in the comments!\n"
+            f"#CryptoAnalysis #{ticker} #TechnicalAnalysis #BinanceSquare\n"
+            f"*Disclaimer: This analysis is based on technical indicators for educational and informational purposes only. "
+            f"This is not financial advice. Always practice strict risk management and do your own research (DYOR).*"
+        )
+
+    # remove any accidental RATING prefix
+    text = re.sub(r'^RATING:\s*\d+\s*\|?\s*', '', text).strip()
     return text
 
 # ========== TRADE MANAGER (50% at TP1 0.5R, 34‑EMA trail) ==========
@@ -436,7 +468,7 @@ def check_open_trades():
             df_4h = get_yahoo_klines(sym, interval='4h', days=5)
             if not df_4h.empty:
                 ema34 = df_4h['Close'].ewm(span=34, adjust=False).mean().iloc[-1]
-                atr_val = get_4h_atr(sym, entry)  # ✅ FIXED: single float, no unpacking
+                atr_val = get_4h_atr(sym, entry)
                 buffer = 0.5 * atr_val
                 if direction == "LONG": current_stop = max(current_stop, ema34 - buffer)
                 else: current_stop = min(current_stop, ema34 + buffer)
@@ -499,7 +531,9 @@ def generate_signal(balance_usdt):
         price = c.get("current_price")
         if price and price>0 and sym not in open_symbols:
             candidates.append({"symbol":sym,"price":price,"volume":c.get("total_volume",0)})
-    candidates.sort(key=lambda x: x["volume"], reverse=True)[:50]
+    # FIX: sort in-place then slice
+    candidates.sort(key=lambda x: x["volume"], reverse=True)
+    candidates = candidates[:50]
     if not candidates: return {"action":"HOLD"}
     btc_score, btc_err = btc_trend_score()
     macro = institutional_macro_filter()
