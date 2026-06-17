@@ -323,7 +323,7 @@ def candle_strength_score(symbol_usdt, direction, atr):
         pass
     return 0
 
-# ========== SCORING ENGINE (clean) ==========
+# ========== SCORING ENGINE ==========
 def score_coin(symbol, price, volume, btc_score, btc_err, macro_score):
     try:
         tech = get_technicals(symbol)
@@ -362,7 +362,7 @@ def compute_confidence(layers):
     if aligned>=2: return 5
     return 4
 
-# ========== VIRAL BINANCE SQUARE POST GENERATOR ==========
+# ========== VIRAL BINANCE SQUARE POST (ANTI‑TEMPLATE) ==========
 def generate_post(coin, direction, entry, stop, tps, sl_pct):
     sym = coin["symbol"]; ticker = sym.replace("USDT","")
     price = coin["price"]; atr = coin["atr"]; layers = coin["layers"]
@@ -375,71 +375,82 @@ def generate_post(coin, direction, entry, stop, tps, sl_pct):
     btc_bullish = btc_trend_score()[0] > 0
     btc_text = "bullish" if btc_bullish else "bearish"
 
-    # Build TP list as string: TP1 (0.5R), TP2 (1R), TP3 (2R), TP4 (3R), TP5 (5R)
+    # TP string
     tp_str = f"{tps[0]:.6f} (0.5R) / {tps[1]:.6f} (1R) / {tps[2]:.6f} (2R) / {tps[3]:.6f} (3R) / {tps[4]:.6f} (5R)"
 
     system_msg = (
-        "You are the best crypto analyst on Binance Square. Your posts are detailed, educational, "
-        "and sound like a real human trader sharing a high‑conviction setup. They consistently go viral because they provide "
-        "clear technical reasoning, exact levels, and an engaging tone. Never use generic phrases. "
-        "Always start with a unique, scroll‑stopping hook using the cashtag. "
-        "Then give a thorough chart analysis explaining what the EMA50, VWAP, volume, and BTC correlation mean for this trade. "
-        "List the risk‑managed levels with precise numbers. End with an open‑ended question and hashtags. "
-        "Use emojis sparingly but effectively. Keep paragraphs short for mobile readability."
+        "You are the #1 viral crypto analyst on Binance Square. Every post you write uses a completely fresh, "
+        "creative hook that makes people stop scrolling. You never repeat the same opening twice. You explain the "
+        "technical setup like a real trader talking to a friend, using plain English, not a template. Your posts are "
+        "detailed, educational, and feel spontaneous. You include the exact risk levels provided, and you always end "
+        "with a question that invites discussion. Use emojis sparingly to highlight key points, not as decoration. "
+        "Keep paragraphs short for mobile readers. Never mention 'EMA50' or 'VWAP' without also explaining what they "
+        "mean for price action. Never output 'RATING:' or any meta text."
     )
 
     user_prompt = (
         f"Write a Binance Square post for a {direction} setup on ${ticker} (USDT pair, 4‑hour chart).\n\n"
-        f"Technical context:\n"
+        f"Key technicals:\n"
         f"- Price: {price:.4f}\n"
-        f"- 50‑period EMA is {ema_slope} and price is {ema_rel} it.\n"
-        f"- Anchored VWAP is {vwap_rel} the current price.\n"
-        f"- Volume is {vol_desc}.\n"
-        f"- $BTC is {btc_text}, which {'supports' if btc_bullish else 'weighs on'} altcoins.\n\n"
-        f"Risk‑managed levels:\n"
+        f"- 50‑EMA is {ema_slope} and price is {ema_rel} it (so momentum is {'supporting' if direction=='LONG' else 'capping'} the move).\n"
+        f"- Anchored VWAP is {vwap_rel} price, acting as {'support' if vwap_rel=='below' else 'resistance' if vwap_rel=='above' else 'a magnet'}.\n"
+        f"- Volume has been {vol_desc}, which {'confirms' if vol_desc=='increasing' else 'shows'} buyer/seller interest.\n"
+        f"- $BTC is in a {btc_text} structure, {'giving altcoins a tailwind' if btc_bullish else 'adding caution to altcoins'}.\n\n"
+        f"Risk‑managed levels (use exactly these numbers):\n"
         f"- Area of Interest: {entry:.6f}\n"
         f"- Technical Invalidation: {stop:.6f} ({sl_pct:.2f}%)\n"
         f"- Target Objectives: {tp_str}\n\n"
-        "Include the exact levels in the post exactly as given. "
-        "Make the hook unique and eye‑catching. Explain the reasoning behind the setup. "
-        "Ask a question that encourages comments. Use these hashtags: #CryptoAnalysis #{ticker} #TechnicalAnalysis #BinanceSquare. "
-        "Add the standard disclaimer about educational purposes and DYOR."
+        "CRITICAL: Start with a unique, scroll‑stopping hook that includes the cashtag. Do NOT use 'Order books are thinning out' or any phrase you've used before. Be creative. Then explain the setup in 2‑3 short paragraphs. Include the risk levels. Ask an engaging question. End with the hashtags: #CryptoAnalysis #{ticker} #TechnicalAnalysis #BinanceSquare and the standard disclaimer."
     )
 
-    url = "https://api.groq.com/openai/v1/chat/completions"
-    headers = {"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"}
-    payload = {
-        "model": "qwen-2.5-72b",
-        "messages": [
-            {"role": "system", "content": system_msg},
-            {"role": "user", "content": user_prompt}
-        ],
-        "temperature": 0.9,
-        "max_tokens": 600
-    }
-    try:
-        resp = requests.post(url, headers=headers, json=payload, timeout=60)
-        if resp.status_code == 200:
-            text = resp.json()["choices"][0]["message"]["content"]
-            if text and len(text) > 100:
-                return text
-    except:
-        pass
+    def call_qwen(sys_msg, usr_msg, temp=1.0):
+        url = "https://api.groq.com/openai/v1/chat/completions"
+        headers = {"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"}
+        payload = {
+            "model": "qwen-2.5-72b",
+            "messages": [
+                {"role": "system", "content": sys_msg},
+                {"role": "user", "content": usr_msg}
+            ],
+            "temperature": temp,
+            "max_tokens": 600
+        }
+        try:
+            r = requests.post(url, headers=headers, json=payload, timeout=60)
+            if r.status_code == 200:
+                return r.json()["choices"][0]["message"]["content"]
+        except:
+            pass
+        return None
 
-    # Fallback (should rarely trigger)
-    direction_icon = "📈" if direction=="LONG" else "📉"
-    return (
-        f"${ticker} is showing strong technical signs of a {direction.lower()} continuation. {direction_icon}\n\n"
-        f"The 50‑EMA is {ema_slope} while price holds {ema_rel} it, and the anchored VWAP is {vwap_rel} price, reinforcing the bias. "
-        f"Volume is {vol_desc}, and with $BTC in a {btc_text} structure, altcoins are getting a clear tailwind.\n\n"
-        f"🎯 Risk‑Managed Levels:\n"
-        f"• Area of Interest: {entry:.6f}\n"
-        f"• Technical Invalidation: {stop:.6f} ({sl_pct:.2f}%)\n"
-        f"• Target Objectives: {tp_str}\n\n"
-        f"What’s your take on ${ticker} right now? Share your thoughts below!\n"
-        f"#CryptoAnalysis #{ticker} #TechnicalAnalysis #BinanceSquare\n"
-        f"*Disclaimer: This analysis is for educational purposes only and does not constitute financial advice. Always DYOR.*"
-    )
+    text = call_qwen(system_msg, user_prompt, 1.0)
+    if not text or len(text) < 150:
+        text = call_qwen(system_msg, user_prompt, 1.1)
+
+    # Fallback (extremely rare) – now varied per coin
+    if not text:
+        hooks = [
+            f"I've been watching ${ticker} closely – the technicals just lined up in a way I can't ignore. ⚡",
+            f"${ticker} is printing a textbook {direction.lower()} structure on the 4‑hour chart. 🚀",
+            f"Most traders are sleeping on ${ticker} right now, but the EMA50 just gave a clear signal. 🧐",
+        ]
+        hook = random.choice(hooks)
+        direction_icon = "📈" if direction=="LONG" else "📉"
+        text = (
+            f"{hook} {direction_icon}\n\n"
+            f"The 50‑EMA is {ema_slope} and price is holding {ema_rel} it, which means the trend is intact. "
+            f"Anchored VWAP is {vwap_rel} price, acting as {'support' if vwap_rel=='below' else 'resistance' if vwap_rel=='above' else 'a magnet'}. "
+            f"Volume has been {vol_desc}, confirming market interest. With $BTC in a {btc_text} trend, this setup has a clear bias.\n\n"
+            f"🎯 Risk‑Managed Levels:\n"
+            f"• Area of Interest: {entry:.6f}\n"
+            f"• Technical Invalidation: {stop:.6f} ({sl_pct:.2f}%)\n"
+            f"• Target Objectives: {tp_str}\n\n"
+            f"What’s your game plan for ${ticker}? Are you entering now or waiting for a retest?\n"
+            f"#CryptoAnalysis #{ticker} #TechnicalAnalysis #BinanceSquare\n"
+            f"*Disclaimer: This analysis is for educational purposes only and does not constitute financial advice. Always DYOR.*"
+        )
+
+    return text.strip()
 
 # ========== TRADE MANAGER (20% partials, BE after TP1, auto close) ==========
 def check_open_trades():
@@ -451,7 +462,7 @@ def check_open_trades():
     else: open_df = open_df.drop_duplicates("symbol", keep="last")
     results = []; still_open = []; alerts = []
     now = datetime.now()
-    fractions = [0.20, 0.20, 0.20, 0.20, 0.20]  # TP1..TP5
+    fractions = [0.20, 0.20, 0.20, 0.20, 0.20]
     for _, trade in open_df.iterrows():
         try:
             sym = trade["symbol"]; direction = trade["action"]
@@ -465,27 +476,22 @@ def check_open_trades():
             df_1h = get_yahoo_klines(sym, interval='1h', start=datetime.strptime(trade["timestamp"],"%Y-%m-%d %H:%M:%S"), end=now)
             if df_1h.empty: still_open.append(trade); continue
             current_stop = entry if highest_tp_idx >= 0 else stop_orig
-            outcome = None; exit_price = None
             for _, candle in df_1h.iterrows():
                 high, low = candle['High'], candle['Low']
-                # Check for new TP hits (only if higher than last hit)
                 new_tp_idx = None
                 if direction == "LONG":
                     for i in range(len(tps)-1, -1, -1):
                         if high >= tps[i] and i > highest_tp_idx:
-                            new_tp_idx = i
-                            break
+                            new_tp_idx = i; break
                 else:
                     for i in range(len(tps)-1, -1, -1):
                         if low <= tps[i] and i > highest_tp_idx:
-                            new_tp_idx = i
-                            break
+                            new_tp_idx = i; break
                 if new_tp_idx is not None:
-                    # Process all freshly reached TPs up to new_tp_idx
                     for i in range(highest_tp_idx+1, new_tp_idx+1):
                         if remaining_qty <= 0: break
-                        if i == 0:  # TP1
-                            current_stop = entry  # move to BE
+                        if i == 0:
+                            current_stop = entry
                         fraction = fractions[i]
                         exit_qty = orig_qty * fraction
                         if exit_qty > remaining_qty: exit_qty = remaining_qty
@@ -503,7 +509,7 @@ def check_open_trades():
                             remaining_qty -= exit_qty
                             highest_tp_idx = i
                             alerts.append(f"🚀 {sym.replace('USDT','')} {direction} TP{i+1} hit — {fraction*100:.0f}% closed")
-                        if i == 4:  # TP5 reached, remaining closed
+                        if i == 4:
                             if remaining_qty > 0:
                                 final_exit_qty = remaining_qty
                                 pnl = (tps[4] - entry) * final_exit_qty if direction=="LONG" else (entry - tps[4]) * final_exit_qty
@@ -519,7 +525,6 @@ def check_open_trades():
                                 alerts.append(f"🔔 {sym.replace('USDT','')} {direction} TP5 hit — remaining closed")
                             break
                     # end for
-                # Check stop loss
                 if remaining_qty > 0:
                     sl_hit = (low <= current_stop) if direction=="LONG" else (high >= current_stop)
                     if sl_hit:
@@ -553,7 +558,7 @@ def check_open_trades():
     save_portfolio(portfolio)
     if alerts: send_telegram("\n".join(alerts))
 
-# ========== SIGNAL GENERATION (threshold 1.49, 5 TPs, 20% partials) ==========
+# ========== SIGNAL GENERATION (threshold 1.49, 5 TPs) ==========
 def generate_signal(balance_usdt):
     try:
         coins_data = fetch_coingecko("https://api.coingecko.com/api/v3/coins/markets?vs_currency=usd&order=volume_desc&per_page=100&page=1")
@@ -618,7 +623,6 @@ def generate_signal(balance_usdt):
         stop = entry - min_stop if direction=="LONG" else entry + min_stop
         risk_per_share = abs(entry - stop)
         qty = round((balance_usdt * 0.01) / risk_per_share, 6)
-        # New TP multipliers
         mults = [0.5, 1.0, 2.0, 3.0, 5.0]
         tps = []
         for m in mults:
@@ -644,7 +648,7 @@ def generate_signal(balance_usdt):
         print(f"generate_signal error: {e}")
         return {"action":"HOLD","reasoning":f"Internal error: {e}","summary":""}
 
-# ========== DARK CHART (all TPs drawn) ==========
+# ========== DARK CHART ==========
 def send_trade_chart(signal):
     try:
         import matplotlib; matplotlib.use('Agg'); import matplotlib.pyplot as plt; import mplfinance as mpf
