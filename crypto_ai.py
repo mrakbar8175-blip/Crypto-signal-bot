@@ -474,7 +474,7 @@ def generate_post(coin, direction, btc_score, macro_score):
         )
     return text.strip()
 
-# ========== TRADE MANAGER (simplified: TP1 only, no trail) ==========
+# ========== TRADE MANAGER (TP1 only, no trail) ==========
 def check_open_trades():
     try:
         open_df = pd.read_csv(OPEN_TRADES_CSV)
@@ -535,7 +535,7 @@ def check_open_trades():
     save_portfolio(portfolio)
     if alerts: send_telegram("\n".join(alerts))
 
-# ========== SIGNAL GENERATION (with TP2 & coin summary) ==========
+# ========== SIGNAL GENERATION (with TP2, layer details, error flags) ==========
 def generate_signal(balance_usdt):
     try:
         coins_data = fetch_coingecko("https://api.coingecko.com/api/v3/coins/markets?vs_currency=usd&order=volume_desc&per_page=100&page=1")
@@ -569,12 +569,24 @@ def generate_signal(balance_usdt):
             coin["score"] = total; coin["atr"] = atr; coin["layers"] = layers; coin["trend_dir"] = trend_dir; coin["adx"] = adx
             all_scored.append(coin)
         if not all_scored: return {"action":"HOLD","reasoning":"No valid scores.","summary":""}
-        # build summary
         all_scored_sorted = sorted(all_scored, key=lambda x: abs(x["score"]), reverse=True)
         summary = " | ".join([f"{c['symbol'].replace('USDT','')}: {c['score']:.2f}" for c in all_scored_sorted[:30]])
         best = all_scored_sorted[0]
         if abs(best["score"]) < 1.49:
-            return {"action":"HOLD","reasoning":f"No strong conviction. Best score {best['score']:.2f} for {best['symbol']}.","summary":summary}
+            layer_str = "; ".join([f"{k}={v:.2f}" for k,v in best["layers"].items()])
+            errors = []
+            for k, v in best["layers"].items():
+                if abs(v) < 0.001:
+                    errors.append(f"{k} zero")
+            err_msg = ""
+            if errors:
+                err_msg = f" ⚠️ Layers with possible error: {', '.join(errors)}."
+            reason = (
+                f"No strong conviction. Best score: {best['score']:.2f} for {best['symbol']}.\n"
+                f"Layers: {layer_str}{err_msg}\n"
+                f"Top coins: {summary}"
+            )
+            return {"action":"HOLD", "reasoning": reason, "summary": summary}
         direction = "LONG" if best["score"]>=0 else "SHORT"
         entry = best.get("bid", best["price"]*0.999) if direction=="LONG" else best.get("ask", best["price"]*1.001)
         atr = best["atr"]
@@ -663,10 +675,7 @@ def main():
             send_telegram(dec['post_text'])
             send_trade_chart(dec)
         else:
-            msg = f"HOLD\n{dec.get('reasoning','No signal')}"
-            summ = dec.get('summary','')
-            if summ: msg += f"\n\nTop coins: {summ}"
-            send_telegram(msg)
+            send_telegram(dec.get('reasoning','HOLD'))
     except Exception as e:
         err = f"Bot crashed: {traceback.format_exc()}"
         print(err); send_telegram(err[:500])
