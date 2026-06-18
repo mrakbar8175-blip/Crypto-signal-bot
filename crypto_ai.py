@@ -166,7 +166,7 @@ def update_portfolio(trade_result):
     portfolio['realized_pnl'] += trade_result['pnl_usdt']
     save_portfolio(portfolio)
 
-# ========== IMPROVED INTERMARKET (retry + fallback) ==========
+# ========== SUPER‑PERSISTENT INTERMARKET (multi‑timeframe fallback) ==========
 def safe_ema(series, span):
     try:
         return series.ewm(span=span, adjust=False).mean()
@@ -174,52 +174,73 @@ def safe_ema(series, span):
         return pd.Series(index=series.index)
 
 def btc_trend_score():
-    for attempt in range(2):
+    """Attempt to fetch BTC trend with increasing persistence."""
+    # 1. Try 4h data twice
+    for delay in [3, 5]:
         try:
             df = get_yahoo_klines("BTCUSDT", interval='4h', days=14)
-            if df.empty or len(df) < 50:
-                if attempt == 0:
-                    time.sleep(3)
-                    continue
-                return btc_fallback_score()
-            closes = df['Close']
-            ema50 = safe_ema(closes, 50)
-            cur = closes.iloc[-1]
-            ema_now = ema50.iloc[-1]
-            slope_up = ema_now > ema50.iloc[-7] if len(ema50) >= 7 else True
-            price_above = cur > ema_now
-            if price_above and slope_up:
-                return 2, None
-            elif not price_above and not slope_up:
-                return -2, None
-            else:
-                return 0, None
+            if not df.empty and len(df) >= 50:
+                closes = df['Close']
+                ema50 = safe_ema(closes, 50)
+                cur = closes.iloc[-1]
+                ema_now = ema50.iloc[-1]
+                slope_up = ema_now > ema50.iloc[-7] if len(ema50) >= 7 else True
+                price_above = cur > ema_now
+                if price_above and slope_up:
+                    return 2, None
+                elif not price_above and not slope_up:
+                    return -2, None
+                else:
+                    return 0, None
+            time.sleep(delay)
         except:
-            if attempt == 0:
-                time.sleep(3)
-            else:
-                return btc_fallback_score()
-    return btc_fallback_score()
+            time.sleep(delay)
 
-def btc_fallback_score():
+    # 2. Try 1h data (last 50 hours)
     try:
-        df_daily = get_yahoo_klines("BTCUSDT", interval='1d', days=90)
-        if not df_daily.empty and len(df_daily) >= 50:
-            closes = df_daily['Close']
+        df_1h = get_yahoo_klines("BTCUSDT", interval='1h', days=3)
+        if not df_1h.empty and len(df_1h) >= 50:
+            closes = df_1h['Close']
             ema50 = safe_ema(closes, 50)
             cur = closes.iloc[-1]
             ema_now = ema50.iloc[-1]
             slope_up = ema_now > ema50.iloc[-7] if len(ema50) >= 7 else True
             price_above = cur > ema_now
-            if price_above and slope_up: return 2, "fallback daily"
-            elif not price_above and not slope_up: return -2, "fallback daily"
-            else: return 0, "fallback daily"
+            if price_above and slope_up: return 2, "1h fallback"
+            elif not price_above and not slope_up: return -2, "1h fallback"
+            else: return 0, "1h fallback"
+    except:
+        pass
+
+    # 3. Try daily data (last 50 days)
+    try:
+        df_d = get_yahoo_klines("BTCUSDT", interval='1d', days=90)
+        if not df_d.empty and len(df_d) >= 50:
+            closes = df_d['Close']
+            ema50 = safe_ema(closes, 50)
+            cur = closes.iloc[-1]
+            ema_now = ema50.iloc[-1]
+            slope_up = ema_now > ema50.iloc[-7] if len(ema50) >= 7 else True
+            price_above = cur > ema_now
+            if price_above and slope_up: return 2, "daily fallback"
+            elif not price_above and not slope_up: return -2, "daily fallback"
+            else: return 0, "daily fallback"
+    except:
+        pass
+
+    # 4. Absolute last resort: CoinGecko live price + approximate EMA
+    try:
         data = fetch_coingecko("https://api.coingecko.com/api/v3/simple/price?ids=bitcoin&vs_currencies=usd")
         if data and 'bitcoin' in data:
-            return 0, "live price only"
-        return 0, "BTC data unavailable"
+            btc_price = data['bitcoin']['usd']
+            # We'll use a very rough estimate: assume EMA50 is around the current price
+            # This is inaccurate, so we return 0 with a note, not a fake direction.
+            return 0, "live price only (neutral)"
     except:
-        return 0, "BTC fallback error"
+        pass
+
+    # If everything failed, return 0 with an error message
+    return 0, "BTC data unavailable after all attempts"
 
 def institutional_macro_filter():
     try:
@@ -455,7 +476,6 @@ def evaluate_deep(coin, direction, btc_score, macro_score):
     ema_slope = "rising" if trend_dir == "up" else "falling"
     vwap_score = anchored_vwap_score(get_yahoo_klines(sym, interval='4h', days=14), price)
     vwap_rel = "above" if vwap_score > 0 else "below" if vwap_score < 0 else "near"
-    # Safe volume trend call
     try:
         vol_trend_s, _ = volume_trend_score(sym, direction)
         vol_trend = "increasing" if vol_trend_s > 0 else "decreasing" if vol_trend_s < 0 else "flat"
@@ -514,7 +534,6 @@ def generate_post(coin, direction, entry, stop, tps, sl_pct, qwen_reason=""):
     ema_slope = "rising" if trend_dir=="up" else "falling"
     vwap_score = anchored_vwap_score(get_yahoo_klines(sym, interval='4h', days=14), price)
     vwap_rel = "above" if vwap_score>0 else "below" if vwap_score<0 else "near"
-    # Safe volume trend call
     try:
         vol_trend_s, _ = volume_trend_score(sym, direction)
         vol_desc = "increasing" if vol_trend_s > 0 else "decreasing" if vol_trend_s < 0 else "steady"
@@ -624,7 +643,7 @@ def generate_post(coin, direction, entry, stop, tps, sl_pct, qwen_reason=""):
         )
     return text.strip()
 
-# ========== TRADE MANAGER (full closure chart + alert) ==========
+# ========== TRADE MANAGER ==========
 def check_open_trades():
     try:
         open_df = pd.read_csv(OPEN_TRADES_CSV)
@@ -802,18 +821,14 @@ def generate_signal(balance_usdt):
             if best_all:
                 layer_str = "; ".join([f"{k}={v:.2f}" for k,v in best_all["layers"].items()])
                 errors = []
-                for k, v in best_all["layers"].items():
-                    if abs(v) < 0.001:
-                        errors.append(f"{k} zero")
-                err_msg = ""
-                if errors:
-                    err_msg = f" ⚠️ Layers with possible error: {', '.join(errors)}."
-                if btc_err and abs(best_all["layers"].get("intermarket", 0)) < 0.001:
-                    err_msg += f" (BTC: {btc_err})"
+                # Only flag intermarket zero if BTC data failed completely
+                if btc_err and "BTC data unavailable after all attempts" in btc_err:
+                    errors.append("intermarket (BTC data failed)")
                 reason = (
                     f"No strong conviction. Best internal score: {best_all['score']:.2f} for {best_all['symbol']}.\n"
                     f"Qwen filter active – no candidate passed the quality check.\n"
-                    f"Layers: {layer_str}{err_msg}\n"
+                    f"Layers: {layer_str}\n"
+                    f"{'⚠️ ' + btc_err if btc_err else ''}\n"
                     f"Top coins: {summary}"
                 )
             else:
