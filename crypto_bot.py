@@ -1,8 +1,6 @@
 #!/usr/bin/env python3
 """
-Crypto Swing Bot – TP1 Optimized (0.5R), 5 TPs: 0.5/1/2/3/5R
-1h micro‑trend + relaxed momentum for maximum TP1 hit rate.
-Spot trading on USDT pairs, data via yfinance.
+Crypto Swing Bot – Top 50 liquid coins via CoinGecko, TP1 Optimized (0.5R), 5 TPs
 """
 
 import requests, json, os, traceback
@@ -18,12 +16,53 @@ GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
 if not GROQ_API_KEY:
     print("WARNING: GROQ_API_KEY not set – AI filtering disabled.")
 
-# ========== CRYPTO UNIVERSE (USDT pairs) ==========
-CRYPTO_PAIRS = [
-    "BTC-USDT", "ETH-USDT", "BNB-USDT", "ADA-USDT", "SOL-USDT",
-    "XRP-USDT", "DOGE-USDT", "DOT-USDT", "MATIC-USDT", "LINK-USDT",
-    "UNI-USDT", "AVAX-USDT", "ATOM-USDT", "LTC-USDT", "FIL-USDT"
-]
+# ========== DYNAMIC COIN LIST (CoinGecko) ==========
+def fetch_top_liquid_coins(limit=50):
+    """
+    Fetch top N coins by 24h trading volume (USDT pairs) using CoinGecko API.
+    Returns list of yfinance symbols like 'BTC-USD'.
+    """
+    url = "https://api.coingecko.com/api/v3/coins/markets"
+    params = {
+        "vs_currency": "usd",
+        "order": "volume_desc",
+        "per_page": limit,
+        "page": 1,
+        "sparkline": False,
+        "price_change_percentage": "24h"
+    }
+    try:
+        resp = requests.get(url, params=params, timeout=15)
+        data = resp.json()
+        # CoinGecko returns a list of coins; each has 'symbol' (e.g., 'btc')
+        yf_symbols = []
+        for coin in data:
+            symbol = coin.get("symbol", "").upper()
+            if symbol:  # avoid empty symbols
+                # yfinance uses 'BTC-USD' format
+                yf_symbols.append(f"{symbol}-USD")
+        # Ensure no duplicates (unlikely but safe)
+        yf_symbols = list(dict.fromkeys(yf_symbols))  # preserve order
+        print(f"Fetched {len(yf_symbols)} coins from CoinGecko: {', '.join(yf_symbols[:10])}...")
+        return yf_symbols[:limit]
+    except Exception as e:
+        print(f"CoinGecko API failed: {e}. Using fallback list.")
+        # Fallback to a safe static list (top liquid coins)
+        return [
+            "BTC-USD", "ETH-USD", "BNB-USD", "SOL-USD", "XRP-USD",
+            "ADA-USD", "DOGE-USD", "DOT-USD", "MATIC-USD", "LINK-USD",
+            "UNI-USD", "AVAX-USD", "LTC-USD", "FIL-USD", "TRX-USD",
+            "ATOM-USD", "XLM-USD", "ETC-USD", "BCH-USD", "NEAR-USD",
+            "VET-USD", "ICP-USD", "HBAR-USD", "APT-USD", "ARB-USD",
+            "OP-USD", "GRT-USD", "THETA-USD", "ALGO-USD", "FTM-USD",
+            "EGLD-USD", "IMX-USD", "SAND-USD", "AXS-USD", "MANA-USD",
+            "AAVE-USD", "MKR-USD", "SNX-USD", "CRV-USD", "COMP-USD",
+            "ZEC-USD", "BAT-USD", "ENJ-USD", "CHZ-USD", "HOT-USD",
+            "KSM-USD", "DASH-USD", "CELO-USD", "QTUM-USD", "IOST-USD"
+        ][:limit]
+
+CRYPTO_PAIRS = fetch_top_liquid_coins(50)
+print(f"Trading universe: {len(CRYPTO_PAIRS)} coins")
 
 # ========== PORTFOLIO ==========
 PORTFOLIO_FILE = "crypto_portfolio.json"
@@ -34,10 +73,10 @@ def load_portfolio():
             with open(PORTFOLIO_FILE) as f:
                 data = json.load(f)
             return {
-                "balance": data.get("balance", 1000.0),        # USDT
+                "balance": data.get("balance", 1000.0),
                 "realized_pnl": data.get("realized_pnl", 0.0),
                 "open_positions": data.get("open_positions", 0),
-                "daily_loss_limit": data.get("daily_loss_limit", -20)  # USDT
+                "daily_loss_limit": data.get("daily_loss_limit", -20)
             }
         except:
             pass
@@ -143,8 +182,8 @@ def update_portfolio(trade_result):
 
 # ========== DATA ==========
 def get_data(pair, interval='4h', days=14, start=None, end=None):
-    # yfinance crypto symbols use "-" e.g. "BTC-USD"
-    ysym = pair.replace("-USDT", "-USD")   # BTC-USDT -> BTC-USD
+    # pair is already like 'BTC-USD'
+    ysym = pair  # e.g., "BTC-USD"
     if start is None:
         end = datetime.now()
         start = end - timedelta(days=days)
@@ -161,8 +200,7 @@ def get_data(pair, interval='4h', days=14, start=None, end=None):
         return pd.DataFrame()
 
 def get_total_market_index(interval='4h', days=14):
-    # Use TOTAL or TOTAL2 from TradingView via yfinance if available, else dummy.
-    # We'll try "TOTAL" which is a crypto total market cap index on some sources.
+    # Use TOTAL or TOTAL2 from TradingView; we try a yfinance ticker that sometimes works
     try:
         df = yf.download("TOTAL", period=f"{days}d", interval=interval, progress=False)
         if not df.empty:
@@ -270,14 +308,12 @@ def score_pair(pair):
     vol_avg = df_4h['Volume'].iloc[-6:-1].mean() if len(df_4h) >= 6 else vol_last
     vol_surge = vol_last > vol_avg * 1.2
 
-    # Market index alignment (e.g., TOTAL)
+    # Market index alignment
     total_df = get_total_market_index(interval='4h', days=14)
     market_aligned = False
     if not total_df.empty:
         total_ema50 = ema(total_df['Close'], 50)
         market_trend_up = total_df['Close'].iloc[-1] > total_ema50.iloc[-1]
-        # Crypto pairs rise with market (bullish) – long signals are better when market is up.
-        # We'll give bonus if direction aligns with market trend.
         if trend_daily == 1 and market_trend_up:
             market_aligned = True
         elif trend_daily == -1 and not market_trend_up:
@@ -288,7 +324,6 @@ def score_pair(pair):
 
     direction = "LONG" if trend_daily == 1 else "SHORT"
 
-    # Standard layers
     if direction == "LONG":
         ema_align = price > ema50_4h.iloc[-1] and ema50_4h.iloc[-1] > ema200_4h.iloc[-1]
     else:
@@ -315,7 +350,6 @@ def score_pair(pair):
     vol_score = bool_score(vol_surge)
     market_score = bool_score(market_aligned)
 
-    # TP1-optimized layers
     if direction == "LONG":
         candle_momentum_ok = bullish_momentum > 0.4
         rsi_1h_ok = rsi_1h < 65
@@ -331,12 +365,10 @@ def score_pair(pair):
     rsi_1h_score = bool_score(rsi_1h_ok)
     micro_trend_score = bool_score(micro_trend_ok)
 
-    # Minimum ATR requirement (in price terms, 0.5% of price to avoid noise)
-    min_atr_ratio = 0.005   # 0.5% of price
+    min_atr_ratio = 0.005
     atr_ok = atr_val > price * min_atr_ratio
     atr_score = bool_score(atr_ok)
 
-    # Total score (same weights as original)
     total = (
         ema_score * 2.0 +
         adx_score * 1.5 +
@@ -427,9 +459,8 @@ def generate_signal():
     best = candidates[0]
     pair, score, direction, price, atr_val, swing_level = best
 
-    # Stop loss: base = 1.0 * ATR, but bounded by min/max % of price
-    min_stop_pct = 0.002   # 0.2%
-    max_stop_pct = 0.01    # 1.0%
+    min_stop_pct = 0.002
+    max_stop_pct = 0.01
     raw_stop = atr_val * 1.0
     min_stop = price * min_stop_pct
     max_stop = price * max_stop_pct
@@ -447,7 +478,6 @@ def generate_signal():
     stop = round(stop, 6)
     risk = abs(price - stop)
 
-    # TP multipliers
     tp_multipliers = [0.5, 1.0, 2.0, 3.0, 5.0]
     tps = []
     for m in tp_multipliers:
@@ -456,11 +486,8 @@ def generate_signal():
         else:
             tps.append(round(price - m * risk, 6))
 
-    # Position sizing: 1% of balance risked on the stop distance
     risk_amount = portfolio['balance'] * 0.01
     quantity = risk_amount / risk
-    # Round quantity to appropriate decimal places (8 for most coins)
-    # For high-priced coins like BTC, 8 decimals is fine.
     quantity = round(quantity, 8)
 
     signal = {
