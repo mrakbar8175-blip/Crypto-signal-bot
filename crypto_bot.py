@@ -2,7 +2,7 @@
 """
 Crypto Swing Bot – Top 50 liquid coins via CoinGecko, TP1 Optimized (0.5R), 5 TPs
 Signal formatting: Elite 7-angle Binance Square posts
-Moderate stop loss (dynamic: 0.3‑2.0%) based on coin rank
+Dynamic stop loss (0.3‑2.0%) based on coin rank
 Breakeven after TP1, allows new signals on same pair
 BLACKLIST for unwanted coins (stablecoins, QUQ, etc.)
 """
@@ -33,6 +33,7 @@ def fetch_top_liquid_coins(limit=50):
     Filters out blacklisted coins and returns yfinance symbols like 'BTC-USD'.
     Also stores the coin's market cap rank for stop loss adjustment.
     """
+    global COIN_RANK                           # declare at the top
     url = "https://api.coingecko.com/api/v3/coins/markets"
     params = {
         "vs_currency": "usd",
@@ -46,7 +47,6 @@ def fetch_top_liquid_coins(limit=50):
         resp = requests.get(url, params=params, timeout=15)
         data = resp.json()
         yf_symbols = []
-        global COIN_RANK    # store rank for stop‑loss logic
         COIN_RANK = {}
         rank = 1
         for coin in data:
@@ -73,8 +73,6 @@ def fetch_top_liquid_coins(limit=50):
             "ZEC-USD", "BAT-USD", "ENJ-USD", "CHZ-USD", "HOT-USD",
             "KSM-USD", "DASH-USD", "CELO-USD", "QTUM-USD", "IOST-USD"
         ]
-        # Assign ranks to fallback
-        global COIN_RANK
         COIN_RANK = {sym: i+1 for i, sym in enumerate(fallback)}
         return fallback[:limit]
 
@@ -582,14 +580,12 @@ def check_open_trades():
             continue
 
         highest_tp_idx = int(trade.get("highest_tp", -1))
-        # current stop: entry if already breakeven, else the original stop
         current_stop = entry if breakeven else stop_orig
 
         for candle_time, candle in df_1h.iterrows():
             high = candle['High']
             low = candle['Low']
 
-            # Check take profit hits
             new_tp_idx = None
             if direction == "LONG":
                 for i in range(len(tps)-1, -1, -1):
@@ -624,7 +620,6 @@ def check_open_trades():
                         remaining_qty -= exit_qty
                         highest_tp_idx = i
                         if i == 0:
-                            # TP1 hit -> set breakeven, move SL to entry
                             breakeven = True
                             current_stop = entry
                     alerts.append(f"🚀 {sym} {direction} TP{i+1} hit — {fraction*100:.0f}% closed, SL to BE")
@@ -633,7 +628,6 @@ def check_open_trades():
                 if remaining_qty <= 0:
                     break
 
-            # Check stop loss (only if still open)
             if remaining_qty > 0:
                 sl_hit = (low <= current_stop) if direction == "LONG" else (high >= current_stop)
                 if sl_hit:
@@ -642,7 +636,7 @@ def check_open_trades():
                     final = trade.to_dict()
                     if breakeven:
                         desc = "BREAKEVEN STOP"
-                        pnl = 0.0   # force zero pnl when stopped at entry
+                        pnl = 0.0
                     else:
                         desc = "STOP LOSS" if highest_tp_idx == -1 else f"STOP LOSS after TP{highest_tp_idx+1}"
                     final["hit_level"] = desc
