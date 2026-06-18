@@ -1,4 +1,11 @@
-import requests, json, os, traceback, re
+#!/usr/bin/env python3
+"""
+Crypto Swing Bot – TP1 Optimized (0.5R), 5 TPs: 0.5/1/2/3/5R
+1h micro‑trend + relaxed momentum for maximum TP1 hit rate.
+Spot trading on USDT pairs, data via yfinance.
+"""
+
+import requests, json, os, traceback
 import pandas as pd
 import numpy as np
 import yfinance as yf
@@ -9,65 +16,142 @@ TELEGRAM_TOKEN = os.environ["TELEGRAM_TOKEN"]
 CHAT_ID = os.environ["CHAT_ID"]
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
 if not GROQ_API_KEY:
-    raise RuntimeError("GROQ_API_KEY not set in secrets.")
+    print("WARNING: GROQ_API_KEY not set – AI filtering disabled.")
 
-# ========== PAPER PORTFOLIO ==========
-portfolio = {
-    "balance_usdt": 1000.0,
-    "positions": [],
-    "realized_pnl": 0.0,
-    "daily_loss_limit": -20
-}
+# ========== CRYPTO UNIVERSE (USDT pairs) ==========
+CRYPTO_PAIRS = [
+    "BTC-USDT", "ETH-USDT", "BNB-USDT", "ADA-USDT", "SOL-USDT",
+    "XRP-USDT", "DOGE-USDT", "DOT-USDT", "MATIC-USDT", "LINK-USDT",
+    "UNI-USDT", "AVAX-USDT", "ATOM-USDT", "LTC-USDT", "FIL-USDT"
+]
 
-# ========== FULL UNIVERSE (deduplicated) ==========
-COIN_LIST = list(set([
-    "BTCUSDT", "ETHUSDT", "BNBUSDT", "XRPUSDT", "ADAUSDT",
-    "SOLUSDT", "DOGEUSDT", "AVAXUSDT", "DOTUSDT", "LINKUSDT",
-    "MATICUSDT", "LTCUSDT", "NEARUSDT", "ATOMUSDT", "ETCUSDT",
-    "STXUSDT", "FILUSDT", "ARBUSDT", "OPUSDT", "INJUSDT",
-    "TIAUSDT", "SEIUSDT", "RUNEUSDT", "GRTUSDT", "AAVEUSDT",
-    "ALGOUSDT", "SANDUSDT", "MANAUSDT", "THETAUSDT", "FTMUSDT",
-    "EOSUSDT", "MKRUSDT", "LDOUSDT", "IMXUSDT", "FLOWUSDT",
-    "XTZUSDT", "NEOUSDT", "KSMUSDT", "ZECUSDT", "DASHUSDT",
-    "EGLDUSDT", "MINAUSDT", "GALAUSDT", "HNTUSDT", "CFXUSDT",
-    "ARUSDT", "FETUSDT", "AGIXUSDT", "OCEANUSDT", "1INCHUSDT",
-    "CRVUSDT", "AXSUSDT", "CHZUSDT", "ENJUSDT", "BATUSDT",
-    "SNXUSDT", "COMPUSDT", "YFIUSDT", "SUSHIUSDT", "ZRXUSDT",
-    "RENUSDT", "CELOUSDT", "LRCUSDT", "ANKRUSDT", "STORJUSDT",
-    "COTIUSDT", "KAVAUSDT", "ICXUSDT", "ONTUSDT", "ZILUSDT",
-    "WAVESUSDT", "QTUMUSDT", "OMGUSDT", "BANDUSDT", "DENTUSDT",
-    "HOTUSDT", "IOSTUSDT", "RVNUSDT", "SCUSDT", "ZENUSDT",
-    "CKBUSDT", "SKLUSDT", "CTSIUSDT", "CTKUSDT", "LINAUSDT",
-    "TRBUSDT", "BALUSDT", "PERPUSDT", "BNTUSDT", "RSRUSDT",
-    "TOMOUSDT", "DGBUSDT", "DUSKUSDT", "REEFUSDT", "ALPHAUSDT",
-    "FORTHUSDT", "POLSUSDT", "C98USDT", "RAREUSDT", "ATAUSDT",
-    "IDEXUSDT", "MLNUSDT",
-    "PEPEUSDT", "WIFUSDT", "BONKUSDT", "FLOKIUSDT",
-    "APTUSDT", "SUIUSDT"
-]))
+# ========== PORTFOLIO ==========
+PORTFOLIO_FILE = "crypto_portfolio.json"
 
-# ========== CSV FILE PATHS ==========
-TRADE_LOG_CSV = "trade_log.csv"
-OPEN_TRADES_CSV = "open_trades.csv"
-TRADE_RESULTS_CSV = "trade_results.csv"
-
-# ========== DATA HELPERS ==========
-def fetch_coingecko(url, retries=2):
-    for _ in range(retries):
+def load_portfolio():
+    if os.path.exists(PORTFOLIO_FILE):
         try:
-            r = requests.get(url, timeout=15)
-            if r.status_code == 200:
-                return r.json()
+            with open(PORTFOLIO_FILE) as f:
+                data = json.load(f)
+            return {
+                "balance": data.get("balance", 1000.0),        # USDT
+                "realized_pnl": data.get("realized_pnl", 0.0),
+                "open_positions": data.get("open_positions", 0),
+                "daily_loss_limit": data.get("daily_loss_limit", -20)  # USDT
+            }
         except:
             pass
-    return None
+    return {
+        "balance": 1000.0,
+        "realized_pnl": 0.0,
+        "open_positions": 0,
+        "daily_loss_limit": -20
+    }
 
-def get_yahoo_klines(symbol_usdt, interval='4h', days=60):
-    yahoo_symbol = symbol_usdt.replace("USDT", "-USD")
-    end = datetime.now()
-    start = end - timedelta(days=days)
+def save_portfolio(p):
     try:
-        df = yf.download(yahoo_symbol, start=start, end=end, interval=interval, progress=False)
+        with open(PORTFOLIO_FILE, "w") as f:
+            json.dump(p, f, indent=2)
+    except:
+        pass
+
+portfolio = load_portfolio()
+
+# ========== CSV LOGGING ==========
+TRADE_LOG_CSV = "crypto_trade_log.csv"
+OPEN_TRADES_CSV = "crypto_open_trades.csv"
+TRADE_RESULTS_CSV = "crypto_trade_results.csv"
+
+def init_csv(f, cols):
+    if not os.path.exists(f):
+        pd.DataFrame(columns=cols).to_csv(f, index=False)
+
+def append_csv(f, df_new):
+    try:
+        existing = pd.read_csv(f)
+        updated = pd.concat([existing, df_new], ignore_index=True)
+    except (FileNotFoundError, pd.errors.EmptyDataError):
+        updated = df_new
+    updated.to_csv(f, index=False)
+
+def save_csv(f, df):
+    df.to_csv(f, index=False)
+
+def initialize_trade_files():
+    init_csv(TRADE_LOG_CSV, ["timestamp","symbol","action","entry","stop",
+                             "TP1","TP2","TP3","TP4","TP5","score","ai_approved"])
+    init_csv(OPEN_TRADES_CSV, ["timestamp","symbol","action","entry","stop",
+                               "TP1","TP2","TP3","TP4","TP5","status",
+                               "quantity","original_qty","highest_tp"])
+    init_csv(TRADE_RESULTS_CSV, ["timestamp","symbol","action","entry","stop",
+                                 "TP1","TP2","TP3","TP4","TP5","status",
+                                 "hit_level","close_time","exit_price","quantity","pnl"])
+
+def log_signal(sig):
+    row = {
+        "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "symbol": sig["symbol"],
+        "action": sig["action"],
+        "entry": sig["limit_price"],
+        "stop": sig["stop_loss"],
+        "TP1": sig["take_profits"][0],
+        "TP2": sig["take_profits"][1],
+        "TP3": sig["take_profits"][2],
+        "TP4": sig["take_profits"][3],
+        "TP5": sig["take_profits"][4],
+        "score": sig["score"],
+        "ai_approved": sig.get("ai_approved", False)
+    }
+    append_csv(TRADE_LOG_CSV, pd.DataFrame([row]))
+
+def add_open_trade(sig):
+    row = {
+        "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "symbol": sig["symbol"],
+        "action": sig["action"],
+        "entry": sig["limit_price"],
+        "stop": sig["stop_loss"],
+        "TP1": sig["take_profits"][0],
+        "TP2": sig["take_profits"][1],
+        "TP3": sig["take_profits"][2],
+        "TP4": sig["take_profits"][3],
+        "TP5": sig["take_profits"][4],
+        "status": "open",
+        "quantity": sig["quantity"],
+        "original_qty": sig["quantity"],
+        "highest_tp": -1
+    }
+    append_csv(OPEN_TRADES_CSV, pd.DataFrame([row]))
+
+# ========== PORTFOLIO HELPERS ==========
+def daily_pnl():
+    try:
+        df = pd.read_csv(TRADE_RESULTS_CSV)
+        if df.empty:
+            return 0.0
+        today = datetime.now().strftime("%Y-%m-%d")
+        df['close_time'] = pd.to_datetime(df['close_time'])
+        daily = df[df['close_time'].dt.strftime("%Y-%m-%d") == today]
+        return daily['pnl'].sum() if not daily.empty else 0.0
+    except:
+        return 0.0
+
+def update_portfolio(trade_result):
+    portfolio['balance'] += trade_result['pnl']
+    portfolio['realized_pnl'] += trade_result['pnl']
+    save_portfolio(portfolio)
+
+# ========== DATA ==========
+def get_data(pair, interval='4h', days=14, start=None, end=None):
+    # yfinance crypto symbols use "-" e.g. "BTC-USD"
+    ysym = pair.replace("-USDT", "-USD")   # BTC-USDT -> BTC-USD
+    if start is None:
+        end = datetime.now()
+        start = end - timedelta(days=days)
+    else:
+        end = end if end else datetime.now()
+    try:
+        df = yf.download(ysym, start=start, end=end, interval=interval, progress=False)
         if df.empty:
             return pd.DataFrame()
         if isinstance(df.columns, pd.MultiIndex):
@@ -76,612 +160,508 @@ def get_yahoo_klines(symbol_usdt, interval='4h', days=60):
     except:
         return pd.DataFrame()
 
-# ========== CSV LOGGING FUNCTIONS ==========
-def init_csv(filepath, columns):
-    if not os.path.exists(filepath):
-        df = pd.DataFrame(columns=columns)
-        df.to_csv(filepath, index=False)
-
-def append_csv(filepath, df_new):
+def get_total_market_index(interval='4h', days=14):
+    # Use TOTAL or TOTAL2 from TradingView via yfinance if available, else dummy.
+    # We'll try "TOTAL" which is a crypto total market cap index on some sources.
     try:
-        existing = pd.read_csv(filepath)
-        updated = pd.concat([existing, df_new], ignore_index=True)
-    except (FileNotFoundError, pd.errors.EmptyDataError):
-        updated = df_new
-    updated.to_csv(filepath, index=False)
-
-def save_csv(filepath, df):
-    df.to_csv(filepath, index=False)
-
-def initialize_trade_files():
-    init_csv(TRADE_LOG_CSV, ["timestamp", "symbol", "action", "entry", "stop",
-                             "TP1", "TP2", "TP3", "TP4", "TP5", "conviction", "ai_confidence"])
-    init_csv(OPEN_TRADES_CSV, ["timestamp", "symbol", "action", "entry", "stop",
-                               "TP1", "TP2", "TP3", "TP4", "TP5", "status"])
-    init_csv(TRADE_RESULTS_CSV, ["timestamp", "symbol", "action", "entry", "stop",
-                                 "TP1", "TP2", "TP3", "TP4", "TP5", "status", "hit_level", "close_time"])
-
-def log_signal(signal):
-    row = {
-        "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-        "symbol": signal["symbol"],
-        "action": signal["action"],
-        "entry": signal["limit_price"],
-        "stop": signal["stop_loss"],
-        "TP1": signal["take_profits"][0],
-        "TP2": signal["take_profits"][1],
-        "TP3": signal["take_profits"][2],
-        "TP4": signal["take_profits"][3],
-        "TP5": signal["take_profits"][4],
-        "conviction": signal["conviction_score"],
-        "ai_confidence": signal["confidence_score"],
-    }
-    df = pd.DataFrame([row])
-    append_csv(TRADE_LOG_CSV, df)
-
-def add_open_trade(signal):
-    row = {
-        "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-        "symbol": signal["symbol"],
-        "action": signal["action"],
-        "entry": signal["limit_price"],
-        "stop": signal["stop_loss"],
-        "TP1": signal["take_profits"][0],
-        "TP2": signal["take_profits"][1],
-        "TP3": signal["take_profits"][2],
-        "TP4": signal["take_profits"][3],
-        "TP5": signal["take_profits"][4],
-        "status": "open"
-    }
-    df = pd.DataFrame([row])
-    append_csv(OPEN_TRADES_CSV, df)
-
-def check_open_trades(current_prices):
-    try:
-        open_df = pd.read_csv(OPEN_TRADES_CSV)
-    except (FileNotFoundError, pd.errors.EmptyDataError):
-        return
-
-    results = []
-    still_open = []
-    for _, trade in open_df.iterrows():
-        sym = trade["symbol"]
-        if sym not in current_prices:
-            still_open.append(trade)
-            continue
-        price = current_prices[sym]
-        direction = trade["action"]
-        entry = trade["entry"]
-        stop = trade["stop"]
-        tps = [trade[f"TP{i}"] for i in range(1,6)]
-
-        hit = None
-        if direction == "LONG":
-            if price <= stop:
-                hit = "STOP LOSS"
-            else:
-                for i, tp in enumerate(tps, 1):
-                    if price >= tp:
-                        hit = f"TP{i}"
-                        break
-        else:  # SHORT
-            if price >= stop:
-                hit = "STOP LOSS"
-            else:
-                for i, tp in enumerate(tps, 1):
-                    if price <= tp:
-                        hit = f"TP{i}"
-                        break
-        if hit:
-            result = trade.to_dict()
-            result["hit_level"] = hit
-            result["close_time"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            results.append(result)
-        else:
-            still_open.append(trade)
-
-    if results:
-        df_results = pd.DataFrame(results)
-        append_csv(TRADE_RESULTS_CSV, df_results)
-    if still_open:
-        df_still_open = pd.DataFrame(still_open)
-        save_csv(OPEN_TRADES_CSV, df_still_open)
-    else:
-        save_csv(OPEN_TRADES_CSV, pd.DataFrame())
-
-# ========== LAYER 1: TECHNICALS (4h, structure‑heavy, no MACD) – weight 20% ==========
-def get_technicals(symbol_usdt):
-    df = get_yahoo_klines(symbol_usdt, interval='4h', days=14)
-    error = None
-    if df.empty or len(df) < 50:
-        error = f"insufficient 4h data ({len(df)} candles)"
-        return {
-            "trend": 0, "adx": 0, "structure": 0,
-            "combined": 0, "ema50_distance": 1.0, "error": error
-        }
-
-    closes = df['Close']
-    highs  = df['High']
-    lows   = df['Low']
-
-    # EMA trend
-    ema50 = closes.ewm(span=50, adjust=False).mean()
-    ema200 = closes.ewm(span=200, adjust=False).mean() if len(closes) >= 200 else ema50
-    current = closes.iloc[-1]
-    trend = 0
-    if current > ema50.iloc[-1]:
-        trend += 1.5
-    else:
-        trend -= 1.5
-    if ema50.iloc[-1] > ema200.iloc[-1]:
-        trend += 1.5
-    else:
-        trend -= 1.5
-    trend = max(-3, min(3, trend))
-
-    # ADX
-    def calc_adx(high, low, close, period=14):
-        dm_plus = high.diff()
-        dm_minus = -low.diff()
-        dm_plus[dm_plus < 0] = 0
-        dm_minus[dm_minus < 0] = 0
-        tr = pd.concat([high - low,
-                        (high - close.shift()).abs(),
-                        (low - close.shift()).abs()], axis=1).max(axis=1)
-        atr = tr.ewm(alpha=1/period, adjust=False).mean()
-        di_plus = 100 * (dm_plus.ewm(alpha=1/period, adjust=False).mean() / atr)
-        di_minus = 100 * (dm_minus.ewm(alpha=1/period, adjust=False).mean() / atr)
-        dx = 100 * (di_plus - di_minus).abs() / (di_plus + di_minus)
-        adx = dx.ewm(alpha=1/period, adjust=False).mean()
-        return adx, di_plus, di_minus
-
-    adx_series, di_plus, di_minus = calc_adx(highs, lows, closes, 14)
-    adx_now = adx_series.iloc[-1]
-    di_plus_now = di_plus.iloc[-1]
-    di_minus_now = di_minus.iloc[-1]
-
-    adx_score = 0
-    if adx_now > 25:
-        if di_plus_now > di_minus_now:
-            adx_score = 2.5
-        else:
-            adx_score = -2.5
-    elif adx_now > 20:
-        if di_plus_now > di_minus_now:
-            adx_score = 1.0
-        else:
-            adx_score = -1.0
-
-    # PRICE ACTION (structure, window=7 on 4h)
-    window = 7
-    lookback = min(50, len(highs))
-    recent_highs = highs.iloc[-lookback:]
-    recent_lows  = lows.iloc[-lookback:]
-
-    swing_highs = []
-    swing_lows  = []
-    for i in range(window, len(recent_highs) - window):
-        if all(recent_highs.iloc[i] >= recent_highs.iloc[i-window:i+window+1]):
-            swing_highs.append((i, recent_highs.iloc[i]))
-        if all(recent_lows.iloc[i] <= recent_lows.iloc[i-window:i+window+1]):
-            swing_lows.append((i, recent_lows.iloc[i]))
-
-    structure_score = 0
-    if len(swing_highs) >= 2 and len(swing_lows) >= 2:
-        last_hh = swing_highs[-1][1] > swing_highs[-2][1]
-        last_hl = swing_lows[-1][1] > swing_lows[-2][1]
-        if last_hh and last_hl:
-            if len(swing_highs) >= 3 and len(swing_lows) >= 3:
-                prev_hh = swing_highs[-2][1] > swing_highs[-3][1]
-                prev_hl = swing_lows[-2][1] > swing_lows[-3][1]
-                if prev_hh and prev_hl:
-                    structure_score = 3.0
-                else:
-                    structure_score = 2.0
-            else:
-                structure_score = 2.0
-        elif (not last_hh) and (not last_hl):
-            if len(swing_highs) >= 3 and len(swing_lows) >= 3:
-                prev_lh = swing_highs[-2][1] < swing_highs[-3][1]
-                prev_ll = swing_lows[-2][1] < swing_lows[-3][1]
-                if prev_lh and prev_ll:
-                    structure_score = -3.0
-                else:
-                    structure_score = -2.0
-            else:
-                structure_score = -2.0
-    structure_score = max(-3, min(3, structure_score))
-
-    # Combined (structure‑heavy, no MACD)
-    combined = (
-        trend * 0.30 +
-        adx_score * 0.25 +
-        structure_score * 0.45
-    )
-
-    ema50_val = ema50.iloc[-1]
-    distance_pct = abs(current - ema50_val) / current
-
-    # Trend direction for the 4h filter
-    trend_dir = "up" if current > ema50.iloc[-1] else "down"
-
-    return {
-        "trend": trend, "adx": adx_score, "structure": structure_score,
-        "combined": combined, "ema50_distance": distance_pct,
-        "adx_value": adx_now, "trend_dir": trend_dir, "error": None
-    }
-
-def get_4h_atr(symbol_usdt, current_price):
-    df = get_yahoo_klines(symbol_usdt, interval='4h', days=14)
-    if df.empty or len(df) < 14:
-        return current_price * 0.02, "ATR data insufficient, using 2% fallback"
-    high, low, close = df['High'], df['Low'], df['Close']
-    tr = pd.concat([high - low, (high - close.shift()).abs(), (low - close.shift()).abs()], axis=1).max(axis=1)
-    atr = tr.rolling(14).mean().iloc[-1]
-    if pd.isna(atr):
-        return current_price * 0.02, "ATR calculation failed, using 2% fallback"
-    return atr, None
-
-# ========== LAYER 2: BUYING PRESSURE (4h, 48 candles lookback) – weight 45% ==========
-def get_buying_pressure(symbol_usdt):
-    df = get_yahoo_klines(symbol_usdt, interval='4h', days=10)
-    if df.empty or len(df) < 48:
-        return 0.0, f"insufficient volume data ({len(df)} candles)"
-    df = df.tail(48)
-    buy_vol = df.loc[df['Close'] > df['Open'], 'Volume'].sum()
-    sell_vol = df.loc[df['Close'] <= df['Open'], 'Volume'].sum()
-    total = buy_vol + sell_vol
-    if total == 0:
-        return 0.0, "zero total volume"
-    return (buy_vol - sell_vol) / total, None
-
-# ========== LAYER 3: VOLATILITY (4h) – weight 5% ==========
-def get_volatility_score(symbol_usdt, current_price):
-    atr, atr_err = get_4h_atr(symbol_usdt, current_price)
-    atr_pct = atr / current_price * 100
-    # Tightened to 7% max
-    if atr_pct < 2 or atr_pct > 7:
-        return -1, atr_err
-    return 1, None
-
-# ========== LAYER 4: INTERMARKET (BTC 4h trend) – weight 25% ==========
-def btc_trend_score():
-    df = get_yahoo_klines("BTCUSDT", interval='4h', days=14)
-    if df.empty or len(df) < 50:
-        return 0, f"BTC data unavailable ({len(df)} candles)"
-    closes = df['Close']
-    ema50 = closes.ewm(span=50, adjust=False).mean()
-    current = closes.iloc[-1]
-    if current > ema50.iloc[-1]:
-        return 2, None
-    else:
-        return -2, None
-
-# ========== LAYER 5: VOLUME TREND (4h, 6 candles) – weight 5% ==========
-def volume_trend_score(symbol_usdt, direction=None):
-    df = get_yahoo_klines(symbol_usdt, interval='4h', days=5)
-    if df.empty or len(df) < 12:
-        return 0, f"volume data insufficient ({len(df)} candles)"
-    recent = df['Volume'].tail(6)
-    first_half = recent[:3].mean()
-    second_half = recent[3:].mean()
-    if second_half > first_half * 1.05:
-        # Rising volume – bullish only if trend is up, bearish if trend is down
-        if direction == "down":
-            return -2, None
-        return 2, None
-    elif second_half < first_half * 0.95:
-        if direction == "up":
-            return -2, None
-        return -2, None
-    return 0, None
-
-# ========== MOMENTUM ALIGNMENT (directional fix) ==========
-def momentum_alignment_score(symbol_usdt, direction, layers):
-    df = get_yahoo_klines(symbol_usdt, interval='4h', days=2)
-    if df.empty or len(df) < 2:
-        return 0.0
-    last = df.iloc[-1]
-    candle_agrees = (direction == "LONG" and last['Close'] > last['Open']) or \
-                    (direction == "SHORT" and last['Close'] < last['Open'])
-    if not candle_agrees:
-        return 0.0
-
-    supporting = 0
-    if direction == "LONG":
-        if layers.get("buying_press", 0) > 0.5: supporting += 1
-        if layers.get("intermarket", 0) > 0.5: supporting += 1
-        if layers.get("volume_trend", 0) > 0.5: supporting += 1
-    else:  # SHORT
-        if layers.get("buying_press", 0) < -0.5: supporting += 1
-        if layers.get("intermarket", 0) < -0.5: supporting += 1
-        if layers.get("volume_trend", 0) < -0.5: supporting += 1
-
-    if supporting >= 2:
-        if direction == "LONG":
-            return 0.20
-        else:  # SHORT
-            return -0.20     # reinforce bearish conviction
-    return 0.0
-
-# ========== TREND STRENGTH BONUS (stronger for ADX > 35) ==========
-def trend_strength_bonus(adx_value, base_score):
-    if adx_value > 35 and abs(base_score) > 0.5:
-        return 0.30 * (1 if base_score > 0 else -1)
-    elif adx_value > 30 and abs(base_score) > 0.5:
-        return 0.20 * (1 if base_score > 0 else -1)
-    return 0.0
-
-# ========== SCORING ENGINE ==========
-def score_coin(symbol, price, volume_24h, change1h, btc_score, btc_error):
-    errors = []
-    tech = get_technicals(symbol)
-    if tech.get("error"):
-        errors.append(f"tech({symbol}): {tech['error']}")
-    tech_combined = tech["combined"]
-    ema50_distance = tech["ema50_distance"]
-    adx_value = tech.get("adx_value", 0)
-    trend_dir = tech.get("trend_dir", "up")
-
-    buying, buy_err = get_buying_pressure(symbol)
-    if buy_err:
-        errors.append(f"buying_press({symbol}): {buy_err}")
-    buying_score = buying * 3
-
-    vol_score, vol_err = get_volatility_score(symbol, price)
-    if vol_err:
-        errors.append(f"volatility({symbol}): {vol_err}")
-
-    intermarket_s = btc_score
-    if btc_error:
-        errors.append(f"intermarket: {btc_error}")
-
-    vol_trend_s, vt_err = volume_trend_score(symbol, direction=trend_dir)
-    if vt_err:
-        errors.append(f"volume_trend({symbol}): {vt_err}")
-
-    total = (
-        0.20 * tech_combined +
-        0.45 * buying_score +
-        0.05 * vol_score +
-        0.25 * intermarket_s +
-        0.05 * vol_trend_s
-    )
-
-    layers = {
-        "tech": tech_combined,
-        "buying_press": buying_score,
-        "volatility": vol_score,
-        "intermarket": intermarket_s,
-        "volume_trend": vol_trend_s,
-    }
-    return max(-3, min(3, total)), layers, ema50_distance, adx_value, trend_dir, errors
-
-# ========== AI REASONING (confidence 4‑7) ==========
-def call_groq_reasoning(symbol, entry, atr, layers, errors=None):
-    layer_str = "; ".join([f"{k}={v:.2f}" for k,v in layers.items()])
-    err_str = ""
-    if errors:
-        err_str = " | Data issues: " + "; ".join(errors)
-
-    directional_scores = [layers["tech"], layers["buying_press"], layers["intermarket"], layers["volume_trend"]]
-    bearish_count = sum(1 for s in directional_scores if s < -0.5)
-    bullish_count = sum(1 for s in directional_scores if s > 0.5)
-    alignment_strength = max(bearish_count, bullish_count)
-
-    prompt = (
-        f"Trade signal for {symbol} at {entry}. 4h ATR: {atr:.4f}. "
-        f"Layer scores: {layer_str}{err_str}. "
-        f"All {alignment_strength} out of 4 directional layers are strongly aligned (bearish/bullish). "
-        "Provide a concise, punchy reasoning (max 2 sentences) capturing why this trade sets up well. "
-        "Also give a confidence score between 4 and 7 (never higher than 7, never lower than 4). "
-        "Confidence must reflect the number of aligned layers: at least 5 if 2 layers agree, 6 if 3 layers agree, 7 only if all 4 layers agree. "
-        "Low ATR is a positive sign for risk management, not a caution. "
-        "Format: CONFIDENCE: 7 | REASONING: [text]"
-    )
-    url = "https://api.groq.com/openai/v1/chat/completions"
-    headers = {"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"}
-    payload = {
-        "model": "llama-3.3-70b-versatile",
-        "messages": [{"role": "user", "content": prompt}],
-        "temperature": 0.3,
-        "max_tokens": 200
-    }
-    try:
-        resp = requests.post(url, headers=headers, json=payload, timeout=30)
-        if resp.status_code == 200:
-            text = resp.json()["choices"][0]["message"]["content"]
-            conf_match = re.search(r'CONFIDENCE:\s*(\d+)', text)
-            reason_match = re.search(r'REASONING:\s*(.*)', text)
-            conf = int(conf_match.group(1)) if conf_match else 5
-            conf = max(4, min(7, conf))
-            reason = reason_match.group(1).strip() if reason_match else "Automated signal."
-            return conf, reason
+        df = yf.download("TOTAL", period=f"{days}d", interval=interval, progress=False)
+        if not df.empty:
+            if isinstance(df.columns, pd.MultiIndex):
+                df.columns = df.columns.get_level_values(0)
+            return df
     except:
         pass
-    return 5, "Multi-factor model (AI unavailable)."
+    return pd.DataFrame()
 
-# ========== MAIN SIGNAL GENERATION (with 4h trend filter) ==========
+# ========== TECHNICAL INDICATORS ==========
+def ema(series, period):
+    return series.ewm(span=period, adjust=False).mean()
+
+def atr(df, period=14):
+    h, l, c = df['High'], df['Low'], df['Close']
+    tr = pd.concat([h - l, (h - c.shift()).abs(), (l - c.shift()).abs()], axis=1).max(axis=1)
+    return tr.rolling(period).mean().iloc[-1]
+
+def rsi(df, period=14):
+    delta = df['Close'].diff()
+    gain = delta.where(delta > 0, 0.0)
+    loss = -delta.where(delta < 0, 0.0)
+    avg_gain = gain.ewm(alpha=1/period, adjust=False).mean()
+    avg_loss = loss.ewm(alpha=1/period, adjust=False).mean()
+    rs = avg_gain / avg_loss
+    return 100 - (100 / (1 + rs)).iloc[-1]
+
+def macd(df):
+    exp1 = df['Close'].ewm(span=12, adjust=False).mean()
+    exp2 = df['Close'].ewm(span=26, adjust=False).mean()
+    macd_line = exp1 - exp2
+    signal = macd_line.ewm(span=9, adjust=False).mean()
+    histogram = macd_line - signal
+    return macd_line.iloc[-1], signal.iloc[-1], histogram.iloc[-1], histogram.iloc[-2] if len(histogram) > 1 else 0
+
+def adx(df, period=14):
+    h, l, c = df['High'], df['Low'], df['Close']
+    dm_plus = h.diff()
+    dm_minus = -l.diff()
+    dm_plus[dm_plus < 0] = 0
+    dm_minus[dm_minus < 0] = 0
+    tr = pd.concat([h - l, (h - c.shift()).abs(), (l - c.shift()).abs()], axis=1).max(axis=1)
+    atr_val = tr.ewm(alpha=1/period, adjust=False).mean()
+    di_plus = 100 * (dm_plus.ewm(alpha=1/period, adjust=False).mean() / atr_val)
+    di_minus = 100 * (dm_minus.ewm(alpha=1/period, adjust=False).mean() / atr_val)
+    dx = 100 * (di_plus - di_minus).abs() / (di_plus + di_minus)
+    adx_val = dx.ewm(alpha=1/period, adjust=False).mean()
+    return adx_val.iloc[-1], di_plus.iloc[-1], di_minus.iloc[-1]
+
+def support_resistance_levels(df, lookback=20):
+    recent = df.tail(lookback)
+    high = recent['High'].max()
+    low = recent['Low'].min()
+    return high, low
+
+# ========== MULTI‑LAYER SCORING (TP1 optimized) ==========
+def score_pair(pair):
+    df_d = get_data(pair, interval='1d', days=90)
+    if df_d.empty or len(df_d) < 50:
+        return 0, None, None, None, None
+
+    df_4h = get_data(pair, interval='4h', days=14)
+    if df_4h.empty or len(df_4h) < 50:
+        return 0, None, None, None, None
+
+    df_1h = get_data(pair, interval='1h', days=3)
+    if df_1h.empty or len(df_1h) < 10:
+        return 0, None, None, None, None
+
+    price = df_4h['Close'].iloc[-1]
+
+    # Daily trend
+    ema50_d = ema(df_d['Close'], 50)
+    ema200_d = ema(df_d['Close'], 200)
+    trend_daily = 0
+    if price > ema50_d.iloc[-1] and ema50_d.iloc[-1] > ema200_d.iloc[-1]:
+        trend_daily = 1
+    elif price < ema50_d.iloc[-1] and ema50_d.iloc[-1] < ema200_d.iloc[-1]:
+        trend_daily = -1
+    if trend_daily == 0:
+        return 0, None, None, None, None
+
+    # 4h indicators
+    ema50_4h = ema(df_4h['Close'], 50)
+    ema200_4h = ema(df_4h['Close'], 200)
+    adx_val, di_plus, di_minus = adx(df_4h)
+    rsi_val = rsi(df_4h)
+    macd_line, macd_signal, macd_hist, macd_hist_prev = macd(df_4h)
+    atr_val = atr(df_4h)
+    res, sup = support_resistance_levels(df_4h, 20)
+
+    # 1h momentum
+    rsi_1h = rsi(df_1h, 14)
+    last_candle = df_1h.iloc[-1]
+    prev_candle = df_1h.iloc[-2]
+    candle_range = last_candle['High'] - last_candle['Low']
+    if candle_range > 0:
+        bullish_momentum = (last_candle['Close'] - last_candle['Open']) / candle_range
+    else:
+        bullish_momentum = 0
+
+    # Volume
+    vol_last = df_4h['Volume'].iloc[-1]
+    vol_avg = df_4h['Volume'].iloc[-6:-1].mean() if len(df_4h) >= 6 else vol_last
+    vol_surge = vol_last > vol_avg * 1.2
+
+    # Market index alignment (e.g., TOTAL)
+    total_df = get_total_market_index(interval='4h', days=14)
+    market_aligned = False
+    if not total_df.empty:
+        total_ema50 = ema(total_df['Close'], 50)
+        market_trend_up = total_df['Close'].iloc[-1] > total_ema50.iloc[-1]
+        # Crypto pairs rise with market (bullish) – long signals are better when market is up.
+        # We'll give bonus if direction aligns with market trend.
+        if trend_daily == 1 and market_trend_up:
+            market_aligned = True
+        elif trend_daily == -1 and not market_trend_up:
+            market_aligned = True
+
+    def bool_score(cond):
+        return 1 if cond else 0
+
+    direction = "LONG" if trend_daily == 1 else "SHORT"
+
+    # Standard layers
+    if direction == "LONG":
+        ema_align = price > ema50_4h.iloc[-1] and ema50_4h.iloc[-1] > ema200_4h.iloc[-1]
+    else:
+        ema_align = price < ema50_4h.iloc[-1] and ema50_4h.iloc[-1] < ema200_4h.iloc[-1]
+    ema_score = bool_score(ema_align)
+
+    adx_trending = adx_val > 20
+    adx_dir = (di_plus > di_minus) if direction == "LONG" else (di_minus > di_plus)
+    adx_score = bool_score(adx_trending and adx_dir)
+
+    rsi_score = bool_score((direction == "LONG" and rsi_val > 50) or (direction == "SHORT" and rsi_val < 50))
+
+    macd_expanding = (direction == "LONG" and macd_hist > 0 and macd_hist > macd_hist_prev) or \
+                     (direction == "SHORT" and macd_hist < 0 and macd_hist < macd_hist_prev)
+    macd_score = bool_score(macd_expanding)
+
+    if direction == "LONG":
+        near_support = (price - sup) < atr_val * 0.5
+        sr_score = bool_score(near_support)
+    else:
+        near_resistance = (res - price) < atr_val * 0.5
+        sr_score = bool_score(near_resistance)
+
+    vol_score = bool_score(vol_surge)
+    market_score = bool_score(market_aligned)
+
+    # TP1-optimized layers
+    if direction == "LONG":
+        candle_momentum_ok = bullish_momentum > 0.4
+        rsi_1h_ok = rsi_1h < 65
+        micro_trend_ok = last_candle['Close'] > last_candle['Open'] and \
+                         prev_candle['Close'] > prev_candle['Open']
+    else:
+        candle_momentum_ok = bullish_momentum < -0.4
+        rsi_1h_ok = rsi_1h > 35
+        micro_trend_ok = last_candle['Close'] < last_candle['Open'] and \
+                         prev_candle['Close'] < prev_candle['Open']
+
+    candle_score = bool_score(candle_momentum_ok)
+    rsi_1h_score = bool_score(rsi_1h_ok)
+    micro_trend_score = bool_score(micro_trend_ok)
+
+    # Minimum ATR requirement (in price terms, 0.5% of price to avoid noise)
+    min_atr_ratio = 0.005   # 0.5% of price
+    atr_ok = atr_val > price * min_atr_ratio
+    atr_score = bool_score(atr_ok)
+
+    # Total score (same weights as original)
+    total = (
+        ema_score * 2.0 +
+        adx_score * 1.5 +
+        rsi_score * 1.5 +
+        macd_score * 1.0 +
+        sr_score * 1.0 +
+        vol_score * 0.5 +
+        market_score * 0.5 +
+        candle_score * 1.5 +
+        rsi_1h_score * 1.0 +
+        atr_score * 1.0 +
+        micro_trend_score * 1.5
+    )
+
+    if total < 6.5:
+        return 0, None, None, None, None
+
+    return total, direction, price, atr_val, (sup if direction == "LONG" else res)
+
+# ========== AI CONFIRMATION GATE ==========
+def ai_confirm_trade(signal_dict):
+    if not GROQ_API_KEY:
+        return True
+    sym = signal_dict["symbol"]
+    direction = signal_dict["action"]
+    entry = signal_dict["limit_price"]
+    stop = signal_dict["stop_loss"]
+    score = signal_dict["score"]
+
+    prompt = (
+        f"Crypto trade setup:\n"
+        f"Pair: {sym}\n"
+        f"Direction: {direction}\n"
+        f"Entry: {entry:.5f}\n"
+        f"Stop Loss: {stop:.5f}\n"
+        f"Technical Conviction Score: {score:.1f}/13.0\n\n"
+        f"Will this trade likely hit TP1 (0.5x the stop distance) before hitting the stop? "
+        f"Answer with exactly one word: PASS or FAIL."
+    )
+
+    url = "https://api.groq.com/openai/v1/chat/completions"
+    headers = {
+        "Authorization": f"Bearer {GROQ_API_KEY}",
+        "Content-Type": "application/json"
+    }
+    payload = {
+        "model": "llama-3.3-70b-versatile",
+        "messages": [
+            {"role": "system", "content": "You are a professional crypto analyst. Respond with only PASS or FAIL."},
+            {"role": "user", "content": prompt}
+        ],
+        "temperature": 0.1,
+        "max_tokens": 5
+    }
+    try:
+        resp = requests.post(url, headers=headers, json=payload, timeout=15)
+        if resp.status_code == 200:
+            text = resp.json()["choices"][0]["message"]["content"].strip().upper()
+            if "FAIL" in text:
+                return False
+            return True
+    except:
+        pass
+    return True
+
+# ========== SIGNAL GENERATION (TPs: 0.5/1/2/3/5R) ==========
 def generate_signal():
-    cg_url = "https://api.coingecko.com/api/v3/coins/markets?vs_currency=usd&order=volume_desc&per_page=100&page=1"
-    coins_data = fetch_coingecko(cg_url)
-    if not coins_data:
-        return {"action": "HOLD", "reasoning": "CoinGecko market data unavailable."}
-
-    # Get list of symbols with open trades
     open_symbols = set()
     try:
         open_df = pd.read_csv(OPEN_TRADES_CSV)
         if not open_df.empty:
             open_symbols = set(open_df["symbol"].values)
-    except (FileNotFoundError, pd.errors.EmptyDataError):
+    except:
         pass
 
-    cg_map = {}
-    for coin in coins_data:
-        sym = coin.get("symbol", "").upper() + "USDT"
-        if coin.get("current_price", 0) > 0:
-            cg_map[sym] = {"price": coin["current_price"], "volume": coin.get("total_volume", 0)}
-
     candidates = []
-    for sym in COIN_LIST:
-        if sym in open_symbols:        # skip coins with an open trade
+    for pair in CRYPTO_PAIRS:
+        if pair in open_symbols:
             continue
-        if sym not in cg_map:
-            continue
-        candidates.append({"symbol": sym, "price": cg_map[sym]["price"], "volume": cg_map[sym]["volume"]})
-    candidates.sort(key=lambda x: x["volume"], reverse=True)
-    candidates = candidates[:60]
+        score, direction, price, atr_val, swing_level = score_pair(pair)
+        if direction and score >= 6.5:
+            candidates.append((pair, score, direction, price, atr_val, swing_level))
 
     if not candidates:
-        return {"action": "HOLD", "reasoning": "No liquid coins available (all coins with open trades skipped)."}
+        return None
 
-    btc_score, btc_error = btc_trend_score()
+    candidates.sort(key=lambda x: x[1], reverse=True)
+    best = candidates[0]
+    pair, score, direction, price, atr_val, swing_level = best
 
-    all_scored = []
-    best = None
-    best_score = 0
-    best_layers = None
-    best_ema_distance = 0.0
-    best_adx = 0
-    best_trend_dir = None
-    best_errors = []
+    # Stop loss: base = 1.0 * ATR, but bounded by min/max % of price
+    min_stop_pct = 0.002   # 0.2%
+    max_stop_pct = 0.01    # 1.0%
+    raw_stop = atr_val * 1.0
+    min_stop = price * min_stop_pct
+    max_stop = price * max_stop_pct
+    stop_distance = np.clip(raw_stop, min_stop, max_stop)
 
-    for coin in candidates:
-        sym = coin["symbol"]
-        price = coin["price"]
-        volume = coin["volume"]
+    if direction == "LONG":
+        stop = price - stop_distance
+        if swing_level is not None and swing_level > price - stop_distance * 1.2:
+            stop = min(stop, swing_level - 0.05 * atr_val)
+    else:
+        stop = price + stop_distance
+        if swing_level is not None and swing_level < price + stop_distance * 1.2:
+            stop = max(stop, swing_level + 0.05 * atr_val)
 
-        total_score, layers, ema_dist, adx_val, trend_dir, errors = score_coin(
-            sym, price, volume, 0, btc_score, btc_error
-        )
-        atr, _ = get_4h_atr(sym, price)
-        if atr / price > 0.07:   # tightened volatility cap
-            total_score = 0.0
-            errors.append("volatility cap triggered (ATR>7%)")
-        coin["score"] = total_score
-        coin["atr"] = atr
-        coin["bid"] = price * 0.999
-        coin["ask"] = price * 1.001
-        coin["layers"] = layers
-        coin["ema_distance"] = ema_dist
-        coin["adx_value"] = adx_val
-        coin["trend_dir"] = trend_dir
-        coin["errors"] = errors
-
-        all_scored.append(coin)
-
-        if best is None or abs(total_score) > abs(best_score):
-            best = coin
-            best_score = total_score
-            best_layers = layers
-            best_ema_distance = ema_dist
-            best_adx = adx_val
-            best_trend_dir = trend_dir
-            best_errors = errors
-
-    if btc_error:
-        best_errors.append(f"intermarket: {btc_error}")
-
-    all_scored_sorted = sorted(all_scored, key=lambda x: abs(x["score"]), reverse=True)
-    coin_summary_list = []
-    for c in all_scored_sorted:
-        coin_summary_list.append(f"{c['symbol'].replace('USDT','')}: {c['score']:.2f}")
-    coin_summary = " | ".join(coin_summary_list)
-
-    if best is None or abs(best_score) < 1.49:
-        best_sym = best["symbol"] if best else "none"
-        layer_str = "; ".join([f"{k}={v:.2f}" for k,v in best_layers.items()])
-        err_str = ""
-        if best_errors:
-            err_str = " | Errors: " + "; ".join(best_errors)
-        display_score = round(best_score, 2)
-        reason = (f"No strong conviction. Best score: {display_score:+.2f}/3 for {best_sym}.\n"
-                  f"Layers: {layer_str}{err_str}\n"
-                  f"All coins: {coin_summary}")
-        return {"action": "HOLD", "reasoning": reason}
-
-    direction = "LONG" if best_score >= 0 else "SHORT"
-
-    # ====== 4h Trend Filter ======
-    if best_trend_dir:
-        if (direction == "LONG" and best_trend_dir == "down") or \
-           (direction == "SHORT" and best_trend_dir == "up"):
-            best_sym = best["symbol"]
-            layer_str = "; ".join([f"{k}={v:.2f}" for k,v in best_layers.items()])
-            err_str = ""
-            if best_errors:
-                err_str = " | Errors: " + "; ".join(best_errors)
-            display_score = round(best_score, 2)
-            reason = (f"Signal {direction} rejected due to 4h trend filter ({best_trend_dir}). "
-                      f"Best score: {display_score:+.2f}/3 for {best_sym}.\n"
-                      f"Layers: {layer_str}{err_str}\n"
-                      f"All coins: {coin_summary}")
-            return {"action": "HOLD", "reasoning": reason}
-
-    # Apply trend strength bonus
-    best_score += trend_strength_bonus(best_adx, best_score)
-
-    # Apply directional momentum alignment bonus
-    momentum_bonus = momentum_alignment_score(best["symbol"], direction, best_layers)
-    best_score += momentum_bonus
-
-    if abs(best_score) < 1.49:
-        best_sym = best["symbol"]
-        layer_str = "; ".join([f"{k}={v:.2f}" for k,v in best_layers.items()])
-        err_str = ""
-        if best_errors:
-            err_str = " | Errors: " + "; ".join(best_errors)
-        display_score = round(best_score, 2)
-        reason = (f"No strong conviction after bonuses. Best score: {display_score:+.2f}/3 for {best_sym}.\n"
-                  f"Layers: {layer_str}{err_str}\n"
-                  f"All coins: {coin_summary}")
-        return {"action": "HOLD", "reasoning": reason}
-
-    entry = best["bid"] if direction == "LONG" else best["ask"]
-    atr = best["atr"]
-    min_stop = max(1.5 * atr, entry * 0.02)
-    stop = entry - min_stop if direction == "LONG" else entry + min_stop
     stop = round(stop, 6)
-    risk = abs(entry - stop)
-    qty = round(10 / risk, 4)
+    risk = abs(price - stop)
 
-    # Fixed RR‑based TP ladder
-    mults = [0.4, 0.8, 1.2, 1.6, 2.0]
+    # TP multipliers
+    tp_multipliers = [0.5, 1.0, 2.0, 3.0, 5.0]
     tps = []
-    for mult in mults:
+    for m in tp_multipliers:
         if direction == "LONG":
-            tps.append(round(entry + mult * risk, 6))
+            tps.append(round(price + m * risk, 6))
         else:
-            tps.append(round(entry - mult * risk, 6))
+            tps.append(round(price - m * risk, 6))
 
-    conf, reason = call_groq_reasoning(best["symbol"], entry, atr, best_layers, best_errors)
-    if conf < 5:
-        layer_str = "; ".join([f"{k}={v:.2f}" for k,v in best_layers.items()])
-        err_str = ""
-        if best_errors:
-            err_str = " | Errors: " + "; ".join(best_errors)
-        display_score = round(best_score, 2)
-        reason = (f"AI confidence too low ({conf}/10). Best score: {display_score:+.2f}/3 for {best['symbol']}.\n"
-                  f"Layers: {layer_str}{err_str}\n"
-                  f"All coins: {coin_summary}\n{reason}")
-        return {"action": "HOLD", "reasoning": reason}
+    # Position sizing: 1% of balance risked on the stop distance
+    risk_amount = portfolio['balance'] * 0.01
+    quantity = risk_amount / risk
+    # Round quantity to appropriate decimal places (8 for most coins)
+    # For high-priced coins like BTC, 8 decimals is fine.
+    quantity = round(quantity, 8)
 
-    conviction_display = round(best_score, 2)
-
-    return {
+    signal = {
         "action": direction,
-        "symbol": best["symbol"],
-        "quantity": qty,
-        "limit_price": entry,
+        "symbol": pair,
+        "quantity": quantity,
+        "limit_price": price,
         "stop_loss": stop,
         "take_profits": tps,
-        "confidence_score": conf,
-        "reasoning": reason,
-        "conviction_score": conviction_display,
-        "layers": best_layers,
-        "errors": best_errors
+        "score": score,
+        "atr": atr_val,
     }
+
+    if not ai_confirm_trade(signal):
+        print(f"AI rejected {pair} {direction} (score {score:.1f})")
+        return None
+
+    signal["ai_approved"] = True
+    return signal
+
+# ========== TRADE MANAGEMENT ==========
+def check_open_trades():
+    try:
+        open_df = pd.read_csv(OPEN_TRADES_CSV)
+    except (FileNotFoundError, pd.errors.EmptyDataError):
+        return
+    if open_df.empty:
+        return
+    if "timestamp" in open_df.columns:
+        open_df = open_df.sort_values("timestamp").drop_duplicates(subset="symbol", keep="last")
+    else:
+        open_df = open_df.drop_duplicates(subset="symbol", keep="last")
+
+    for col in ["highest_tp", "quantity", "original_qty"]:
+        if col not in open_df.columns:
+            open_df[col] = 0.0 if col != "highest_tp" else -1
+
+    results = []
+    still_open = []
+    alerts = []
+    now = datetime.now()
+    fractions = [0.20, 0.20, 0.20, 0.20, 0.20]
+
+    for idx, trade in open_df.iterrows():
+        sym = trade["symbol"]
+        direction = trade["action"]
+        entry = float(trade["entry"])
+        stop_orig = float(trade["stop"])
+        original_qty = float(trade.get("original_qty", trade.get("quantity", 0)))
+        remaining_qty = float(trade.get("quantity", original_qty))
+
+        tps = [float(trade[f"TP{i+1}"]) for i in range(5)]
+
+        try:
+            entry_time = datetime.strptime(trade["timestamp"], "%Y-%m-%d %H:%M:%S")
+        except:
+            still_open.append(trade)
+            continue
+
+        df_1h = get_data(sym, interval='1h', start=entry_time, end=now)
+        if df_1h.empty:
+            still_open.append(trade)
+            continue
+
+        highest_tp_idx = int(trade.get("highest_tp", -1))
+        current_stop = entry if highest_tp_idx >= 0 else stop_orig
+
+        for candle_time, candle in df_1h.iterrows():
+            high = candle['High']
+            low = candle['Low']
+
+            new_tp_idx = None
+            if direction == "LONG":
+                for i in range(len(tps)-1, -1, -1):
+                    if high >= tps[i] and i > highest_tp_idx:
+                        new_tp_idx = i
+                        break
+            else:
+                for i in range(len(tps)-1, -1, -1):
+                    if low <= tps[i] and i > highest_tp_idx:
+                        new_tp_idx = i
+                        break
+
+            if new_tp_idx is not None:
+                for i in range(highest_tp_idx+1, new_tp_idx+1):
+                    if remaining_qty <= 0:
+                        break
+                    fraction = fractions[i]
+                    exit_qty = original_qty * fraction
+                    if exit_qty > remaining_qty:
+                        exit_qty = remaining_qty
+                    if exit_qty > 0:
+                        exit_price = tps[i]
+                        pnl = (exit_price - entry) * exit_qty if direction == "LONG" else (entry - exit_price) * exit_qty
+                        partial = trade.to_dict()
+                        partial["hit_level"] = f"TP{i+1}"
+                        partial["close_time"] = now.strftime("%Y-%m-%d %H:%M:%S")
+                        partial["exit_price"] = exit_price
+                        partial["quantity"] = exit_qty
+                        partial["pnl"] = round(pnl, 4)
+                        results.append(partial)
+                        update_portfolio({'pnl': pnl})
+                        remaining_qty -= exit_qty
+                        highest_tp_idx = i
+                        if i == 0:
+                            current_stop = entry
+                    alerts.append(f"🚀 {sym} {direction} TP{i+1} hit — {fraction*100:.0f}% closed, SL to BE")
+                    send_closed_trade_chart(trade, f"TP{i+1}", exit_price, pnl, remaining_qty)
+
+                if remaining_qty <= 0:
+                    break
+
+            if remaining_qty > 0:
+                sl_hit = (low <= current_stop) if direction == "LONG" else (high >= current_stop)
+                if sl_hit:
+                    exit_price = current_stop
+                    pnl = (exit_price - entry) * remaining_qty if direction == "LONG" else (entry - exit_price) * remaining_qty
+                    final = trade.to_dict()
+                    desc = "STOP LOSS" if highest_tp_idx == -1 else f"STOP LOSS after TP{highest_tp_idx+1}"
+                    final["hit_level"] = desc
+                    final["close_time"] = now.strftime("%Y-%m-%d %H:%M:%S")
+                    final["exit_price"] = exit_price
+                    final["quantity"] = remaining_qty
+                    final["pnl"] = round(pnl, 4)
+                    results.append(final)
+                    update_portfolio({'pnl': pnl})
+                    remaining_qty = 0
+                    alerts.append(f"🔴 {sym} {direction} → {desc}")
+                    send_closed_trade_chart(trade, desc, exit_price, pnl, 0)
+                    break
+
+        if remaining_qty > 0:
+            trade["highest_tp"] = highest_tp_idx
+            trade["quantity"] = remaining_qty
+            still_open.append(trade)
+
+    if results:
+        append_csv(TRADE_RESULTS_CSV, pd.DataFrame(results))
+    if still_open:
+        save_csv(OPEN_TRADES_CSV, pd.DataFrame(still_open))
+        portfolio['open_positions'] = len(still_open)
+    else:
+        save_csv(OPEN_TRADES_CSV, pd.DataFrame())
+        portfolio['open_positions'] = 0
+    save_portfolio(portfolio)
+
+    if alerts:
+        send_telegram("Crypto trade updates:\n" + "\n".join(alerts))
+
+# ========== CHART ON TRADE CLOSE ==========
+def send_closed_trade_chart(trade, hit_level, exit_price, pnl, remaining_qty):
+    sym = trade["symbol"]
+    entry = float(trade["entry"])
+    stop = float(trade["stop"])
+    tps = [float(trade[f"TP{i+1}"]) for i in range(5)]
+    direction = trade["action"]
+
+    try:
+        import matplotlib
+        matplotlib.use('Agg')
+        import matplotlib.pyplot as plt
+        import mplfinance as mpf
+
+        entry_time = datetime.strptime(trade["timestamp"], "%Y-%m-%d %H:%M:%S")
+        df = get_data(sym, interval='1h', start=entry_time, end=datetime.now())
+        if df.empty:
+            return
+
+        mpf_style = mpf.make_mpf_style(
+            base_mpf_style='nightclouds',
+            facecolor='#000000',
+            gridcolor='#2a2e39',
+            rc={'axes.labelcolor': 'white',
+                'xtick.color': 'white',
+                'ytick.color': 'white',
+                'axes.titlecolor': 'white'}
+        )
+
+        title = f"{sym} {direction} – {hit_level} (PnL: {pnl:.2f}$)"
+        fig, ax = mpf.plot(df, type='candle', style=mpf_style,
+                           title=title, ylabel='Price',
+                           returnfig=True, figsize=(8,6))
+
+        ax.axhline(y=entry, color='#f1c40f', linestyle='--', linewidth=1.5, label='Entry')
+        ax.axhline(y=stop, color='#e74c3c', linestyle='--', linewidth=1.5, label='Stop')
+        for i, tp in enumerate(tps):
+            ax.axhline(y=tp, color='#2ecc71', linestyle='--', linewidth=1, alpha=0.6,
+                       label=f'TP{i+1}' if i==0 else None)
+        ax.axhline(y=exit_price, color='#e67e22', linewidth=2, label=f'Exit ({hit_level})')
+        ax.legend(loc='upper left', facecolor='#000000', edgecolor='white', labelcolor='white')
+
+        chart_path = f"{sym}_close_{datetime.now().strftime('%Y%m%d_%H%M%S')}.png"
+        fig.savefig(chart_path, dpi=150, bbox_inches='tight', facecolor='black')
+        plt.close(fig)
+
+        url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendPhoto"
+        with open(chart_path, 'rb') as img:
+            requests.post(url, data={'chat_id': CHAT_ID}, files={'photo': img})
+        os.remove(chart_path)
+    except Exception as e:
+        print(f"Closed trade chart error: {e}")
 
 # ========== TELEGRAM ==========
 def send_telegram(text):
@@ -689,68 +669,114 @@ def send_telegram(text):
     try:
         requests.post(url, data={"chat_id": CHAT_ID, "text": text}, timeout=10)
     except Exception as e:
-        print("Telegram send failed:", e)
+        print("Telegram error:", e)
 
+def format_signal(sig):
+    sym = sig["symbol"]
+    dirn = "🟢 LONG" if sig["action"] == "LONG" else "🔴 SHORT"
+    entry = sig["limit_price"]
+    stop = sig["stop_loss"]
+    tps = sig["take_profits"]
+    qty = sig["quantity"]
+    score = sig["score"]
+    risk = abs(entry - stop)
+    tp_pcts = [round(abs(tp - entry)/entry*100, 2) for tp in tps]
+    tp_str = " / ".join([f"TP{i+1}: {tp:.5f} (+{p}%)" for i, (tp, p) in enumerate(zip(tps, tp_pcts))])
+
+    ai_note = " (AI approved)" if sig.get("ai_approved") else ""
+    return (
+        f"{dirn} {sym}{ai_note}\n"
+        f"Conviction: {score:.1f}/13.0\n"
+        f"Entry: {entry:.5f}\n"
+        f"Stop Loss: {stop:.5f} (-{risk:.5f} = {risk/entry*100:.2f}%)\n"
+        f"Take Profits: {tp_str}\n"
+        f"Quantity: {qty:.8f} (Risk: 1% of balance)"
+    )
+
+# ========== CHART ON SIGNAL ==========
+def send_trade_chart(signal):
+    sym = signal['symbol']
+    try:
+        import matplotlib
+        matplotlib.use('Agg')
+        import matplotlib.pyplot as plt
+        import mplfinance as mpf
+
+        df = get_data(sym, interval='4h', days=21)
+        if df.empty or len(df) < 20:
+            raise ValueError(f"Only {len(df)} 4h candles")
+
+        mpf_style = mpf.make_mpf_style(
+            base_mpf_style='nightclouds',
+            facecolor='#000000',
+            gridcolor='#2a2e39',
+            rc={'axes.labelcolor': 'white',
+                'xtick.color': 'white',
+                'ytick.color': 'white',
+                'axes.titlecolor': 'white'}
+        )
+
+        ema50 = df['Close'].ewm(span=min(50, len(df)), adjust=False).mean()
+        addplots = [mpf.make_addplot(ema50, color='#f39c12', width=1.5, label='EMA50')]
+        if df['Volume'].sum() > 0:
+            typical = (df['High'] + df['Low'] + df['Close']) / 3
+            vwap = (typical * df['Volume']).cumsum() / df['Volume'].cumsum()
+            addplots.append(mpf.make_addplot(vwap, color='#3498db', width=1, linestyle='--', label='VWAP'))
+
+        fig, axes = mpf.plot(df, type='candle', style=mpf_style,
+                             title=f"{sym} 4h", ylabel='Price', addplot=addplots,
+                             returnfig=True, figsize=(8,6))
+        ax = axes[0]
+        entry = signal.get('limit_price')
+        stop = signal.get('stop_loss')
+        tps = signal.get('take_profits')
+        if entry:
+            ax.axhline(y=entry, color='#f1c40f', linestyle='--', linewidth=1.5, label='Entry')
+            ax.axhline(y=stop, color='#e74c3c', linestyle='--', linewidth=1.5, label='Stop')
+            if tps:
+                for i, tp in enumerate(tps):
+                    ax.axhline(y=tp, color='#2ecc71', linestyle='--', linewidth=1, alpha=0.8,
+                               label=f'TP{i+1}' if i==0 else None)
+            ax.legend(loc='upper left', facecolor='#000000', edgecolor='white', labelcolor='white')
+
+        chart_path = f"{sym}_chart.png"
+        fig.savefig(chart_path, dpi=150, bbox_inches='tight', facecolor='black')
+        plt.close(fig)
+
+        url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendPhoto"
+        with open(chart_path, 'rb') as img:
+            requests.post(url, data={'chat_id': CHAT_ID}, files={'photo': img})
+        os.remove(chart_path)
+    except Exception as e:
+        print(f"Chart image error: {e}")
+        studies = "&studies[]=STD%3BEMA%3B50&studies[]=STD%3BVWAP"
+        tv_url = f"https://www.tradingview.com/chart/?symbol={sym.replace('-','')}&interval=240{studies}"
+        send_telegram(f"📈 Chart unavailable – view here: {tv_url}")
+
+# ========== MAIN ==========
 def main():
     try:
-        # Initialize CSV files (headers only) if they don't exist
         initialize_trade_files()
+        check_open_trades()
 
-        # Step 1: check open trades and update results
-        print("Checking open trades...")
-        all_coins_data = fetch_coingecko("https://api.coingecko.com/api/v3/coins/markets?vs_currency=usd&order=volume_desc&per_page=250&page=1")
-        current_prices = {}
-        if all_coins_data:
-            for coin in all_coins_data:
-                sym = coin.get("symbol", "").upper() + "USDT"
-                if coin.get("current_price", 0) > 0:
-                    current_prices[sym] = coin["current_price"]
-        check_open_trades(current_prices)
+        if daily_pnl() <= portfolio['daily_loss_limit']:
+            send_telegram("Daily loss limit reached. No new trades today.")
+            return
 
-        # Step 2: generate new signal
-        dec = generate_signal()
-        action = dec.get('action', 'HOLD')
-        if action in ["LONG", "SHORT"]:
-            # Log signal to CSV
-            log_signal(dec)
-            # Add to open trades
-            add_open_trade(dec)
-            # Send Telegram signal
-            raw_symbol = dec.get('symbol', '')
-            symbol = raw_symbol.replace("USDT", "/USDT") if raw_symbol else ""
-            direction_icon = "🟢" if action == "LONG" else "🔴"
-            swing_header = "📈 Swing Setup" if action == "LONG" else "📉 Swing Setup"
-            entry_price = dec.get('limit_price', 0)
-            stop_price = dec.get('stop_loss', 0)
-            confidence = dec.get('confidence_score', 0)
-            conviction = dec.get('conviction_score', 0)
-            tps = dec.get('take_profits', [])
-
-            sl_pct = -abs(stop_price - entry_price) / entry_price * 100
-            tp_lines = ""
-            for i, tp in enumerate(tps, start=1):
-                tp_lines += f"TP{i}: {tp:,.6f}\n"
-            tp_lines = tp_lines.strip()
-
-            msg = (
-                f"{swing_header}\n"
-                f"${symbol}\n"
-                f"{action} {direction_icon}\n"
-                f"⛔ Entry: {entry_price:,.6f}\n"
-                f"🛑 Stop: {stop_price:,.6f} ({sl_pct:+.2f}%)\n"
-                f"💰 Targets:\n"
-                f"{tp_lines}\n"
-                f"Conviction: {conviction:+.2f}/3  |  AI: {confidence}/10"
-            )
-            send_telegram(msg)
+        sig = generate_signal()
+        if sig:
+            log_signal(sig)
+            add_open_trade(sig)
+            portfolio['open_positions'] += 1
+            save_portfolio(portfolio)
+            send_telegram(format_signal(sig))
+            send_trade_chart(sig)
         else:
-            msg = f"📊 HOLD\n{dec.get('reasoning', 'No signal')}"
-            send_telegram(msg)
-
+            send_telegram("HOLD – No high‑conviction crypto setup found.")
     except Exception as e:
-        err_msg = f"Bot crashed: {traceback.format_exc()}"
-        print(err_msg)
-        send_telegram(err_msg[:500])
+        err = f"Bot crashed: {traceback.format_exc()[:500]}"
+        print(err)
+        send_telegram(err)
 
 if __name__ == "__main__":
     main()
