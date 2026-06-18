@@ -1,7 +1,7 @@
 name: Crypto Swing Bot (Manual)
 
 on:
-  workflow_dispatch:  # only triggered manually from the Actions tab
+  workflow_dispatch:
 
 jobs:
   run-bot:
@@ -10,6 +10,13 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+
+      - name: List files for debugging
+        run: |
+          pwd
+          ls -la
+          echo "---"
+          ls -la crypto_bot.py || echo "crypto_bot.py NOT FOUND"
 
       - name: Set up Python
         uses: actions/setup-python@v5
