@@ -47,53 +47,175 @@ TRADE_LOG_CSV = "trade_log.csv"
 OPEN_TRADES_CSV = "open_trades.csv"
 TRADE_RESULTS_CSV = "trade_results.csv"
 
-# ========== BINANCE DATA FETCH ==========
-def get_binance_klines(symbol_usdt, interval='4h', days=60, start=None, end=None):
-    """
-    Fetch OHLC candles from Binance public API.
-    No API key required.
-    """
-    interval_map = {'1h': '1h', '4h': '4h', '1d': '1d'}
-    binance_interval = interval_map.get(interval, '4h')
-    symbol = symbol_usdt.upper()   # e.g., BTCUSDT
+# ========== COINGECKO DATA FETCH (sole source for 4h candles) ==========
+# Mapping from CoinGecko ticker -> coin ID
+COINGECKO_ID_MAP = {
+    "BTCUSDT": "bitcoin",
+    "ETHUSDT": "ethereum",
+    "BNBUSDT": "binancecoin",
+    "XRPUSDT": "ripple",
+    "ADAUSDT": "cardano",
+    "SOLUSDT": "solana",
+    "DOGEUSDT": "dogecoin",
+    "AVAXUSDT": "avalanche-2",
+    "DOTUSDT": "polkadot",
+    "LINKUSDT": "chainlink",
+    "LTCUSDT": "litecoin",
+    "NEARUSDT": "near",
+    "ATOMUSDT": "cosmos",
+    "ETCUSDT": "ethereum-classic",
+    "FILUSDT": "filecoin",
+    "ARBUSDT": "arbitrum",
+    "OPUSDT": "optimism",
+    "INJUSDT": "injective-protocol",
+    "TIAUSDT": "celestia",
+    "SEIUSDT": "sei-network",
+    "RUNEUSDT": "thorchain",
+    "GRTUSDT": "the-graph",
+    "AAVEUSDT": "aave",
+    "ALGOUSDT": "algorand",
+    "SANDUSDT": "the-sandbox",
+    "MANAUSDT": "decentraland",
+    "THETAUSDT": "theta-token",
+    "FTMUSDT": "fantom",
+    "EOSUSDT": "eos",
+    "MKRUSDT": "maker",
+    "LDOUSDT": "lido-dao",
+    "IMXUSDT": "immutable-x",
+    "FLOWUSDT": "flow",
+    "XTZUSDT": "tezos",
+    "NEOUSDT": "neo",
+    "KSMUSDT": "kusama",
+    "ZECUSDT": "zcash",
+    "DASHUSDT": "dash",
+    "EGLDUSDT": "elrond-erd-2",
+    "MINAUSDT": "mina-protocol",
+    "GALAUSDT": "gala",
+    "HNTUSDT": "helium",
+    "CFXUSDT": "conflux-token",
+    "ARUSDT": "arweave",
+    "FETUSDT": "fetch-ai",
+    "AGIXUSDT": "singularitynet",
+    "OCEANUSDT": "ocean-protocol",
+    "1INCHUSDT": "1inch",
+    "CRVUSDT": "curve-dao-token",
+    "AXSUSDT": "axie-infinity",
+    "CHZUSDT": "chiliz",
+    "ENJUSDT": "enjincoin",
+    "BATUSDT": "basic-attention-token",
+    "SNXUSDT": "synthetix-network-token",
+    "COMPUSDT": "compound-governance-token",
+    "YFIUSDT": "yearn-finance",
+    "SUSHIUSDT": "sushi",
+    "ZRXUSDT": "0x",
+    "RENUSDT": "republic-protocol",
+    "CELOUSDT": "celo",
+    "LRCUSDT": "loopring",
+    "ANKRUSDT": "ankr",
+    "STORJUSDT": "storj",
+    "COTIUSDT": "coti",
+    "KAVAUSDT": "kava",
+    "ICXUSDT": "icon",
+    "ONTUSDT": "ontology",
+    "ZILUSDT": "zilliqa",
+    "WAVESUSDT": "waves",
+    "QTUMUSDT": "qtum",
+    "OMGUSDT": "omisego",
+    "BANDUSDT": "band-protocol",
+    "DENTUSDT": "dent",
+    "HOTUSDT": "holotoken",
+    "IOSTUSDT": "iostoken",
+    "RVNUSDT": "ravencoin",
+    "SCUSDT": "siacoin",
+    "ZENUSDT": "horizen",
+    "CKBUSDT": "nervos-network",
+    "SKLUSDT": "skale",
+    "CTSIUSDT": "cartesi",
+    "CTKUSDT": "certik",
+    "LINAUSDT": "linear",
+    "TRBUSDT": "tellor",
+    "BALUSDT": "balancer",
+    "PERPUSDT": "perpetual-protocol",
+    "BNTUSDT": "bancor",
+    "RSRUSDT": "reserve-rights-token",
+    "TOMOUSDT": "tomochain",
+    "DGBUSDT": "digibyte",
+    "DUSKUSDT": "dusk-network",
+    "REEFUSDT": "reef",
+    "ALPHAUSDT": "alpha-finance",
+    "FORTHUSDT": "ampleforth-governance-token",
+    "POLSUSDT": "polkastarter",
+    "C98USDT": "coin98",
+    "RAREUSDT": "superrare",
+    "ATAUSDT": "automata",
+    "IDEXUSDT": "idex",
+    "MLNUSDT": "melon",
+    "PEPEUSDT": "pepe",
+    "WIFUSDT": "dogwifcoin",
+    "BONKUSDT": "bonk",
+    "FLOKIUSDT": "floki",
+    "APTUSDT": "aptos",
+    "SUIUSDT": "sui",
+    "WLDUSDT": "worldcoin-wld",
+    "XLMUSDT": "stellar",
+    "TRXUSDT": "tron",
+    "BCHUSDT": "bitcoin-cash",
+    "WBTUSDT": "whitebit",
+    "USDCUSDT": "usd-coin",
+    "DAIUSDT": "dai",
+    "PYUSDUSDT": "paypal-usd",
+    "XAUTUSDT": "tether-gold",
+    "PAXGUSDT": "pax-gold",
+    "JTOUSDT": "jito-governance-token",
+    "ONDOUSDT": "ondo-finance",
+    "IDUSDT": "space-id",
+    "XMRUSDT": "monero",
+    "ZECUSDT": "zcash",
+    "INJUSDT": "injective-protocol",
+    "QUQUSDT": "quq",
+    "MPRAUSDT": "mpra",
+    "SPYXUSDT": "spyx",
+    "NIGHTUSDT": "night",
+    "RLUSDUSDT": "rlusd",
+    "SHEBUSDT": "sheb",
+    "HYPEUSDT": "hype",
+    "USD1USDT": "usd1",
+    "UNIUSDT": "uniswap",
+    "ASTERUSDT": "aster",
+    "FDUSDUSDT": "first-digital-usd",
+    "HBARUSDT": "hedera-hashgraph",
+}
 
-    # Determine time range
-    if start is None and days is not None:
-        end_dt = datetime.now()
-        start_dt = end_dt - timedelta(days=days)
-    elif start is not None:
-        start_dt = start
-        end_dt = end if end is not None else datetime.now()
-    else:
-        end_dt = datetime.now()
-        start_dt = end_dt - timedelta(days=60)
-
-    start_ts = int(start_dt.timestamp() * 1000)
-    end_ts = int(end_dt.timestamp() * 1000)
-
-    url = f"https://api.binance.com/api/v3/klines?symbol={symbol}&interval={binance_interval}&startTime={start_ts}&endTime={end_ts}&limit=1000"
+def get_cg_ohlc(symbol_usdt, days=14):
+    """Fetch 4h OHLC candles from CoinGecko. Returns DataFrame with Open, High, Low, Close, Volume."""
+    coin_id = COINGECKO_ID_MAP.get(symbol_usdt)
+    if not coin_id:
+        # Fallback: construct ID from lowercase ticker (may not always work)
+        coin_id = symbol_usdt.replace("USDT", "").lower()
+    url = f"https://api.coingecko.com/api/v3/coins/{coin_id}/ohlc?vs_currency=usd&days={days}"
     try:
-        resp = requests.get(url, timeout=10)
+        resp = requests.get(url, timeout=15)
         if resp.status_code != 200:
             return pd.DataFrame()
         data = resp.json()
         if not data:
             return pd.DataFrame()
-        df = pd.DataFrame(data, columns=[
-            'timestamp','open','high','low','close','volume',
-            'close_time','quote_vol','trades','taker_buy_base','taker_buy_quote','ignore'
-        ])
-        df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
-        df.set_index('timestamp', inplace=True)
-        for col in ['open','high','low','close','volume']:
+        df = pd.DataFrame(data, columns=["time", "open", "high", "low", "close"])
+        df["time"] = pd.to_datetime(df["time"], unit='ms')
+        df.set_index("time", inplace=True)
+        for col in ["open", "high", "low", "close"]:
             df[col] = pd.to_numeric(df[col])
-        df = df[['open','high','low','close','volume']]
-        df.columns = ['Open','High','Low','Close','Volume']
+        # CoinGecko OHLC does not include volume – we'll estimate from price range later
+        df["Volume"] = (df["high"] - df["low"]) * 1000   # rough placeholder
+        df.columns = ["Open", "High", "Low", "Close", "Volume"]
         return df
     except:
         return pd.DataFrame()
 
-# ========== MACRO BIAS (CoinGecko – used for BTC context only) ==========
+# Alias for consistency
+get_4h_klines = get_cg_ohlc
+
+# ========== COINGECKO MACRO BIAS ==========
 def fetch_coingecko(url, retries=2):
     for attempt in range(retries):
         try:
@@ -372,7 +494,7 @@ def score_coin(symbol, price, volume, macro_bias, coin_data_cache, btc_df):
         if symbol in coin_data_cache:
             df = coin_data_cache[symbol]
         else:
-            df = get_binance_klines(symbol, interval='4h', days=14)
+            df = get_4h_klines(symbol, days=14)
             coin_data_cache[symbol] = df
 
         if df.empty or len(df) < 48:
@@ -489,7 +611,7 @@ def generate_post(coin, direction, entry, stop, tps, sl_pct, qwen_reason=""):
 
     recent_candles = ""
     try:
-        df = get_binance_klines(sym, interval='4h', days=2)
+        df = get_4h_klines(sym, days=2)
         if not df.empty:
             last_candles = df.tail(6)
             candle_list = []
@@ -608,89 +730,110 @@ def check_open_trades():
             tps = []
             for i in range(1,6):
                 tps.append(float(trade[f"TP{i}"]))
-            df_1h = get_binance_klines(sym, interval='1h', days=3)
-            if df_1h.empty: still_open.append(trade); continue
+            # For trade checking, we can use 1h data from market_chart
+            coin_id = COINGECKO_ID_MAP.get(sym, sym.replace("USDT","").lower())
+            cg_url = f"https://api.coingecko.com/api/v3/coins/{coin_id}/market_chart?vs_currency=usd&days=3"
+            cg_data = fetch_coingecko(cg_url)
+            if not cg_data or 'prices' not in cg_data:
+                still_open.append(trade); continue
+            prices = cg_data['prices']
+            if len(prices) < 2:
+                still_open.append(trade); continue
+            df = pd.DataFrame(prices, columns=['time','price'])
+            df['time'] = pd.to_datetime(df['time'], unit='ms')
+            df.set_index('time', inplace=True)
+            # Use high/low? Not directly available, so we'll estimate using price swings (not perfect but works)
+            # Simpler: only check close price against TP/SL? That's fine for paper tracking.
+            # We'll just check if price crossed levels by comparing consecutive prices.
             current_stop = entry if highest_tp_idx >= 0 else stop_orig
             full_close_data = None
-            for _, candle in df_1h.iterrows():
-                high, low = candle['High'], candle['Low']
-                new_tp_idx = None
-                if direction == "LONG":
-                    for i in range(len(tps)-1, -1, -1):
-                        if high >= tps[i] and i > highest_tp_idx:
-                            new_tp_idx = i; break
-                else:
-                    for i in range(len(tps)-1, -1, -1):
-                        if low <= tps[i] and i > highest_tp_idx:
-                            new_tp_idx = i; break
-                if new_tp_idx is not None:
-                    for i in range(highest_tp_idx+1, new_tp_idx+1):
-                        if remaining_qty <= 0: break
-                        if i == 0:
-                            current_stop = entry
-                        fraction = fractions[i]
-                        exit_qty = orig_qty * fraction
-                        if exit_qty > remaining_qty: exit_qty = remaining_qty
-                        if exit_qty > 0:
-                            exit_price = tps[i]
-                            pnl = (exit_price - entry) * exit_qty if direction=="LONG" else (entry - exit_price) * exit_qty
-                            partial = trade.to_dict()
-                            partial["hit_level"] = f"TP{i+1} (partial)"
-                            partial["close_time"] = now.strftime("%Y-%m-%d %H:%M:%S")
-                            partial["exit_price"] = exit_price
-                            partial["quantity"] = exit_qty
-                            partial["pnl_usdt"] = round(pnl,4)
-                            results.append(partial)
-                            update_portfolio({'pnl_usdt': pnl})
-                            remaining_qty -= exit_qty
-                            highest_tp_idx = i
-                            alerts.append(f"🚀 {sym.replace('USDT','')} {direction} TP{i+1} hit — {fraction*100:.0f}% closed")
-                        if i == 4:
-                            if remaining_qty > 0:
-                                final_exit_qty = remaining_qty
-                                exit_price = tps[4]
-                                pnl = (exit_price - entry) * final_exit_qty if direction=="LONG" else (entry - exit_price) * final_exit_qty
-                                final = trade.to_dict()
-                                final["hit_level"] = "TP5 (final)"
-                                final["close_time"] = now.strftime("%Y-%m-%d %H:%M:%S")
-                                final["exit_price"] = exit_price
-                                final["quantity"] = final_exit_qty
-                                final["pnl_usdt"] = round(pnl,4)
-                                results.append(final)
+            prev_price = None
+            for ts, row in df.iterrows():
+                p = row['price']
+                if prev_price is not None:
+                    # Approximate high/low as min/max of the two prices
+                    high = max(p, prev_price)
+                    low = min(p, prev_price)
+                    new_tp_idx = None
+                    if direction == "LONG":
+                        for i in range(len(tps)-1, -1, -1):
+                            if high >= tps[i] and i > highest_tp_idx:
+                                new_tp_idx = i; break
+                    else:
+                        for i in range(len(tps)-1, -1, -1):
+                            if low <= tps[i] and i > highest_tp_idx:
+                                new_tp_idx = i; break
+                    if new_tp_idx is not None:
+                        # process partials (same as before)
+                        for i in range(highest_tp_idx+1, new_tp_idx+1):
+                            if remaining_qty <= 0: break
+                            if i == 0:
+                                current_stop = entry
+                            fraction = fractions[i]
+                            exit_qty = orig_qty * fraction
+                            if exit_qty > remaining_qty: exit_qty = remaining_qty
+                            if exit_qty > 0:
+                                exit_price = tps[i]
+                                pnl = (exit_price - entry) * exit_qty if direction=="LONG" else (entry - exit_price) * exit_qty
+                                partial = trade.to_dict()
+                                partial["hit_level"] = f"TP{i+1} (partial)"
+                                partial["close_time"] = now.strftime("%Y-%m-%d %H:%M:%S")
+                                partial["exit_price"] = exit_price
+                                partial["quantity"] = exit_qty
+                                partial["pnl_usdt"] = round(pnl,4)
+                                results.append(partial)
                                 update_portfolio({'pnl_usdt': pnl})
-                                remaining_qty = 0
-                                highest_tp_idx = 4
-                                full_close_data = {
-                                    "symbol": sym, "action": direction,
-                                    "limit_price": entry, "stop_loss": stop_orig,
-                                    "take_profits": tps
-                                }
-                                alerts.append(f"🔔 {sym.replace('USDT','')} {direction} TP5 hit — remaining closed")
+                                remaining_qty -= exit_qty
+                                highest_tp_idx = i
+                                alerts.append(f"🚀 {sym.replace('USDT','')} {direction} TP{i+1} hit — {fraction*100:.0f}% closed")
+                            if i == 4:
+                                if remaining_qty > 0:
+                                    final_exit_qty = remaining_qty
+                                    exit_price = tps[4]
+                                    pnl = (exit_price - entry) * final_exit_qty if direction=="LONG" else (entry - exit_price) * final_exit_qty
+                                    final = trade.to_dict()
+                                    final["hit_level"] = "TP5 (final)"
+                                    final["close_time"] = now.strftime("%Y-%m-%d %H:%M:%S")
+                                    final["exit_price"] = exit_price
+                                    final["quantity"] = final_exit_qty
+                                    final["pnl_usdt"] = round(pnl,4)
+                                    results.append(final)
+                                    update_portfolio({'pnl_usdt': pnl})
+                                    remaining_qty = 0
+                                    highest_tp_idx = 4
+                                    full_close_data = {
+                                        "symbol": sym, "action": direction,
+                                        "limit_price": entry, "stop_loss": stop_orig,
+                                        "take_profits": tps
+                                    }
+                                    alerts.append(f"🔔 {sym.replace('USDT','')} {direction} TP5 hit — remaining closed")
+                                break
+                        if remaining_qty <= 0 and i == 4:
                             break
-                    if remaining_qty <= 0 and i == 4:
-                        break
-                if remaining_qty > 0:
-                    sl_hit = (low <= current_stop) if direction=="LONG" else (high >= current_stop)
-                    if sl_hit:
-                        exit_qty = remaining_qty; exit_price = current_stop
-                        pnl = (exit_price - entry) * exit_qty if direction=="LONG" else (entry - exit_price) * exit_qty
-                        final = trade.to_dict()
-                        desc = "STOP LOSS" if highest_tp_idx == -1 else "BE STOP"
-                        final["hit_level"] = desc
-                        final["close_time"] = now.strftime("%Y-%m-%d %H:%M:%S")
-                        final["exit_price"] = exit_price
-                        final["quantity"] = exit_qty
-                        final["pnl_usdt"] = round(pnl,4)
-                        results.append(final)
-                        update_portfolio({'pnl_usdt': pnl})
-                        remaining_qty = 0
-                        full_close_data = {
-                            "symbol": sym, "action": direction,
-                            "limit_price": entry, "stop_loss": stop_orig,
-                            "take_profits": tps
-                        }
-                        alerts.append(f"🔴 {sym.replace('USDT','')} {direction} → {desc} (remaining closed)")
-                        break
+                    # Check stop loss
+                    if remaining_qty > 0:
+                        sl_hit = (low <= current_stop) if direction=="LONG" else (high >= current_stop)
+                        if sl_hit:
+                            exit_qty = remaining_qty; exit_price = current_stop
+                            pnl = (exit_price - entry) * exit_qty if direction=="LONG" else (entry - exit_price) * exit_qty
+                            final = trade.to_dict()
+                            desc = "STOP LOSS" if highest_tp_idx == -1 else "BE STOP"
+                            final["hit_level"] = desc
+                            final["close_time"] = now.strftime("%Y-%m-%d %H:%M:%S")
+                            final["exit_price"] = exit_price
+                            final["quantity"] = exit_qty
+                            final["pnl_usdt"] = round(pnl,4)
+                            results.append(final)
+                            update_portfolio({'pnl_usdt': pnl})
+                            remaining_qty = 0
+                            full_close_data = {
+                                "symbol": sym, "action": direction,
+                                "limit_price": entry, "stop_loss": stop_orig,
+                                "take_profits": tps
+                            }
+                            alerts.append(f"🔴 {sym.replace('USDT','')} {direction} → {desc} (remaining closed)")
+                            break
+                prev_price = p
             if remaining_qty > 0:
                 trade["quantity"] = remaining_qty
                 trade["highest_tp"] = highest_tp_idx
@@ -735,7 +878,7 @@ def generate_signal(balance_usdt):
         if not candidates: return {"action":"HOLD","reasoning":"No liquid coins.","summary":""}
         macro_bias = get_macro_bias()
         coin_data_cache = {}
-        btc_df = get_binance_klines("BTCUSDT", interval='4h', days=14)
+        btc_df = get_4h_klines("BTCUSDT", days=14)
         all_scored = []
         for coin in candidates:
             total, layers, trend_dir, atr = score_coin(coin["symbol"], coin["price"], coin["volume"], macro_bias, coin_data_cache, btc_df)
@@ -776,12 +919,16 @@ def generate_signal(balance_usdt):
         direction = coin["direction"]
         entry = coin.get("bid", coin["price"]*0.999) if direction=="LONG" else coin.get("ask", coin["price"]*1.001)
         atr = coin["atr"]
-        df_1h_recent = get_binance_klines(coin["symbol"], interval='1h', days=1)
+        # Confirm with 1h candle direction (using CoinGecko market_chart)
+        coin_id = COINGECKO_ID_MAP.get(coin["symbol"], coin["symbol"].replace("USDT","").lower())
+        cg_url = f"https://api.coingecko.com/api/v3/coins/{coin_id}/market_chart?vs_currency=usd&days=1"
+        cg_data = fetch_coingecko(cg_url)
         confirm = False
-        if not df_1h_recent.empty:
-            last_candle = df_1h_recent.iloc[-1]
-            if direction=="LONG" and last_candle['Close'] > last_candle['Open']: confirm = True
-            elif direction=="SHORT" and last_candle['Close'] < last_candle['Open']: confirm = True
+        if cg_data and 'prices' in cg_data and len(cg_data['prices']) >= 2:
+            p1 = cg_data['prices'][-2][1]
+            p2 = cg_data['prices'][-1][1]
+            if direction == "LONG" and p2 > p1: confirm = True
+            elif direction == "SHORT" and p2 < p1: confirm = True
         stop_mult = 1.2 if confirm else 1.5
         min_stop = max(stop_mult * atr, entry * 0.01)
         stop = entry - min_stop if direction=="LONG" else entry + min_stop
@@ -816,7 +963,7 @@ def generate_signal(balance_usdt):
 def send_trade_chart(signal, title_suffix=""):
     try:
         import matplotlib; matplotlib.use('Agg'); import matplotlib.pyplot as plt; import mplfinance as mpf
-        sym = signal['symbol']; df = get_binance_klines(sym, interval='4h', days=10)
+        sym = signal['symbol']; df = get_4h_klines(sym, days=10)
         if df.empty: return
         style = mpf.make_mpf_style(base_mpf_style='nightclouds', facecolor='#000000', gridcolor='#2a2e39',
                                    rc={'axes.labelcolor':'white','xtick.color':'white','ytick.color':'white','axes.titlecolor':'white'})
