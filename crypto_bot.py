@@ -5,6 +5,7 @@ Signal formatting: Elite 7-angle Binance Square posts
 Dynamic stop loss (0.3‑2.0%) based on coin rank
 Breakeven after TP1, allows new signals on same pair
 BLACKLIST for unwanted coins (stablecoins, QUQ, etc.)
+HOLD message shows conviction scores + layer breakdown
 """
 
 import requests, json, os, traceback, random
@@ -274,17 +275,21 @@ def support_resistance_levels(df, lookback=20):
 
 # ========== MULTI‑LAYER SCORING (TP1 optimized) ==========
 def score_pair(pair):
+    """
+    Returns (total_score, direction, price, atr_val, swing_level, layers)
+    layers is a dict of layer_name: (obtained_score, max_score)
+    """
     df_d = get_data(pair, interval='1d', days=90)
     if df_d.empty or len(df_d) < 50:
-        return 0, None, None, None, None
+        return 0, None, None, None, None, {}
 
     df_4h = get_data(pair, interval='4h', days=14)
     if df_4h.empty or len(df_4h) < 50:
-        return 0, None, None, None, None
+        return 0, None, None, None, None, {}
 
     df_1h = get_data(pair, interval='1h', days=3)
     if df_1h.empty or len(df_1h) < 10:
-        return 0, None, None, None, None
+        return 0, None, None, None, None, {}
 
     price = df_4h['Close'].iloc[-1]
 
@@ -296,7 +301,7 @@ def score_pair(pair):
     elif price < ema50_d.iloc[-1] and ema50_d.iloc[-1] < ema200_d.iloc[-1]:
         trend_daily = -1
     if trend_daily == 0:
-        return 0, None, None, None, None
+        return 0, None, None, None, None, {}
 
     ema50_4h = ema(df_4h['Close'], 50)
     ema200_4h = ema(df_4h['Close'], 200)
@@ -379,24 +384,24 @@ def score_pair(pair):
     atr_ok = atr_val > price * min_atr_ratio
     atr_score = bool_score(atr_ok)
 
-    total = (
-        ema_score * 2.0 +
-        adx_score * 1.5 +
-        rsi_score * 1.5 +
-        macd_score * 1.0 +
-        sr_score * 1.0 +
-        vol_score * 0.5 +
-        market_score * 0.5 +
-        candle_score * 1.5 +
-        rsi_1h_score * 1.0 +
-        atr_score * 1.0 +
-        micro_trend_score * 1.5
-    )
+    # Build layers dict
+    layers = {
+        "EMA Align":   (ema_score * 2.0, 2.0),
+        "ADX":         (adx_score * 1.5, 1.5),
+        "RSI":         (rsi_score * 1.5, 1.5),
+        "MACD":        (macd_score * 1.0, 1.0),
+        "S/R":         (sr_score * 1.0, 1.0),
+        "Volume":      (vol_score * 0.5, 0.5),
+        "Market":      (market_score * 0.5, 0.5),
+        "Candle Mom":  (candle_score * 1.5, 1.5),
+        "RSI 1h":      (rsi_1h_score * 1.0, 1.0),
+        "ATR":         (atr_score * 1.0, 1.0),
+        "Micro Trend": (micro_trend_score * 1.5, 1.5)
+    }
 
-    if total < 6.5:
-        return 0, None, None, None, None
+    total = sum(score for score, _ in layers.values())
 
-    return total, direction, price, atr_val, (sup if direction == "LONG" else res)
+    return total, direction, price, atr_val, (sup if direction == "LONG" else res), layers
 
 # ========== AI CONFIRMATION GATE ==========
 def ai_confirm_trade(signal_dict):
@@ -458,20 +463,31 @@ def generate_signal():
     except:
         pass
 
-    candidates = []
+    all_scored = []          # list of (pair, score, direction, price, atr_val, swing_level, layers)
+    top_overall = None
+
     for pair in CRYPTO_PAIRS:
         if pair in open_symbols_risky:
             continue
-        score, direction, price, atr_val, swing_level = score_pair(pair)
-        if direction and score >= 6.5:
-            candidates.append((pair, score, direction, price, atr_val, swing_level))
+        score, direction, price, atr_val, swing_level, layers = score_pair(pair)
+        if direction is None:   # no daily trend
+            continue
+        all_scored.append((pair, score, direction, price, atr_val, swing_level, layers))
+        if top_overall is None or score > top_overall[1]:
+            top_overall = (pair, score, direction, price, atr_val, swing_level, layers)
 
+    # Filter candidates that meet threshold
+    candidates = [item for item in all_scored if item[1] >= 6.5]
     if not candidates:
-        return None
+        # Return no signal, but pass the top 5 scores and the top overall layers
+        top5 = sorted(all_scored, key=lambda x: x[1], reverse=True)[:5]
+        top_layers = top_overall[6] if top_overall else {}
+        return None, top5, top_layers
 
+    # Best candidate by score
     candidates.sort(key=lambda x: x[1], reverse=True)
     best = candidates[0]
-    pair, score, direction, price, atr_val, swing_level = best
+    pair, score, direction, price, atr_val, swing_level, layers = best
 
     # ----- DYNAMIC STOP LOSS BASED ON RANK -----
     rank = COIN_RANK.get(pair, 99)
@@ -524,10 +540,12 @@ def generate_signal():
 
     if not ai_confirm_trade(signal):
         print(f"AI rejected {pair} {direction} (score {score:.1f})")
-        return None
+        return None, [], {}
 
     signal["ai_approved"] = True
-    return signal
+    # Also return top 5 and top layers for possible use, though we won't use them when a signal exists
+    top5 = sorted(all_scored, key=lambda x: x[1], reverse=True)[:5]
+    return signal, top5, top_overall[6] if top_overall else {}
 
 # ========== TRADE MANAGEMENT (BREAKEVEN AFTER TP1) ==========
 def check_open_trades():
@@ -859,6 +877,32 @@ def format_signal(sig):
 
     return msg
 
+# ========== HOLD MESSAGE FORMATTING ==========
+def format_hold_message(top5, top_layers):
+    if not top5:
+        return "HOLD – No valid trade setups found. Market is fully trendless."
+
+    # Top 5 list
+    lines = ["HOLD – No high‑conviction crypto setup found.\n📊 **Top Coin Scores** (of {})".format(len(top5))]
+    for idx, (pair, score, direction, _, _, _, _) in enumerate(top5, 1):
+        short = pair.replace("-USD", "")
+        lines.append(f"{idx}. {short} → {direction} ({score:.1f}/13.0)")
+
+    # Layer breakdown for the top coin
+    if top_layers:
+        top_pair = top5[0][0].replace("-USD", "")
+        top_score = top5[0][1]
+        top_dir = top5[0][2]
+        lines.append(f"\n🔎 **Top Coin Layer Breakdown:** {top_pair} ({top_dir}, {top_score:.1f})")
+        for name, (earned, max_) in top_layers.items():
+            check = "✅" if earned > 0 else "❌"
+            lines.append(f"• {name} ({max_}): {check}")
+    else:
+        lines.append("\nNo layer data available.")
+
+    lines.append("\n💬 Are you stalking any setups? Drop your watchlist below! 👇")
+    return "\n".join(lines)
+
 # ========== CHART ON SIGNAL ==========
 def send_trade_chart(signal):
     sym = signal['symbol']
@@ -929,7 +973,7 @@ def main():
             send_telegram("Daily loss limit reached. No new trades today.")
             return
 
-        sig = generate_signal()
+        sig, top5, top_layers = generate_signal()
         if sig:
             log_signal(sig)
             add_open_trade(sig)
@@ -938,7 +982,9 @@ def main():
             send_telegram(format_signal(sig))
             send_trade_chart(sig)
         else:
-            send_telegram("HOLD – No high‑conviction crypto setup found.")
+            # No signal: send detailed HOLD message with scores
+            hold_msg = format_hold_message(top5, top_layers)
+            send_telegram(hold_msg)
     except Exception as e:
         err = f"Bot crashed: {traceback.format_exc()[:500]}"
         print(err)
