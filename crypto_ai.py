@@ -233,13 +233,11 @@ def btc_trend_score():
         data = fetch_coingecko("https://api.coingecko.com/api/v3/simple/price?ids=bitcoin&vs_currencies=usd")
         if data and 'bitcoin' in data:
             btc_price = data['bitcoin']['usd']
-            # We'll use a very rough estimate: assume EMA50 is around the current price
-            # This is inaccurate, so we return 0 with a note, not a fake direction.
+            # Rough estimate: assume EMA50 is around the current price
             return 0, "live price only (neutral)"
     except:
         pass
 
-    # If everything failed, return 0 with an error message
     return 0, "BTC data unavailable after all attempts"
 
 def institutional_macro_filter():
@@ -293,53 +291,60 @@ def refined_buying_pressure(symbol_usdt):
     except:
         return 0,0
 
+# ========== FALLBACK‑RESILIENT TECHNICALS ==========
 def get_technicals(symbol_usdt):
-    try:
-        df = get_yahoo_klines(symbol_usdt, interval='4h', days=14)
+    # Try 4h data first
+    df = get_yahoo_klines(symbol_usdt, interval='4h', days=14)
+    if df.empty or len(df) < 50:
+        # Fallback: try 1h data (last 3 days)
+        df = get_yahoo_klines(symbol_usdt, interval='1h', days=3)
         if df.empty or len(df) < 50:
             return {"combined":0, "trend_dir":"up", "adx":0, "di_plus":0, "di_minus":0}
-        closes = df['Close']
-        highs, lows = df['High'], df['Low']
-        ema50 = safe_ema(closes, 50)
-        ema200 = safe_ema(closes, 200) if len(closes) >= 200 else ema50
-        current = closes.iloc[-1]
-        trend = 1.5 if current > ema50.iloc[-1] else -1.5
-        trend += 1.5 if ema50.iloc[-1] > ema200.iloc[-1] else -1.5
-        trend = max(-3, min(3, trend))
-        def adx(high, low, close, period=14):
-            dm_plus = high.diff(); dm_minus = -low.diff()
-            dm_plus[dm_plus<0]=0; dm_minus[dm_minus<0]=0
-            tr = pd.concat([high-low, (high-close.shift()).abs(), (low-close.shift()).abs()], axis=1).max(axis=1)
-            atr = safe_ema(tr, span=period)
-            di_plus = 100 * (safe_ema(dm_plus, span=period) / atr)
-            di_minus = 100 * (safe_ema(dm_minus, span=period) / atr)
-            dx = 100 * (di_plus - di_minus).abs() / (di_plus + di_minus)
-            return safe_ema(dx, span=period), di_plus, di_minus
-        adx_s, di_p, di_m = adx(highs, lows, closes)
-        adx_now = adx_s.iloc[-1] if not adx_s.empty else 0
-        di_plus_now = di_p.iloc[-1] if not di_p.empty else 0
-        di_minus_now = di_m.iloc[-1] if not di_m.empty else 0
-        adx_score = 2.5 if adx_now>25 and di_plus_now>di_minus_now else (-2.5 if adx_now>25 else (1.0 if adx_now>20 and di_plus_now>di_minus_now else (-1.0 if adx_now>20 else 0)))
-        window=7; lookback=min(50,len(highs))
-        rh=highs.iloc[-lookback:]; rl=lows.iloc[-lookback:]
-        sh, sl = [], []
-        for i in range(window,len(rh)-window):
-            if all(rh.iloc[i] >= rh.iloc[i-window:i+window+1]): sh.append((i,rh.iloc[i]))
-            if all(rl.iloc[i] <= rl.iloc[i-window:i+window+1]): sl.append((i,rl.iloc[i]))
-        structure=0
-        if len(sh)>=2 and len(sl)>=2:
-            last_hh = sh[-1][1] > sh[-2][1]; last_hl = sl[-1][1] > sl[-2][1]
-            if last_hh and last_hl:
-                structure = 3.0 if (len(sh)>=3 and sh[-2][1]>sh[-3][1] and len(sl)>=3 and sl[-2][1]>sl[-3][1]) else 2.0
-            elif not last_hh and not last_hl:
-                structure = -3.0 if (len(sh)>=3 and sh[-2][1]<sh[-3][1] and len(sl)>=3 and sl[-2][1]<sl[-3][1]) else -2.0
-        structure = max(-3, min(3, structure))
-        combined = trend*0.30 + adx_score*0.25 + structure*0.45
-        trend_dir = "up" if current > ema50.iloc[-1] else "down"
-        return {"combined":combined, "trend_dir":trend_dir, "adx":adx_now, "di_plus":di_plus_now, "di_minus":di_minus_now}
-    except Exception as e:
-        print(f"tech error {symbol_usdt}: {e}")
-        return {"combined":0, "trend_dir":"up", "adx":0, "di_plus":0, "di_minus":0}
+
+    closes = df['Close']
+    highs, lows = df['High'], df['Low']
+    ema50 = safe_ema(closes, 50)
+    ema200 = safe_ema(closes, 200) if len(closes) >= 200 else ema50
+    current = closes.iloc[-1]
+    trend = 1.5 if current > ema50.iloc[-1] else -1.5
+    trend += 1.5 if ema50.iloc[-1] > ema200.iloc[-1] else -1.5
+    trend = max(-3, min(3, trend))
+
+    def adx(high, low, close, period=14):
+        dm_plus = high.diff(); dm_minus = -low.diff()
+        dm_plus[dm_plus<0]=0; dm_minus[dm_minus<0]=0
+        tr = pd.concat([high-low, (high-close.shift()).abs(), (low-close.shift()).abs()], axis=1).max(axis=1)
+        atr = safe_ema(tr, span=period)
+        di_plus = 100 * (safe_ema(dm_plus, span=period) / atr)
+        di_minus = 100 * (safe_ema(dm_minus, span=period) / atr)
+        dx = 100 * (di_plus - di_minus).abs() / (di_plus + di_minus)
+        return safe_ema(dx, span=period), di_plus, di_minus
+
+    adx_s, di_p, di_m = adx(highs, lows, closes)
+    adx_now = adx_s.iloc[-1] if not adx_s.empty else 0
+    di_plus_now = di_p.iloc[-1] if not di_p.empty else 0
+    di_minus_now = di_m.iloc[-1] if not di_m.empty else 0
+    adx_score = 2.5 if adx_now>25 and di_plus_now>di_minus_now else (-2.5 if adx_now>25 else (1.0 if adx_now>20 and di_plus_now>di_minus_now else (-1.0 if adx_now>20 else 0)))
+
+    # Structure detection (same as before)
+    window=7; lookback=min(50,len(highs))
+    rh=highs.iloc[-lookback:]; rl=lows.iloc[-lookback:]
+    sh, sl = [], []
+    for i in range(window,len(rh)-window):
+        if all(rh.iloc[i] >= rh.iloc[i-window:i+window+1]): sh.append((i,rh.iloc[i]))
+        if all(rl.iloc[i] <= rl.iloc[i-window:i+window+1]): sl.append((i,rl.iloc[i]))
+    structure=0
+    if len(sh)>=2 and len(sl)>=2:
+        last_hh = sh[-1][1] > sh[-2][1]; last_hl = sl[-1][1] > sl[-2][1]
+        if last_hh and last_hl:
+            structure = 3.0 if (len(sh)>=3 and sh[-2][1]>sh[-3][1] and len(sl)>=3 and sl[-2][1]>sl[-3][1]) else 2.0
+        elif not last_hh and not last_hl:
+            structure = -3.0 if (len(sh)>=3 and sh[-2][1]<sh[-3][1] and len(sl)>=3 and sl[-2][1]<sl[-3][1]) else -2.0
+    structure = max(-3, min(3, structure))
+
+    combined = trend*0.30 + adx_score*0.25 + structure*0.45
+    trend_dir = "up" if current > ema50.iloc[-1] else "down"
+    return {"combined":combined, "trend_dir":trend_dir, "adx":adx_now, "di_plus":di_plus_now, "di_minus":di_minus_now}
 
 def get_4h_atr(symbol_usdt, current_price):
     try:
@@ -643,7 +648,7 @@ def generate_post(coin, direction, entry, stop, tps, sl_pct, qwen_reason=""):
         )
     return text.strip()
 
-# ========== TRADE MANAGER ==========
+# ========== TRADE MANAGER (full closure chart + alert) ==========
 def check_open_trades():
     try:
         open_df = pd.read_csv(OPEN_TRADES_CSV)
@@ -820,17 +825,14 @@ def generate_signal(balance_usdt):
             reason = ""
             if best_all:
                 layer_str = "; ".join([f"{k}={v:.2f}" for k,v in best_all["layers"].items()])
-                errors = []
-                # Only flag intermarket zero if BTC data failed completely
-                if btc_err and "BTC data unavailable after all attempts" in btc_err:
-                    errors.append("intermarket (BTC data failed)")
                 reason = (
                     f"No strong conviction. Best internal score: {best_all['score']:.2f} for {best_all['symbol']}.\n"
                     f"Qwen filter active – no candidate passed the quality check.\n"
                     f"Layers: {layer_str}\n"
-                    f"{'⚠️ ' + btc_err if btc_err else ''}\n"
                     f"Top coins: {summary}"
                 )
+                if btc_err:
+                    reason += f"\n⚠️ BTC data note: {btc_err}"
             else:
                 reason = "No valid coins to evaluate."
             return {"action":"HOLD", "reasoning": reason, "summary": summary}
