@@ -61,68 +61,11 @@ def fetch_coingecko(url, retries=2):
             time.sleep(1)
     return None
 
-# ========== BYBIT KLINE FUNCTIONS ==========
-def get_bybit_klines(symbol_usdt, interval='4h', days=60, start=None, end=None):
-    """
-    Fetch candlestick data from Bybit public API.
-    Returns DataFrame with columns Open, High, Low, Close, Volume (index = datetime).
-    """
-    # Map interval to Bybit format
-    interval_map = {
-        '1m': '1', '5m': '5', '15m': '15', '30m': '30',
-        '1h': '60', '4h': '240', '1d': 'D', '1w': 'W'
-    }
-    bybit_interval = interval_map.get(interval, '240')
-    symbol = symbol_usdt.upper()
-
-    # Determine time range
-    if start is None and days is not None:
-        end_dt = datetime.now()
-        start_dt = end_dt - timedelta(days=days)
-    elif start is not None:
-        start_dt = start
-        end_dt = end if end is not None else datetime.now()
-    else:
-        end_dt = datetime.now()
-        start_dt = end_dt - timedelta(days=60)
-
-    start_ts = int(start_dt.timestamp() * 1000)
-    end_ts = int(end_dt.timestamp() * 1000)
-
-    url = f"https://api.bybit.com/v5/market/kline?category=spot&symbol={symbol}&interval={bybit_interval}&start={start_ts}&end={end_ts}&limit=1000"
-    try:
-        resp = requests.get(url, timeout=10)
-        if resp.status_code == 200:
-            data = resp.json()
-            if data.get('retCode') != 0 or 'list' not in data.get('result', {}):
-                return pd.DataFrame()
-            klines = data['result']['list']
-            if not klines:
-                return pd.DataFrame()
-            # Bybit returns list in reverse chronological order; we reverse to chronological
-            klines.reverse()
-            df = pd.DataFrame(klines, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume', 'turnover'])
-            df['timestamp'] = pd.to_datetime(df['timestamp'].astype(np.int64), unit='ms')
-            df.set_index('timestamp', inplace=True)
-            for col in ['open', 'high', 'low', 'close', 'volume']:
-                df[col] = pd.to_numeric(df[col])
-            df = df[['open', 'high', 'low', 'close', 'volume']]
-            df.columns = ['Open', 'High', 'Low', 'Close', 'Volume']
-            return df
-    except:
-        pass
-    return pd.DataFrame()
-
 def get_yahoo_klines(symbol_usdt, interval='4h', days=60, start=None, end=None):
     """
-    Primary function to fetch klines. Tries Bybit first, then falls back to Yahoo Finance.
+    Fetch klines from Yahoo Finance (sole source).
+    Retries once with longer delay if needed.
     """
-    # Try Bybit first
-    df = get_bybit_klines(symbol_usdt, interval=interval, days=days, start=start, end=end)
-    if not df.empty and len(df) >= 10:
-        return df
-
-    # Fallback to Yahoo Finance
     yahoo_symbol = symbol_usdt.replace("USDT", "-USD")
     if start is None:
         end_dt = datetime.now()
@@ -130,17 +73,19 @@ def get_yahoo_klines(symbol_usdt, interval='4h', days=60, start=None, end=None):
     else:
         start_dt = start
         end_dt = end if end is not None else datetime.now()
-    try:
-        df_yf = yf.download(yahoo_symbol, start=start_dt, end=end_dt, interval=interval, progress=False)
-        if df_yf.empty:
-            return pd.DataFrame()
-        if isinstance(df_yf.columns, pd.MultiIndex):
-            df_yf.columns = df_yf.columns.get_level_values(0)
-        if not {'Open','High','Low','Close','Volume'}.issubset(df_yf.columns):
-            return pd.DataFrame()
-        return df_yf
-    except:
-        return pd.DataFrame()
+
+    for attempt in range(2):
+        try:
+            df = yf.download(yahoo_symbol, start=start_dt, end=end_dt, interval=interval, progress=False)
+            if not df.empty and len(df) >= 10:
+                if isinstance(df.columns, pd.MultiIndex):
+                    df.columns = df.columns.get_level_values(0)
+                if {'Open','High','Low','Close','Volume'}.issubset(df.columns):
+                    return df
+            time.sleep(3)
+        except:
+            time.sleep(3)
+    return pd.DataFrame()
 
 # ========== CSV LOGGING ==========
 def init_csv(filepath, columns):
@@ -227,7 +172,7 @@ def update_portfolio(trade_result):
     portfolio['realized_pnl'] += trade_result['pnl_usdt']
     save_portfolio(portfolio)
 
-# ========== BULLETPROOF BTC TREND (Bybit + Yahoo + CoinGecko) ==========
+# ========== BULLETPROOF BTC TREND (Yahoo 4h → 1h → CoinGecko daily) ==========
 def safe_ema(series, span):
     try:
         return series.ewm(span=span, adjust=False).mean()
@@ -235,11 +180,11 @@ def safe_ema(series, span):
         return pd.Series(index=series.index)
 
 def btc_trend_score():
-    """Returns +2 bullish, -2 bearish, 0 neutral."""
-    # 1. Bybit 4h
-    for attempt in range(2):
+    """Returns +2 (bullish), -2 (bearish), 0 (neutral)."""
+    # 1. Yahoo 4h
+    for attempt in range(3):
         try:
-            df = get_yahoo_klines("BTCUSDT", interval='4h', days=14)   # tries Bybit first, then Yahoo
+            df = get_yahoo_klines("BTCUSDT", interval='4h', days=14)
             if not df.empty and len(df) >= 50:
                 closes = df['Close']
                 ema50 = safe_ema(closes, 50)
@@ -253,11 +198,27 @@ def btc_trend_score():
                     return -2, None
                 else:
                     return 0, None
-            time.sleep(2)
+            time.sleep(3)
         except:
-            time.sleep(2)
+            time.sleep(3)
 
-    # 2. CoinGecko daily (ultimate fallback)
+    # 2. Yahoo 1h (7 days → up to 168 candles)
+    try:
+        df_1h = get_yahoo_klines("BTCUSDT", interval='1h', days=7)
+        if not df_1h.empty and len(df_1h) >= 50:
+            closes = df_1h['Close']
+            ema50 = safe_ema(closes, 50)
+            cur = closes.iloc[-1]
+            ema_now = ema50.iloc[-1]
+            slope_up = ema_now > ema50.iloc[-7] if len(ema50) >= 7 else True
+            price_above = cur > ema_now
+            if price_above and slope_up: return 2, "1h fallback"
+            elif not price_above and not slope_up: return -2, "1h fallback"
+            else: return 0, "1h fallback"
+    except:
+        pass
+
+    # 3. CoinGecko daily
     try:
         cg_url = "https://api.coingecko.com/api/v3/coins/bitcoin/market_chart?vs_currency=usd&days=90"
         cg_data = fetch_coingecko(cg_url)
@@ -337,7 +298,7 @@ def refined_buying_pressure(symbol_usdt):
 def get_technicals(symbol_usdt):
     df = get_yahoo_klines(symbol_usdt, interval='4h', days=14)
     if df.empty or len(df) < 50:
-        df = get_yahoo_klines(symbol_usdt, interval='1h', days=3)
+        df = get_yahoo_klines(symbol_usdt, interval='1h', days=3)   # up to 72 candles
         if df.empty or len(df) < 50:
             return {"combined":0, "trend_dir":"up", "adx":0, "di_plus":0, "di_minus":0}
 
