@@ -1,7 +1,6 @@
 import requests, json, os, traceback, re, time, random
 import pandas as pd
 import numpy as np
-import yfinance as yf
 from datetime import datetime, timedelta
 
 # ========== ENVIRONMENT ==========
@@ -61,25 +60,56 @@ def fetch_coingecko(url, retries=2):
             time.sleep(1)
     return None
 
-def get_yahoo_klines(symbol_usdt, interval='4h', days=60, start=None, end=None):
-    yahoo_symbol = symbol_usdt.replace("USDT", "-USD")
-    if start is None:
-        end = datetime.now()
-        start = end - timedelta(days=days)
+def get_binance_klines(symbol_usdt, interval='4h', days=60, start=None, end=None):
+    """
+    Fetch candlestick data from Binance public API.
+    Returns a DataFrame with columns Open, High, Low, Close, Volume (index = datetime).
+    """
+    interval_map = {
+        '1m': '1m', '5m': '5m', '15m': '15m',
+        '1h': '1h', '4h': '4h', '1d': '1d', '1w': '1w'
+    }
+    binance_interval = interval_map.get(interval, '4h')
+    symbol = symbol_usdt.upper()  # e.g., BTCUSDT
+
+    # Determine time range
+    if start is None and days is not None:
+        end_dt = datetime.now()
+        start_dt = end_dt - timedelta(days=days)
+    elif start is not None:
+        start_dt = start
+        end_dt = end if end is not None else datetime.now()
     else:
-        if end is None:
-            end = datetime.now()
+        end_dt = datetime.now()
+        start_dt = end_dt - timedelta(days=60)
+
+    start_ts = int(start_dt.timestamp() * 1000)
+    end_ts = int(end_dt.timestamp() * 1000)
+
+    url = f"https://api.binance.com/api/v3/klines?symbol={symbol}&interval={binance_interval}&startTime={start_ts}&endTime={end_ts}&limit=1000"
     try:
-        df = yf.download(yahoo_symbol, start=start, end=end, interval=interval, progress=False)
-        if df.empty:
-            return pd.DataFrame()
-        if isinstance(df.columns, pd.MultiIndex):
-            df.columns = df.columns.get_level_values(0)
-        if not {'Open','High','Low','Close','Volume'}.issubset(df.columns):
-            return pd.DataFrame()
-        return df
+        resp = requests.get(url, timeout=10)
+        if resp.status_code == 200:
+            data = resp.json()
+            if not data:
+                return pd.DataFrame()
+            df = pd.DataFrame(data, columns=[
+                'timestamp', 'open', 'high', 'low', 'close', 'volume',
+                'close_time', 'quote_vol', 'trades', 'taker_buy_base', 'taker_buy_quote', 'ignore'
+            ])
+            df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
+            df.set_index('timestamp', inplace=True)
+            for col in ['open', 'high', 'low', 'close', 'volume']:
+                df[col] = pd.to_numeric(df[col])
+            df = df[['open', 'high', 'low', 'close', 'volume']]
+            df.columns = ['Open', 'High', 'Low', 'Close', 'Volume']
+            return df
     except:
-        return pd.DataFrame()
+        pass
+    return pd.DataFrame()
+
+# Override Yahoo function to use Binance
+get_yahoo_klines = get_binance_klines
 
 # ========== CSV LOGGING ==========
 def init_csv(filepath, columns):
@@ -166,7 +196,7 @@ def update_portfolio(trade_result):
     portfolio['realized_pnl'] += trade_result['pnl_usdt']
     save_portfolio(portfolio)
 
-# ========== SUPER‑PERSISTENT INTERMARKET (multi‑timeframe fallback) ==========
+# ========== BULLETPROOF BTC TREND (Binance + fallback) ==========
 def safe_ema(series, span):
     try:
         return series.ewm(span=span, adjust=False).mean()
@@ -174,9 +204,11 @@ def safe_ema(series, span):
         return pd.Series(index=series.index)
 
 def btc_trend_score():
-    for delay in [3, 5]:
+    """Returns +2 bullish, -2 bearish, 0 neutral. Uses Binance 4h, then 1h, then CoinGecko daily."""
+    # 1. Binance 4h
+    for attempt in range(2):
         try:
-            df = get_yahoo_klines("BTCUSDT", interval='4h', days=14)
+            df = get_binance_klines("BTCUSDT", interval='4h', days=14)
             if not df.empty and len(df) >= 50:
                 closes = df['Close']
                 ema50 = safe_ema(closes, 50)
@@ -190,12 +222,13 @@ def btc_trend_score():
                     return -2, None
                 else:
                     return 0, None
-            time.sleep(delay)
+            time.sleep(2)
         except:
-            time.sleep(delay)
+            time.sleep(2)
 
+    # 2. Binance 1h
     try:
-        df_1h = get_yahoo_klines("BTCUSDT", interval='1h', days=3)
+        df_1h = get_binance_klines("BTCUSDT", interval='1h', days=3)
         if not df_1h.empty and len(df_1h) >= 50:
             closes = df_1h['Close']
             ema50 = safe_ema(closes, 50)
@@ -209,25 +242,26 @@ def btc_trend_score():
     except:
         pass
 
+    # 3. CoinGecko daily
     try:
-        df_d = get_yahoo_klines("BTCUSDT", interval='1d', days=90)
-        if not df_d.empty and len(df_d) >= 50:
-            closes = df_d['Close']
+        cg_url = "https://api.coingecko.com/api/v3/coins/bitcoin/market_chart?vs_currency=usd&days=90"
+        cg_data = fetch_coingecko(cg_url)
+        if cg_data and 'prices' in cg_data:
+            prices = cg_data['prices']
+            if len(prices) < 50:
+                return 0, "CG daily data insufficient"
+            df_cg = pd.DataFrame(prices, columns=['date', 'price'])
+            df_cg['date'] = pd.to_datetime(df_cg['date'], unit='ms')
+            df_cg.set_index('date', inplace=True)
+            closes = df_cg['price']
             ema50 = safe_ema(closes, 50)
             cur = closes.iloc[-1]
             ema_now = ema50.iloc[-1]
             slope_up = ema_now > ema50.iloc[-7] if len(ema50) >= 7 else True
             price_above = cur > ema_now
-            if price_above and slope_up: return 2, "daily fallback"
-            elif not price_above and not slope_up: return -2, "daily fallback"
-            else: return 0, "daily fallback"
-    except:
-        pass
-
-    try:
-        data = fetch_coingecko("https://api.coingecko.com/api/v3/simple/price?ids=bitcoin&vs_currencies=usd")
-        if data and 'bitcoin' in data:
-            return 0, "live price only (neutral)"
+            if price_above and slope_up: return 2, "CG daily fallback"
+            elif not price_above and not slope_up: return -2, "CG daily fallback"
+            else: return 0, "CG daily fallback"
     except:
         pass
 
@@ -235,7 +269,7 @@ def btc_trend_score():
 
 def institutional_macro_filter():
     try:
-        df_btc = get_yahoo_klines("BTCUSDT", interval='4h', days=14)
+        df_btc = get_binance_klines("BTCUSDT", interval='4h', days=14)
         if df_btc.empty or len(df_btc) < 50: return 0
         closes = df_btc['Close']
         ema50 = safe_ema(closes, 50)
@@ -268,7 +302,7 @@ def anchored_vwap_score(df, current_price):
 
 def refined_buying_pressure(symbol_usdt):
     try:
-        df = get_yahoo_klines(symbol_usdt, interval='4h', days=10)
+        df = get_binance_klines(symbol_usdt, interval='4h', days=10)
         if df.empty or len(df) < 48: return 0,0
         short = df.tail(12)
         s_buy = short.loc[short['Close'] > short['Open'], 'Volume'].sum()
@@ -286,9 +320,9 @@ def refined_buying_pressure(symbol_usdt):
 
 # ========== FALLBACK‑RESILIENT TECHNICALS ==========
 def get_technicals(symbol_usdt):
-    df = get_yahoo_klines(symbol_usdt, interval='4h', days=14)
+    df = get_binance_klines(symbol_usdt, interval='4h', days=14)
     if df.empty or len(df) < 50:
-        df = get_yahoo_klines(symbol_usdt, interval='1h', days=3)
+        df = get_binance_klines(symbol_usdt, interval='1h', days=3)
         if df.empty or len(df) < 50:
             return {"combined":0, "trend_dir":"up", "adx":0, "di_plus":0, "di_minus":0}
 
@@ -338,7 +372,7 @@ def get_technicals(symbol_usdt):
 
 def get_4h_atr(symbol_usdt, current_price):
     try:
-        df = get_yahoo_klines(symbol_usdt, interval='4h', days=14)
+        df = get_binance_klines(symbol_usdt, interval='4h', days=14)
         if df.empty or len(df) < 14: return current_price*0.02
         high,low,close = df['High'],df['Low'],df['Close']
         tr = pd.concat([high-low, (high-close.shift()).abs(), (low-close.shift()).abs()], axis=1).max(axis=1)
@@ -363,7 +397,7 @@ def get_volatility_score(symbol_usdt, price):
 
 def volume_trend_score(symbol_usdt, direction=None):
     try:
-        df = get_yahoo_klines(symbol_usdt, interval='4h', days=5)
+        df = get_binance_klines(symbol_usdt, interval='4h', days=5)
         if df.empty or len(df) < 12: return 0,"vol data insufficient"
         recent = df['Volume'].tail(6)
         first, second = recent[:3].mean(), recent[3:].mean()
@@ -376,7 +410,7 @@ def volume_trend_score(symbol_usdt, direction=None):
 # ========== BONUS LAYERS ==========
 def candle_strength_score(symbol_usdt, direction, atr):
     try:
-        df = get_yahoo_klines(symbol_usdt, interval='4h', days=2)
+        df = get_binance_klines(symbol_usdt, interval='4h', days=2)
         if df.empty or len(df) < 1: return 0
         last = df.iloc[-1]
         candle_range = last['High'] - last['Low']
@@ -403,7 +437,7 @@ def momentum_bonus(tech, direction):
 
 def candle_conviction_bonus(symbol_usdt, direction):
     try:
-        df = get_yahoo_klines(symbol_usdt, interval='4h', days=2)
+        df = get_binance_klines(symbol_usdt, interval='4h', days=2)
         if df.empty or len(df) < 1: return 0
         last = df.iloc[-1]
         candle_range = last['High'] - last['Low']
@@ -426,7 +460,7 @@ def score_coin(symbol, price, volume, btc_score, btc_err, macro_score):
         buying_score, _ = get_buying_pressure(symbol)
         vol_score = get_volatility_score(symbol, price)
         intermarket = btc_score if btc_score else 0
-        df_vwap = get_yahoo_klines(symbol, interval='4h', days=14)
+        df_vwap = get_binance_klines(symbol, interval='4h', days=14)
         vwap_score = anchored_vwap_score(df_vwap, price)
         atr_val = get_4h_atr(symbol, price)
         total = (0.20 * tech_combined +
@@ -469,7 +503,7 @@ def evaluate_deep(coin, direction, btc_score, macro_score):
     trend_dir = tech.get("trend_dir", "up")
     ema_rel = "above" if trend_dir == "up" else "below"
     ema_slope = "rising" if trend_dir == "up" else "falling"
-    vwap_score = anchored_vwap_score(get_yahoo_klines(sym, interval='4h', days=14), price)
+    vwap_score = anchored_vwap_score(get_binance_klines(sym, interval='4h', days=14), price)
     vwap_rel = "above" if vwap_score > 0 else "below" if vwap_score < 0 else "near"
     try:
         vol_trend_s, _ = volume_trend_score(sym, direction)
@@ -529,7 +563,7 @@ def generate_post(coin, direction, entry, stop, tps, sl_pct, qwen_reason=""):
     tech = get_technicals(sym); trend_dir = tech.get("trend_dir","up")
     ema_rel = "above" if trend_dir=="up" else "below"
     ema_slope = "rising" if trend_dir=="up" else "falling"
-    vwap_score = anchored_vwap_score(get_yahoo_klines(sym, interval='4h', days=14), price)
+    vwap_score = anchored_vwap_score(get_binance_klines(sym, interval='4h', days=14), price)
     vwap_rel = "above" if vwap_score>0 else "below" if vwap_score<0 else "near"
     try:
         vol_trend_s, _ = volume_trend_score(sym, direction)
@@ -541,7 +575,7 @@ def generate_post(coin, direction, entry, stop, tps, sl_pct, qwen_reason=""):
 
     recent_candles = ""
     try:
-        df_4h = get_yahoo_klines(sym, interval='4h', days=2)
+        df_4h = get_binance_klines(sym, interval='4h', days=2)
         if not df_4h.empty:
             last_candles = df_4h.tail(6)
             candle_list = []
@@ -661,7 +695,7 @@ def check_open_trades():
             tps = []
             for i in range(1,6):
                 tps.append(float(trade[f"TP{i}"]))
-            df_1h = get_yahoo_klines(sym, interval='1h', start=datetime.strptime(trade["timestamp"],"%Y-%m-%d %H:%M:%S"), end=now)
+            df_1h = get_binance_klines(sym, interval='1h', start=datetime.strptime(trade["timestamp"],"%Y-%m-%d %H:%M:%S"), end=now)
             if df_1h.empty: still_open.append(trade); continue
             current_stop = entry if highest_tp_idx >= 0 else stop_orig
             full_close_data = None
@@ -797,7 +831,6 @@ def generate_signal(balance_usdt):
         if not all_scored: return {"action":"HOLD","reasoning":"No valid scores.","summary":""}
         all_scored_sorted = sorted(all_scored, key=lambda x: abs(x["score"]), reverse=True)
         summary = " | ".join([f"{c['symbol'].replace('USDT','')}: {c['score']:.2f}" for c in all_scored_sorted[:30]])
-        # Take top 20 for Llama evaluation
         top_candidates = all_scored_sorted[:20]
         best_combined = -999
         best_signal = None
@@ -832,7 +865,7 @@ def generate_signal(balance_usdt):
         direction = coin["direction"]
         entry = coin.get("bid", coin["price"]*0.999) if direction=="LONG" else coin.get("ask", coin["price"]*1.001)
         atr = coin["atr"]
-        df_1h_recent = get_yahoo_klines(coin["symbol"], interval='1h', days=2)
+        df_1h_recent = get_binance_klines(coin["symbol"], interval='1h', days=2)
         confirm = False
         if not df_1h_recent.empty:
             last_candle = df_1h_recent.iloc[-1]
@@ -872,7 +905,7 @@ def generate_signal(balance_usdt):
 def send_trade_chart(signal, title_suffix=""):
     try:
         import matplotlib; matplotlib.use('Agg'); import matplotlib.pyplot as plt; import mplfinance as mpf
-        sym = signal['symbol']; df = get_yahoo_klines(sym, interval='4h', days=10)
+        sym = signal['symbol']; df = get_binance_klines(sym, interval='4h', days=10)
         if df.empty: return
         style = mpf.make_mpf_style(base_mpf_style='nightclouds', facecolor='#000000', gridcolor='#2a2e39',
                                    rc={'axes.labelcolor':'white','xtick.color':'white','ytick.color':'white','axes.titlecolor':'white'})
