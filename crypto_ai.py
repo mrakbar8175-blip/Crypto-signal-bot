@@ -48,7 +48,6 @@ OPEN_TRADES_CSV = "open_trades.csv"
 TRADE_RESULTS_CSV = "trade_results.csv"
 
 # ========== KRAKEN DATA FETCH ==========
-# Kraken uses different symbols for some coins; map CoinGecko ticker -> Kraken pair
 KRAKEN_SYMBOL_MAP = {
     "BTCUSDT": "XBTUSDT",
     "BCHUSDT": "BCHUSDT",
@@ -69,30 +68,13 @@ KRAKEN_SYMBOL_MAP = {
     "AAVEUSDT": "AAVEUSDT",
     "INJUSDT": "INJUSDT",
     "ZECUSDT": "ZECUSDT",
-    "BCHUSDT": "BCHUSDT",
-    # Many others map directly: symbol -> symbolUSDT? Kraken uses SYM/USDT, e.g., ETH/USDT -> ETHUSDT
-    # We'll build dynamic fallback: if not in map, assume symbolUSDT
 }
 
 def get_kraken_klines(symbol_usdt, interval='240', days=10):
-    """
-    Fetch OHLC candles from Kraken.
-    interval: '240' (4h) or '60' (1h), etc.
-    Returns DataFrame with columns Open, High, Low, Close, Volume.
-    """
-    # Convert to Kraken pair format
-    kraken_symbol = KRAKEN_SYMBOL_MAP.get(symbol_usdt)
-    if kraken_symbol is None:
-        # assume direct mapping (e.g., ETHUSDT -> ETHUSDT)
-        kraken_symbol = symbol_usdt
-
-    # Time range
+    kraken_symbol = KRAKEN_SYMBOL_MAP.get(symbol_usdt, symbol_usdt)
     end_dt = datetime.now()
     start_dt = end_dt - timedelta(days=days)
-    # Kraken expects Unix seconds
     since = int(start_dt.timestamp())
-    to = int(end_dt.timestamp())
-
     url = f"https://api.kraken.com/0/public/OHLC?pair={kraken_symbol}&interval={interval}&since={since}"
     try:
         resp = requests.get(url, timeout=10)
@@ -104,12 +86,10 @@ def get_kraken_klines(symbol_usdt, interval='240', days=10):
         result = data.get("result")
         if not result:
             return pd.DataFrame()
-        # Kraken returns dict with pair key, e.g., "XBTUSDT"
         pair_key = list(result.keys())[0]
         ohlc_list = result[pair_key]
         if not ohlc_list:
             return pd.DataFrame()
-        # Convert to DataFrame
         df = pd.DataFrame(ohlc_list, columns=[
             "time", "open", "high", "low", "close", "vwap", "volume", "count"
         ])
@@ -124,24 +104,7 @@ def get_kraken_klines(symbol_usdt, interval='240', days=10):
         return pd.DataFrame()
 
 def get_4h_klines(symbol_usdt, days=10):
-    """Get 4h candles; if insufficient, try 1h and resample to 4h."""
-    df = get_kraken_klines(symbol_usdt, interval='240', days=days)
-    if not df.empty and len(df) >= 20:
-        return df
-    # Try 1h data and resample to 4h
-    df1 = get_kraken_klines(symbol_usdt, interval='60', days=3)
-    if df1.empty or len(df1) < 12:
-        return pd.DataFrame()
-    # Resample: aggregate 4 1-hour candles into one 4-hour
-    df1_4h = df1.resample('4h').agg({
-        'Open': 'first',
-        'High': 'max',
-        'Low': 'min',
-        'Close': 'last',
-        'Volume': 'sum'
-    })
-    df1_4h.dropna(inplace=True)
-    return df1_4h
+    return get_kraken_klines(symbol_usdt, interval='240', days=days)
 
 # ========== COINGECKO MACRO BIAS ==========
 def fetch_coingecko(url, retries=2):
@@ -158,7 +121,6 @@ def fetch_coingecko(url, retries=2):
 
 def get_macro_bias():
     bias = 0.0
-    # 1. BTC 24h change
     try:
         cg_simple = fetch_coingecko(
             "https://api.coingecko.com/api/v3/simple/price?ids=bitcoin&vs_currencies=usd&include_24hr_change=true"
@@ -168,7 +130,6 @@ def get_macro_bias():
             bias += max(-1.0, min(1.0, change / 5.0)) * 0.6
     except:
         pass
-    # 2. BTC 7-day EMA trend
     try:
         cg_daily = fetch_coingecko(
             "https://api.coingecko.com/api/v3/coins/bitcoin/market_chart?vs_currency=usd&days=14"
@@ -273,7 +234,7 @@ def update_portfolio(trade_result):
     portfolio['realized_pnl'] += trade_result['pnl_usdt']
     save_portfolio(portfolio)
 
-# ========== PRICE‑ACTION LAYERS ==========
+# ========== TP5‑FOCUSED LAYERS ==========
 def safe_ema(series, span):
     try:
         return series.ewm(span=span, adjust=False).mean()
@@ -282,7 +243,8 @@ def safe_ema(series, span):
 
 def get_atr(df, current_price):
     try:
-        if df.empty or len(df) < 14: return current_price * 0.02
+        if df.empty or len(df) < 14:
+            return current_price * 0.02
         high, low, close = df['High'], df['Low'], df['Close']
         tr = pd.concat([high - low, (high - close.shift()).abs(), (low - close.shift()).abs()], axis=1).max(axis=1)
         atr = safe_ema(tr, 14).iloc[-1]
@@ -290,96 +252,134 @@ def get_atr(df, current_price):
     except:
         return current_price * 0.02
 
-def candle_conviction_score(df, direction, atr):
+def trend_strength_score(df, direction):
+    """EMA50 slope + ADX, returns -1..+1"""
     try:
-        if df.empty: return 0
-        last = df.iloc[-1]
-        body = abs(last['Close'] - last['Open'])
-        candle_range = last['High'] - last['Low']
-        if candle_range <= 0: return 0
-        if direction == "LONG":
-            if last['Close'] > last['Open']:
-                close_pos = (last['Close'] - last['Low']) / candle_range
-                body_ratio = body / candle_range
-                return (close_pos * 0.6 + body_ratio * 0.4) * 0.9
-            else:
-                return -0.5
-        else:
-            if last['Close'] < last['Open']:
-                close_pos = (last['High'] - last['Close']) / candle_range
-                body_ratio = body / candle_range
-                return (close_pos * 0.6 + body_ratio * 0.4) * 0.9
-            else:
-                return -0.5
-    except:
-        return 0
-
-def momentum_score(df, direction):
-    try:
-        if df.empty or len(df) < 4: return 0
+        n = len(df)
+        if n < 20:
+            return 0
         closes = df['Close']
-        roc = (closes.iloc[-1] / closes.iloc[-4] - 1) * 100
-        if direction == "LONG":
-            return max(-1.0, min(1.0, roc / 2.0))
-        else:
-            return -max(-1.0, min(1.0, roc / 2.0))
-    except:
-        return 0
-
-def trend_alignment_score(df, direction):
-    try:
-        if df.empty or len(df) < 20: return 0
-        closes = df['Close']
-        ema20 = safe_ema(closes, 20)
+        highs = df['High']
+        lows = df['Low']
+        ema50 = safe_ema(closes, 50) if n >= 50 else safe_ema(closes, n)
         current = closes.iloc[-1]
-        ema_now = ema20.iloc[-1]
-        if len(ema20) >= 6:
-            slope_up = ema_now > ema20.iloc[-6]
+        ema_now = ema50.iloc[-1]
+        if len(ema50) >= 6:
+            slope_up = ema_now > ema50.iloc[-6]
         else:
             slope_up = True
         price_above = current > ema_now
+
+        # ADX
+        period = 14
+        dm_plus = highs.diff()
+        dm_minus = -lows.diff()
+        dm_plus[dm_plus < 0] = 0
+        dm_minus[dm_minus < 0] = 0
+        tr = pd.concat([highs - lows, (highs - closes.shift()).abs(), (lows - closes.shift()).abs()], axis=1).max(axis=1)
+        atr = safe_ema(tr, period)
+        di_plus = 100 * (safe_ema(dm_plus, period) / atr)
+        di_minus = 100 * (safe_ema(dm_minus, period) / atr)
+        dx = 100 * (di_plus - di_minus).abs() / (di_plus + di_minus)
+        adx = safe_ema(dx, period).iloc[-1]
+        if pd.isna(adx):
+            adx = 0
+
+        base_score = 0
         if direction == "LONG":
-            score = 0
-            if price_above: score += 0.6
-            if slope_up: score += 0.4
-            return score
+            if price_above: base_score += 0.4
+            if slope_up: base_score += 0.3
+            if adx > 25 and di_plus.iloc[-1] > di_minus.iloc[-1]:
+                base_score += 0.3
+            return base_score
         else:
-            score = 0
-            if not price_above: score += 0.6
-            if not slope_up: score += 0.4
-            return -score
+            if not price_above: base_score += 0.4
+            if not slope_up: base_score += 0.3
+            if adx > 25 and di_minus.iloc[-1] > di_plus.iloc[-1]:
+                base_score += 0.3
+            return -base_score
     except:
         return 0
 
-def volume_surge_score(df, direction):
+def sustained_momentum_score(df, direction):
+    """6‑period and 12‑period ROC combined"""
     try:
-        if df.empty or len(df) < 21: return 0
-        last_vol = df['Volume'].iloc[-1]
-        avg_vol = df['Volume'].tail(21).mean()
-        if avg_vol <= 0: return 0
-        vol_ratio = last_vol / avg_vol
-        if vol_ratio > 5.0: vol_ratio = 5.0
-        surge = (vol_ratio - 1) / 4.0
+        if len(df) < 13:
+            return 0
+        closes = df['Close']
+        roc6 = (closes.iloc[-1] / closes.iloc[-7] - 1) * 100
+        roc12 = (closes.iloc[-1] / closes.iloc[-13] - 1) * 100
+        # Scale: 2% change = 1.0
+        score6 = max(-1.0, min(1.0, roc6 / 2.0))
+        score12 = max(-1.0, min(1.0, roc12 / 2.0))
+        combined = score6 * 0.6 + score12 * 0.4
+        if direction == "LONG":
+            return combined
+        else:
+            return -combined
+    except:
+        return 0
+
+def volume_expansion_score(df, direction):
+    """Compare avg volume of last 12 candles to last 48 candles"""
+    try:
+        if len(df) < 48:
+            return 0
+        short_vol = df['Volume'].iloc[-12:].mean()
+        long_vol = df['Volume'].iloc[-48:].mean()
+        if long_vol == 0:
+            return 0
+        ratio = short_vol / long_vol
+        # Normalise: 1.0 means equal, >1 means expansion
+        expansion = (ratio - 1) * 2   # 1.5 ratio -> 1.0
+        expansion = max(-1.0, min(1.0, expansion))
+        # Only positive if the last candle confirms direction
         last = df.iloc[-1]
         if direction == "LONG":
             if last['Close'] > last['Open']:
-                return max(-1.0, min(1.0, surge))
+                return expansion
             else:
-                return -max(-1.0, min(1.0, surge))
+                return -expansion
         else:
             if last['Close'] < last['Open']:
-                return max(-1.0, min(1.0, surge))
+                return expansion
             else:
-                return -max(-1.0, min(1.0, surge))
+                return -expansion
+    except:
+        return 0
+
+def breakout_candle_score(df, direction, atr):
+    """Body > 1.5*ATR and close near extreme = potential breakout"""
+    try:
+        if df.empty:
+            return 0
+        last = df.iloc[-1]
+        body = abs(last['Close'] - last['Open'])
+        if body < 1.5 * atr:
+            return 0
+        candle_range = last['High'] - last['Low']
+        if candle_range == 0:
+            return 0
+        if direction == "LONG":
+            if last['Close'] > last['Open'] and (last['Close'] - last['Low']) / candle_range > 0.7:
+                return 1.0
+            else:
+                return -0.5
+        else:
+            if last['Close'] < last['Open'] and (last['High'] - last['Close']) / candle_range > 0.7:
+                return 1.0
+            else:
+                return -0.5
     except:
         return 0
 
 def relative_strength_score(df, direction, btc_df):
+    """Coin outperformance vs BTC over last 12 candles"""
     try:
-        if df.empty or len(df) < 6 or btc_df.empty or len(btc_df) < 6:
+        if df.empty or len(df) < 13 or btc_df.empty or len(btc_df) < 13:
             return 0
-        coin_perf = (df['Close'].iloc[-1] / df['Close'].iloc[-6] - 1)
-        btc_perf = (btc_df['Close'].iloc[-1] / btc_df['Close'].iloc[-6] - 1)
+        coin_perf = (df['Close'].iloc[-1] / df['Close'].iloc[-13] - 1)
+        btc_perf = (btc_df['Close'].iloc[-1] / btc_df['Close'].iloc[-13] - 1)
         rs = coin_perf - btc_perf
         if direction == "LONG":
             return max(-1.0, min(1.0, rs * 10))
@@ -394,11 +394,11 @@ def score_coin(symbol, price, volume, macro_bias, coin_data_cache, btc_df):
         if symbol in coin_data_cache:
             df = coin_data_cache[symbol]
         else:
-            df = get_4h_klines(symbol, days=10)
+            df = get_4h_klines(symbol, days=14)   # 14 days = 84 candles for EMA50
             coin_data_cache[symbol] = df
 
-        if df.empty or len(df) < 20:
-            return 0, {"conviction":0,"momentum":0,"trend":0,"volume":0}, "up", price*0.02
+        if df.empty or len(df) < 48:
+            return 0, {"trend":0,"momentum":0,"volume":0,"breakout":0,"rs":0}, "up", price*0.02
 
         last_candle = df.iloc[-1]
         if last_candle['Close'] > last_candle['Open']:
@@ -408,45 +408,45 @@ def score_coin(symbol, price, volume, macro_bias, coin_data_cache, btc_df):
 
         atr_val = get_atr(df, price)
 
-        conv = candle_conviction_score(df, direction, atr_val)
-        mom = momentum_score(df, direction)
-        trend = trend_alignment_score(df, direction)
-        vol = volume_surge_score(df, direction)
+        trend = trend_strength_score(df, direction)
+        mom = sustained_momentum_score(df, direction)
+        vol = volume_expansion_score(df, direction)
+        brk = breakout_candle_score(df, direction, atr_val)
         rs = relative_strength_score(df, direction, btc_df)
 
-        core = (0.40 * conv + 0.30 * mom + 0.20 * trend + 0.10 * vol)
+        core = (0.30 * trend + 0.25 * mom + 0.20 * vol + 0.15 * brk + 0.10 * rs)
 
+        # Stronger macro multiplier for TP5
         if core >= 0:
-            macro_mult = 1.0 + 0.3 * macro_bias
+            macro_mult = 1.0 + 0.5 * macro_bias   # macro bias now has a bigger impact
         else:
-            macro_mult = 1.0 - 0.3 * macro_bias
+            macro_mult = 1.0 - 0.5 * macro_bias
 
         total = core * macro_mult
-        total += rs * 0.15
 
-        # Alignment bonus
-        signs = [1 if s > 0.1 else (-1 if s < -0.1 else 0) for s in [conv, mom, trend, vol]]
+        # Alignment bonus: if all 5 layers agree
+        signs = [1 if s > 0.2 else (-1 if s < -0.2 else 0) for s in [trend, mom, vol, brk, rs]]
         aligned = sum(1 for s in signs if (direction == "LONG" and s == 1) or (direction == "SHORT" and s == -1))
-        if aligned >= 3:
-            total += 0.25 if direction == "LONG" else -0.25
+        if aligned >= 4:
+            total += 0.3 if direction == "LONG" else -0.3
 
         total = max(-3.0, min(3.0, total))
 
         layers = {
-            "conviction": conv,
-            "momentum": mom,
             "trend": trend,
+            "momentum": mom,
             "volume": vol,
-            "macro_bias": macro_bias,
-            "rs": rs
+            "breakout": brk,
+            "rs": rs,
+            "macro_bias": macro_bias
         }
         return total, layers, direction, atr_val
     except Exception as e:
         print(f"score_coin error {symbol}: {e}")
-        return 0, {"conviction":0,"momentum":0,"trend":0,"volume":0,"macro_bias":0,"rs":0}, "up", price*0.02
+        return 0, {"trend":0,"momentum":0,"volume":0,"breakout":0,"rs":0,"macro_bias":0}, "up", price*0.02
 
 def compute_confidence(layers):
-    scores = [layers["conviction"], layers["momentum"], layers["trend"], layers["volume"]]
+    scores = [layers["trend"], layers["momentum"], layers["volume"], layers["breakout"]]
     bear = sum(1 for s in scores if s < -0.3)
     bull = sum(1 for s in scores if s > 0.3)
     aligned = max(bear, bull)
@@ -465,11 +465,11 @@ def evaluate_deep(coin, direction, macro_bias):
     prompt = (
         f"Symbol: {sym} | Direction: {direction} | Price: {price:.4f} | ATR: {atr:.4f}\n"
         f"Macro Bias (BTC): {macro_bias:.2f} (‑1 bearish, +1 bullish).\n"
-        f"Layers: conviction={layers['conviction']:.2f}, momentum={layers['momentum']:.2f}, "
-        f"trend={layers['trend']:.2f}, volume={layers['volume']:.2f}, rs={layers['rs']:.2f}.\n\n"
+        f"Layers: trend={layers['trend']:.2f}, momentum={layers['momentum']:.2f}, "
+        f"volume={layers['volume']:.2f}, breakout={layers['breakout']:.2f}, rs={layers['rs']:.2f}.\n\n"
         "You are a senior crypto analyst. Rate this setup from 1 to 10, where 10 is a perfect, high‑probability trade "
-        "with strong trend alignment, clear momentum, and confirming volume. "
-        "Be strict: only give a high rating if the setup is clean and has a clear edge. "
+        "for a 5R move (strong trend, momentum, and volume). "
+        "Be strict: only give a high rating if the setup is clean and has a clear edge for a large move. "
         "If the data provided is insufficient to judge, return a rating of 5 and state that the data is limited. "
         "Do not invent patterns or structures that are not explicitly supported by the given data. "
         "Give a very brief reason for your rating. Output format exactly:\n"
@@ -546,7 +546,8 @@ def generate_post(coin, direction, entry, stop, tps, sl_pct, qwen_reason=""):
         f"Recent 4‑hour candles (newest first):\n{recent_candles}\n\n"
         f"Technical context:\n"
         f"- Price: {price:.4f}\n"
-        f"- Momentum: {'bullish' if layers['momentum']>0 else 'bearish'}. Volume: {'supportive' if layers['volume']>0 else 'weak'}.\n"
+        f"- Momentum: {'bullish' if layers['momentum']>0 else 'bearish'}. Trend: {'up' if layers['trend']>0 else 'down'}.\n"
+        f"- Volume expansion: {'yes' if layers['volume']>0 else 'no'}. Breakout signal: {'yes' if layers['breakout']>0 else 'no'}.\n"
         f"- BTC macro bias: {layers['macro_bias']:.2f} (‑1 bearish, +1 bullish).\n"
         f"{'Analyst note: ' + qwen_reason if qwen_reason else ''}\n\n"
         f"Risk‑managed levels (use exactly these numbers):\n"
@@ -597,7 +598,8 @@ def generate_post(coin, direction, entry, stop, tps, sl_pct, qwen_reason=""):
         direction_icon = "📈" if direction=="LONG" else "📉"
         text = (
             f"{hook} {direction_icon}\n\n"
-            f"Candle conviction is {'bullish' if layers['conviction']>0 else 'bearish'}, and momentum {'confirms' if layers['momentum']>0 else 'warns'}. "
+            f"Trend is {'up' if layers['trend']>0 else 'down'}, momentum {'confirms' if layers['momentum']>0 else 'warns'}, "
+            f"and volume is {'expanding' if layers['volume']>0 else 'stable'}. "
             f"The macro backdrop is {'supportive' if layers['macro_bias']>0 else 'cautious'} for altcoins.\n\n"
             f"🎯 Risk‑Managed Levels:\n"
             f"• Area of Interest: {entry:.6f}\n"
@@ -630,8 +632,7 @@ def check_open_trades():
             tps = []
             for i in range(1,6):
                 tps.append(float(trade[f"TP{i}"]))
-            # Fetch 1h candles for checking
-            df_1h = get_kraken_klines(sym, interval='60', days=3)  # sufficient to cover trade duration
+            df_1h = get_kraken_klines(sym, interval='60', days=3)
             if df_1h.empty: still_open.append(trade); continue
             current_stop = entry if highest_tp_idx >= 0 else stop_orig
             full_close_data = None
@@ -758,7 +759,7 @@ def generate_signal(balance_usdt):
         if not candidates: return {"action":"HOLD","reasoning":"No liquid coins.","summary":""}
         macro_bias = get_macro_bias()
         coin_data_cache = {}
-        btc_df = get_4h_klines("BTCUSDT", days=10)
+        btc_df = get_4h_klines("BTCUSDT", days=14)
         all_scored = []
         for coin in candidates:
             total, layers, trend_dir, atr = score_coin(coin["symbol"], coin["price"], coin["volume"], macro_bias, coin_data_cache, btc_df)
@@ -767,7 +768,6 @@ def generate_signal(balance_usdt):
         if not all_scored: return {"action":"HOLD","reasoning":"No valid scores.","summary":""}
         all_scored_sorted = sorted(all_scored, key=lambda x: abs(x["score"]), reverse=True)
         summary = " | ".join([f"{c['symbol'].replace('USDT','')}: {c['score']:.2f}" for c in all_scored_sorted[:30]])
-        # Llama filter on top 5
         top5 = all_scored_sorted[:5]
         best_combined = -999
         best_signal = None
@@ -844,8 +844,8 @@ def send_trade_chart(signal, title_suffix=""):
         if df.empty: return
         style = mpf.make_mpf_style(base_mpf_style='nightclouds', facecolor='#000000', gridcolor='#2a2e39',
                                    rc={'axes.labelcolor':'white','xtick.color':'white','ytick.color':'white','axes.titlecolor':'white'})
-        ema20 = df['Close'].ewm(span=20, adjust=False).mean()
-        apds = [mpf.make_addplot(ema20,color='#f39c12',width=1.5,label='EMA20')]
+        ema50 = df['Close'].ewm(span=50, adjust=False).mean()
+        apds = [mpf.make_addplot(ema50,color='#f39c12',width=1.5,label='EMA50')]
         fig,axes=mpf.plot(df,type='candle',style=style,title=f"{sym.replace('USDT','')} 4h{title_suffix}",ylabel='Price',addplot=apds,returnfig=True,figsize=(8,6))
         ax=axes[0]
         entry=signal.get('limit_price'); stop=signal.get('stop_loss'); tps=signal.get('take_profits')
@@ -863,7 +863,7 @@ def send_trade_chart(signal, title_suffix=""):
         with open(path,'rb') as img: requests.post(url,data={'chat_id':CHAT_ID},files={'photo':img})
         os.remove(path)
     except ImportError:
-        base=signal['symbol'].replace("USDT","").upper(); studies="&studies[]=STD%3BEMA%3B20&studies[]=STD%3BVWAP"
+        base=signal['symbol'].replace("USDT","").upper(); studies="&studies[]=STD%3BEMA%3B50&studies[]=STD%3BVWAP"
         send_telegram(f"📈 Chart with EMA & VWAP: https://www.tradingview.com/chart/?symbol=BINANCE:{base}USDT&interval=240{studies}")
     except Exception as e: print(f"Chart error: {e}")
 
