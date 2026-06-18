@@ -455,9 +455,12 @@ def evaluate_deep(coin, direction, btc_score, macro_score):
     ema_slope = "rising" if trend_dir == "up" else "falling"
     vwap_score = anchored_vwap_score(get_yahoo_klines(sym, interval='4h', days=14), price)
     vwap_rel = "above" if vwap_score > 0 else "below" if vwap_score < 0 else "near"
-    # Volume trend from dedicated function
-    vol_trend_s, _ = volume_trend_score(sym, direction)
-    vol_trend = "increasing" if vol_trend_s > 0 else "decreasing" if vol_trend_s < 0 else "flat"
+    # Safe volume trend call
+    try:
+        vol_trend_s, _ = volume_trend_score(sym, direction)
+        vol_trend = "increasing" if vol_trend_s > 0 else "decreasing" if vol_trend_s < 0 else "flat"
+    except:
+        vol_trend = "flat"
 
     prompt = (
         f"Symbol: {sym} | Direction: {direction} | Price: {price:.4f} | ATR: {atr:.4f}\n"
@@ -511,9 +514,12 @@ def generate_post(coin, direction, entry, stop, tps, sl_pct, qwen_reason=""):
     ema_slope = "rising" if trend_dir=="up" else "falling"
     vwap_score = anchored_vwap_score(get_yahoo_klines(sym, interval='4h', days=14), price)
     vwap_rel = "above" if vwap_score>0 else "below" if vwap_score<0 else "near"
-    # Volume trend from dedicated function
-    vol_trend_s, _ = volume_trend_score(sym, direction)
-    vol_desc = "increasing" if vol_trend_s > 0 else "decreasing" if vol_trend_s < 0 else "steady"
+    # Safe volume trend call
+    try:
+        vol_trend_s, _ = volume_trend_score(sym, direction)
+        vol_desc = "increasing" if vol_trend_s > 0 else "decreasing" if vol_trend_s < 0 else "steady"
+    except:
+        vol_desc = "steady"
     btc_bullish = btc_trend_score()[0] > 0
     btc_text = "bullish" if btc_bullish else "bearish"
 
