@@ -174,15 +174,14 @@ def safe_ema(series, span):
         return pd.Series(index=series.index)
 
 def btc_trend_score():
-    """Retry once if fails, then fallback to 0 to avoid zero errors."""
     for attempt in range(2):
         try:
             df = get_yahoo_klines("BTCUSDT", interval='4h', days=14)
             if df.empty or len(df) < 50:
                 if attempt == 0:
-                    time.sleep(2)   # wait and retry
+                    time.sleep(3)
                     continue
-                return 0, "BTC data unavailable after retry"
+                return btc_fallback_score()
             closes = df['Close']
             ema50 = safe_ema(closes, 50)
             cur = closes.iloc[-1]
@@ -197,10 +196,30 @@ def btc_trend_score():
                 return 0, None
         except:
             if attempt == 0:
-                time.sleep(2)
+                time.sleep(3)
             else:
-                return 0, "BTC error after retry"
-    return 0, "BTC unavailable"
+                return btc_fallback_score()
+    return btc_fallback_score()
+
+def btc_fallback_score():
+    try:
+        df_daily = get_yahoo_klines("BTCUSDT", interval='1d', days=90)
+        if not df_daily.empty and len(df_daily) >= 50:
+            closes = df_daily['Close']
+            ema50 = safe_ema(closes, 50)
+            cur = closes.iloc[-1]
+            ema_now = ema50.iloc[-1]
+            slope_up = ema_now > ema50.iloc[-7] if len(ema50) >= 7 else True
+            price_above = cur > ema_now
+            if price_above and slope_up: return 2, "fallback daily"
+            elif not price_above and not slope_up: return -2, "fallback daily"
+            else: return 0, "fallback daily"
+        data = fetch_coingecko("https://api.coingecko.com/api/v3/simple/price?ids=bitcoin&vs_currencies=usd")
+        if data and 'bitcoin' in data:
+            return 0, "live price only"
+        return 0, "BTC data unavailable"
+    except:
+        return 0, "BTC fallback error"
 
 def institutional_macro_filter():
     try:
@@ -412,8 +431,66 @@ def compute_confidence(layers):
     if aligned>=2: return 5
     return 4
 
-# ========== VIRAL BINANCE SQUARE POST ==========
-def generate_post(coin, direction, entry, stop, tps, sl_pct):
+# ========== QWEN QUALITY FILTER ==========
+def evaluate_deep(coin, direction, btc_score, macro_score):
+    """Ask Qwen to rate the trade setup 1-10 based on technicals."""
+    sym = coin["symbol"]
+    price = coin["price"]
+    atr = coin["atr"]
+    layers = coin["layers"]
+    tech = get_technicals(sym)
+    trend_dir = tech.get("trend_dir", "up")
+    ema_rel = "above" if trend_dir == "up" else "below"
+    ema_slope = "rising" if trend_dir == "up" else "falling"
+    vwap_score = anchored_vwap_score(get_yahoo_klines(sym, interval='4h', days=14), price)
+    vwap_rel = "above" if vwap_score > 0 else "below" if vwap_score < 0 else "near"
+    vol_trend = "increasing" if layers["volume_trend"] > 0 else "decreasing" if layers["volume_trend"] < 0 else "flat"
+
+    prompt = (
+        f"Symbol: {sym} | Direction: {direction} | Price: {price:.4f} | ATR: {atr:.4f}\n"
+        f"EMA50: {ema_rel} price, {ema_slope}. VWAP: {vwap_rel}. Volume: {vol_trend}.\n"
+        f"BTC Trend Score: {btc_score} (2=bullish, -2=bearish). Macro: {macro_score}.\n"
+        f"Layers: tech={layers['tech']:.2f}, buying_press={layers['buying_press']:.2f}, "
+        f"intermarket={layers['intermarket']:.2f}.\n\n"
+        "You are a senior crypto analyst. Rate this setup from 1 to 10, where 10 is a perfect, high‑probability trade "
+        "with strong trend alignment, clear chart structure, and confirming volume. "
+        "Be strict: only give a high rating if the setup is clean and has a clear edge. "
+        "Give a very brief reason for your rating. Output format exactly:\n"
+        "RATING: 8 | REASON: [short reason]"
+    )
+
+    def call_qwen(p, temp=0.3):
+        url = "https://api.groq.com/openai/v1/chat/completions"
+        headers = {"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"}
+        payload = {
+            "model": "qwen-2.5-72b",
+            "messages": [{"role": "user", "content": p}],
+            "temperature": temp,
+            "max_tokens": 150
+        }
+        try:
+            r = requests.post(url, headers=headers, json=payload, timeout=30)
+            if r.status_code == 200:
+                return r.json()["choices"][0]["message"]["content"]
+        except:
+            pass
+        return None
+
+    text = call_qwen(prompt, 0.3)
+    rating = 5
+    reason = ""
+    if text:
+        rat_match = re.search(r'RATING:\s*(\d+)', text)
+        if rat_match:
+            rating = int(rat_match.group(1))
+            rating = max(1, min(10, rating))
+        reason_match = re.search(r'REASON:\s*(.*)', text)
+        if reason_match:
+            reason = reason_match.group(1).strip()
+    return rating, reason
+
+# ========== VIRAL BINANCE SQUARE POST (patterns + craving hook) ==========
+def generate_post(coin, direction, entry, stop, tps, sl_pct, qwen_reason=""):
     sym = coin["symbol"]; ticker = sym.replace("USDT","")
     price = coin["price"]; atr = coin["atr"]; layers = coin["layers"]
     tech = get_technicals(sym); trend_dir = tech.get("trend_dir","up")
@@ -425,34 +502,61 @@ def generate_post(coin, direction, entry, stop, tps, sl_pct):
     btc_bullish = btc_trend_score()[0] > 0
     btc_text = "bullish" if btc_bullish else "bearish"
 
+    # Get recent candle data for pattern detection
+    recent_candles = ""
+    try:
+        df_4h = get_yahoo_klines(sym, interval='4h', days=2)
+        if not df_4h.empty:
+            last_candles = df_4h.tail(6)
+            candle_list = []
+            for idx, row in last_candles.iterrows():
+                candle_list.append(
+                    f"O:{row['Open']:.4f} H:{row['High']:.4f} L:{row['Low']:.4f} C:{row['Close']:.4f} V:{row['Volume']:.0f}"
+                )
+            recent_candles = "\n".join(candle_list)
+    except:
+        pass
+
     tp_str = f"{tps[0]:.6f} (0.5R) / {tps[1]:.6f} (1R) / {tps[2]:.6f} (2R) / {tps[3]:.6f} (3R) / {tps[4]:.6f} (5R)"
 
     system_msg = (
-        "You are the #1 viral crypto analyst on Binance Square. Every post you write uses a completely fresh, "
-        "creative hook that makes people stop scrolling. You never repeat the same opening twice. You explain the "
-        "technical setup like a real trader talking to a friend, using plain English, not a template. Your posts are "
-        "detailed, educational, and feel spontaneous. You include the exact risk levels provided, and you always end "
-        "with a question that invites discussion. Use emojis sparingly to highlight key points, not as decoration. "
-        "Keep paragraphs short for mobile readers. Never mention 'EMA50' or 'VWAP' without also explaining what they "
-        "mean for price action. Never output 'RATING:' or any meta text."
+        "You are a legendary crypto chart analyst with 15 years of experience. "
+        "Your posts on Binance Square go viral every time because you combine deep technical knowledge with a natural, "
+        "human storytelling style. You identify candlestick patterns, chart formations, and key levels like a pro. "
+        "Your hooks are irresistible – they create curiosity and FOMO. "
+        "Your analysis is detailed yet easy to read, breaking down trend, momentum, volume, and market context. "
+        "You always include exact risk‑managed levels and end with an engaging question. "
+        "Use emojis sparingly but effectively to highlight key points. "
+        "Never output 'RATING:' or any meta commentary. "
+        "Important: Base your analysis on the candle data and indicators provided – mention specific patterns "
+        "(like bullish engulfing, doji, breakout of triangle, etc.) if you see them."
     )
 
     user_prompt = (
         f"Write a Binance Square post for a {direction} setup on ${ticker} (USDT pair, 4‑hour chart).\n\n"
-        f"Key technicals:\n"
+        f"Recent 4‑hour candles (newest first):\n{recent_candles}\n\n"
+        f"Technical context:\n"
         f"- Price: {price:.4f}\n"
-        f"- 50‑EMA is {ema_slope} and price is {ema_rel} it (so momentum is {'supporting' if direction=='LONG' else 'capping'} the move).\n"
+        f"- 50‑EMA is {ema_slope} and price is {ema_rel} it (trend direction).\n"
         f"- Anchored VWAP is {vwap_rel} price, acting as {'support' if vwap_rel=='below' else 'resistance' if vwap_rel=='above' else 'a magnet'}.\n"
-        f"- Volume has been {vol_desc}, which {'confirms' if vol_desc=='increasing' else 'shows'} buyer/seller interest.\n"
-        f"- $BTC is in a {btc_text} structure, {'giving altcoins a tailwind' if btc_bullish else 'adding caution to altcoins'}.\n\n"
+        f"- Volume has been {vol_desc}, signaling {'buyer/seller interest' if vol_desc!='flat' else 'indecision'}.\n"
+        f"- $BTC is in a {btc_text} structure, {'giving altcoins a tailwind' if btc_bullish else 'adding caution'}.\n"
+        f"{'Qwen analyst note: ' + qwen_reason if qwen_reason else ''}\n\n"
         f"Risk‑managed levels (use exactly these numbers):\n"
         f"- Area of Interest: {entry:.6f}\n"
         f"- Technical Invalidation: {stop:.6f} ({sl_pct:.2f}%)\n"
         f"- Target Objectives: {tp_str}\n\n"
-        "CRITICAL: Start with a unique, scroll‑stopping hook that includes the cashtag. Do NOT use 'Order books are thinning out' or any phrase you've used before. Be creative. Then explain the setup in 2‑3 short paragraphs. Include the risk levels. Ask an engaging question. End with the hashtags: #CryptoAnalysis #{ticker} #TechnicalAnalysis #BinanceSquare and the standard disclaimer."
+        "CRITICAL INSTRUCTIONS:\n"
+        "1. Start with a craving, scroll‑stopping hook that includes the cashtag and mentions a pattern or level.\n"
+        "2. Write a detailed, multi‑paragraph analysis explaining what the candles are telling you – include candlestick patterns, "
+        "support/resistance, and how the EMA/VWAP/volume confirm the bias.\n"
+        "3. List the risk levels exactly as provided.\n"
+        "4. Ask an open‑ended question that invites discussion.\n"
+        "5. End with: #CryptoAnalysis #{ticker} #TechnicalAnalysis #BinanceSquare\n"
+        "and the standard disclaimer."
     )
 
-    def call_qwen(sys_msg, usr_msg, temp=1.0):
+    def call_qwen(sys_msg, usr_msg, temp=0.9):
         url = "https://api.groq.com/openai/v1/chat/completions"
         headers = {"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"}
         payload = {
@@ -462,7 +566,7 @@ def generate_post(coin, direction, entry, stop, tps, sl_pct):
                 {"role": "user", "content": usr_msg}
             ],
             "temperature": temp,
-            "max_tokens": 600
+            "max_tokens": 800
         }
         try:
             r = requests.post(url, headers=headers, json=payload, timeout=60)
@@ -472,11 +576,12 @@ def generate_post(coin, direction, entry, stop, tps, sl_pct):
             pass
         return None
 
-    text = call_qwen(system_msg, user_prompt, 1.0)
-    if not text or len(text) < 150:
-        text = call_qwen(system_msg, user_prompt, 1.1)
+    text = call_qwen(system_msg, user_prompt, 0.9)
+    if not text or len(text) < 200:
+        text = call_qwen(system_msg, user_prompt, 1.0)
 
     if not text:
+        # Fallback
         hooks = [
             f"I've been watching ${ticker} closely – the technicals just lined up in a way I can't ignore. ⚡",
             f"${ticker} is printing a textbook {direction.lower()} structure on the 4‑hour chart. 🚀",
@@ -497,7 +602,6 @@ def generate_post(coin, direction, entry, stop, tps, sl_pct):
             f"#CryptoAnalysis #{ticker} #TechnicalAnalysis #BinanceSquare\n"
             f"*Disclaimer: This analysis is for educational purposes only and does not constitute financial advice. Always DYOR.*"
         )
-
     return text.strip()
 
 # ========== TRADE MANAGER (full closure chart + alert) ==========
@@ -524,8 +628,7 @@ def check_open_trades():
             df_1h = get_yahoo_klines(sym, interval='1h', start=datetime.strptime(trade["timestamp"],"%Y-%m-%d %H:%M:%S"), end=now)
             if df_1h.empty: still_open.append(trade); continue
             current_stop = entry if highest_tp_idx >= 0 else stop_orig
-            full_close_data = None   # store signal data for final chart
-
+            full_close_data = None
             for _, candle in df_1h.iterrows():
                 high, low = candle['High'], candle['Low']
                 new_tp_idx = None
@@ -610,7 +713,6 @@ def check_open_trades():
                 trade["highest_tp"] = highest_tp_idx
                 still_open.append(trade)
             elif full_close_data:
-                # trade fully closed -> send chart immediately
                 send_trade_chart(full_close_data, title_suffix=f" – Closed")
         except Exception as e:
             print(f"Trade check error {trade['symbol']}: {e}")
@@ -624,7 +726,7 @@ def check_open_trades():
     save_portfolio(portfolio)
     if alerts: send_telegram("\n".join(alerts))
 
-# ========== SIGNAL GENERATION (unchanged) ==========
+# ========== SIGNAL GENERATION (Qwen quality filter) ==========
 def generate_signal(balance_usdt):
     try:
         coins_data = fetch_coingecko("https://api.coingecko.com/api/v3/coins/markets?vs_currency=usd&order=volume_desc&per_page=100&page=1")
@@ -659,26 +761,51 @@ def generate_signal(balance_usdt):
         if not all_scored: return {"action":"HOLD","reasoning":"No valid scores.","summary":""}
         all_scored_sorted = sorted(all_scored, key=lambda x: abs(x["score"]), reverse=True)
         summary = " | ".join([f"{c['symbol'].replace('USDT','')}: {c['score']:.2f}" for c in all_scored_sorted[:30]])
-        best = all_scored_sorted[0]
-        if abs(best["score"]) < 1.49:
-            layer_str = "; ".join([f"{k}={v:.2f}" for k,v in best["layers"].items()])
-            errors = []
-            for k, v in best["layers"].items():
-                if abs(v) < 0.001:
-                    errors.append(f"{k} zero")
-            err_msg = ""
-            if errors:
-                err_msg = f" ⚠️ Layers with possible error: {', '.join(errors)}."
-            reason = (
-                f"No strong conviction. Best score: {best['score']:.2f} for {best['symbol']}.\n"
-                f"Layers: {layer_str}{err_msg}\n"
-                f"Top coins: {summary}"
-            )
+        # Qwen filter on top 5
+        top5 = all_scored_sorted[:5]
+        best_combined = -999
+        best_signal = None
+        for coin in top5:
+            if abs(coin["score"]) < 0.5: continue
+            direction = "LONG" if coin["score"] >= 0 else "SHORT"
+            rating, reason = evaluate_deep(coin, direction, btc_score, macro)
+            combined = abs(coin["score"]) * (rating / 5.0)
+            if combined > best_combined:
+                best_combined = combined
+                coin["direction"] = direction
+                coin["rating"] = rating
+                coin["qwen_reason"] = reason
+                best_signal = coin
+        if best_signal is None or best_combined < 1.49:
+            # If no candidate passes, hold with message
+            best_all = all_scored_sorted[0] if all_scored_sorted else None
+            reason = ""
+            if best_all:
+                layer_str = "; ".join([f"{k}={v:.2f}" for k,v in best_all["layers"].items()])
+                errors = []
+                for k, v in best_all["layers"].items():
+                    if abs(v) < 0.001:
+                        errors.append(f"{k} zero")
+                err_msg = ""
+                if errors:
+                    err_msg = f" ⚠️ Layers with possible error: {', '.join(errors)}."
+                if btc_err and abs(best_all["layers"].get("intermarket", 0)) < 0.001:
+                    err_msg += f" (BTC: {btc_err})"
+                reason = (
+                    f"No strong conviction. Best internal score: {best_all['score']:.2f} for {best_all['symbol']}.\n"
+                    f"Qwen filter active – no candidate passed the quality check.\n"
+                    f"Layers: {layer_str}{err_msg}\n"
+                    f"Top coins: {summary}"
+                )
+            else:
+                reason = "No valid coins to evaluate."
             return {"action":"HOLD", "reasoning": reason, "summary": summary}
-        direction = "LONG" if best["score"]>=0 else "SHORT"
-        entry = best.get("bid", best["price"]*0.999) if direction=="LONG" else best.get("ask", best["price"]*1.001)
-        atr = best["atr"]
-        df_1h_recent = get_yahoo_klines(best["symbol"], interval='1h', days=2)
+        # Use best_signal
+        coin = best_signal
+        direction = coin["direction"]
+        entry = coin.get("bid", coin["price"]*0.999) if direction=="LONG" else coin.get("ask", coin["price"]*1.001)
+        atr = coin["atr"]
+        df_1h_recent = get_yahoo_klines(coin["symbol"], interval='1h', days=2)
         confirm = False
         if not df_1h_recent.empty:
             last_candle = df_1h_recent.iloc[-1]
@@ -697,16 +824,16 @@ def generate_signal(balance_usdt):
             else:
                 tps.append(round(entry - m * risk_per_share, 6))
         sl_pct = abs(entry - stop)/entry*100
-        post = generate_post(best, direction, entry, stop, tps, sl_pct)
+        post = generate_post(coin, direction, entry, stop, tps, sl_pct, qwen_reason=coin.get("qwen_reason",""))
         return {
             "action": direction,
-            "symbol": best["symbol"],
+            "symbol": coin["symbol"],
             "quantity": qty,
             "limit_price": entry,
             "stop_loss": stop,
             "take_profits": tps,
-            "confidence_score": compute_confidence(best["layers"]),
-            "conviction_score": abs(best["score"]),
+            "confidence_score": compute_confidence(coin["layers"]),
+            "conviction_score": abs(coin["score"]),
             "post_text": post,
             "summary": summary
         }
