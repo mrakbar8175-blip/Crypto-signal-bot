@@ -166,12 +166,41 @@ def update_portfolio(trade_result):
     portfolio['realized_pnl'] += trade_result['pnl_usdt']
     save_portfolio(portfolio)
 
-# ========== SIMPLIFIED INDICATORS ==========
+# ========== IMPROVED INTERMARKET (retry + fallback) ==========
 def safe_ema(series, span):
     try:
         return series.ewm(span=span, adjust=False).mean()
     except:
         return pd.Series(index=series.index)
+
+def btc_trend_score():
+    """Retry once if fails, then fallback to 0 to avoid zero errors."""
+    for attempt in range(2):
+        try:
+            df = get_yahoo_klines("BTCUSDT", interval='4h', days=14)
+            if df.empty or len(df) < 50:
+                if attempt == 0:
+                    time.sleep(2)   # wait and retry
+                    continue
+                return 0, "BTC data unavailable after retry"
+            closes = df['Close']
+            ema50 = safe_ema(closes, 50)
+            cur = closes.iloc[-1]
+            ema_now = ema50.iloc[-1]
+            slope_up = ema_now > ema50.iloc[-7] if len(ema50) >= 7 else True
+            price_above = cur > ema_now
+            if price_above and slope_up:
+                return 2, None
+            elif not price_above and not slope_up:
+                return -2, None
+            else:
+                return 0, None
+        except:
+            if attempt == 0:
+                time.sleep(2)
+            else:
+                return 0, "BTC error after retry"
+    return 0, "BTC unavailable"
 
 def institutional_macro_filter():
     try:
@@ -297,21 +326,7 @@ def get_volatility_score(symbol_usdt, price):
     except:
         return 0
 
-def btc_trend_score():
-    try:
-        df = get_yahoo_klines("BTCUSDT", interval='4h', days=14)
-        if df.empty or len(df)<50: return 0,"BTC unavailable"
-        closes = df['Close']; ema50 = safe_ema(closes, 50)
-        cur = closes.iloc[-1]; ema_now = ema50.iloc[-1]
-        slope_up = ema_now > ema50.iloc[-7] if len(ema50)>=7 else True
-        price_above = cur > ema_now
-        if price_above and slope_up: return 2,None
-        elif not price_above and not slope_up: return -2,None
-        else: return 0,None
-    except:
-        return 0, "BTC error"
-
-# ========== EXISTING BONUS: CANDLE STRENGTH ==========
+# ========== BONUS LAYERS ==========
 def candle_strength_score(symbol_usdt, direction, atr):
     try:
         df = get_yahoo_klines(symbol_usdt, interval='4h', days=2)
@@ -325,7 +340,6 @@ def candle_strength_score(symbol_usdt, direction, atr):
         pass
     return 0
 
-# ========== NEW BONUSES: MOMENTUM & CANDLE CONVICTION ==========
 def momentum_bonus(tech, direction):
     try:
         adx = tech.get("adx", 0)
@@ -350,14 +364,14 @@ def candle_conviction_bonus(symbol_usdt, direction):
         if direction == "LONG":
             close_pct = (last['Close'] - last['Low']) / candle_range
             if close_pct >= 0.60: return 0.10
-        else:  # SHORT
+        else:
             close_pct = (last['High'] - last['Close']) / candle_range
             if close_pct >= 0.60: return 0.10
     except:
         pass
     return 0
 
-# ========== SCORING ENGINE (with new bonuses) ==========
+# ========== SCORING ENGINE ==========
 def score_coin(symbol, price, volume, btc_score, btc_err, macro_score):
     try:
         tech = get_technicals(symbol)
@@ -376,7 +390,6 @@ def score_coin(symbol, price, volume, btc_score, btc_err, macro_score):
         total += vwap_score * 0.1
         direction = "LONG" if total >= 0 else "SHORT"
         total += candle_strength_score(symbol, direction, atr_val)
-        # New bonuses for 0.5R win rate
         total += momentum_bonus(tech, direction)
         total += candle_conviction_bonus(symbol, direction)
         layers = {
@@ -487,7 +500,7 @@ def generate_post(coin, direction, entry, stop, tps, sl_pct):
 
     return text.strip()
 
-# ========== TRADE MANAGER (20% partials, BE after TP1, auto close) ==========
+# ========== TRADE MANAGER (full closure chart + alert) ==========
 def check_open_trades():
     try:
         open_df = pd.read_csv(OPEN_TRADES_CSV)
@@ -511,6 +524,8 @@ def check_open_trades():
             df_1h = get_yahoo_klines(sym, interval='1h', start=datetime.strptime(trade["timestamp"],"%Y-%m-%d %H:%M:%S"), end=now)
             if df_1h.empty: still_open.append(trade); continue
             current_stop = entry if highest_tp_idx >= 0 else stop_orig
+            full_close_data = None   # store signal data for final chart
+
             for _, candle in df_1h.iterrows():
                 high, low = candle['High'], candle['Low']
                 new_tp_idx = None
@@ -547,19 +562,27 @@ def check_open_trades():
                         if i == 4:
                             if remaining_qty > 0:
                                 final_exit_qty = remaining_qty
-                                pnl = (tps[4] - entry) * final_exit_qty if direction=="LONG" else (entry - tps[4]) * final_exit_qty
+                                exit_price = tps[4]
+                                pnl = (exit_price - entry) * final_exit_qty if direction=="LONG" else (entry - exit_price) * final_exit_qty
                                 final = trade.to_dict()
                                 final["hit_level"] = "TP5 (final)"
                                 final["close_time"] = now.strftime("%Y-%m-%d %H:%M:%S")
-                                final["exit_price"] = tps[4]
+                                final["exit_price"] = exit_price
                                 final["quantity"] = final_exit_qty
                                 final["pnl_usdt"] = round(pnl,4)
                                 results.append(final)
                                 update_portfolio({'pnl_usdt': pnl})
                                 remaining_qty = 0
+                                highest_tp_idx = 4
+                                full_close_data = {
+                                    "symbol": sym, "action": direction,
+                                    "limit_price": entry, "stop_loss": stop_orig,
+                                    "take_profits": tps
+                                }
                                 alerts.append(f"🔔 {sym.replace('USDT','')} {direction} TP5 hit — remaining closed")
                             break
-                    # end for
+                    if remaining_qty <= 0 and i == 4:
+                        break
                 if remaining_qty > 0:
                     sl_hit = (low <= current_stop) if direction=="LONG" else (high >= current_stop)
                     if sl_hit:
@@ -575,12 +598,20 @@ def check_open_trades():
                         results.append(final)
                         update_portfolio({'pnl_usdt': pnl})
                         remaining_qty = 0
+                        full_close_data = {
+                            "symbol": sym, "action": direction,
+                            "limit_price": entry, "stop_loss": stop_orig,
+                            "take_profits": tps
+                        }
                         alerts.append(f"🔴 {sym.replace('USDT','')} {direction} → {desc} (remaining closed)")
                         break
             if remaining_qty > 0:
                 trade["quantity"] = remaining_qty
                 trade["highest_tp"] = highest_tp_idx
                 still_open.append(trade)
+            elif full_close_data:
+                # trade fully closed -> send chart immediately
+                send_trade_chart(full_close_data, title_suffix=f" – Closed")
         except Exception as e:
             print(f"Trade check error {trade['symbol']}: {e}")
             still_open.append(trade)
@@ -593,7 +624,7 @@ def check_open_trades():
     save_portfolio(portfolio)
     if alerts: send_telegram("\n".join(alerts))
 
-# ========== SIGNAL GENERATION (threshold 1.49) ==========
+# ========== SIGNAL GENERATION (unchanged) ==========
 def generate_signal(balance_usdt):
     try:
         coins_data = fetch_coingecko("https://api.coingecko.com/api/v3/coins/markets?vs_currency=usd&order=volume_desc&per_page=100&page=1")
@@ -684,7 +715,7 @@ def generate_signal(balance_usdt):
         return {"action":"HOLD","reasoning":f"Internal error: {e}","summary":""}
 
 # ========== DARK CHART ==========
-def send_trade_chart(signal):
+def send_trade_chart(signal, title_suffix=""):
     try:
         import matplotlib; matplotlib.use('Agg'); import matplotlib.pyplot as plt; import mplfinance as mpf
         sym = signal['symbol']; df = get_yahoo_klines(sym, interval='4h', days=10)
@@ -695,7 +726,7 @@ def send_trade_chart(signal):
         typical = (df['High']+df['Low']+df['Close'])/3; vwap = (typical*df['Volume']).cumsum()/df['Volume'].cumsum()
         apds = [mpf.make_addplot(ema50,color='#f39c12',width=1.5,label='EMA50'),
                 mpf.make_addplot(vwap,color='#3498db',width=1,linestyle='--',label='VWAP')]
-        fig,axes=mpf.plot(df,type='candle',style=style,title=f"{sym.replace('USDT','')} 4h",ylabel='Price',addplot=apds,returnfig=True,figsize=(8,6))
+        fig,axes=mpf.plot(df,type='candle',style=style,title=f"{sym.replace('USDT','')} 4h{title_suffix}",ylabel='Price',addplot=apds,returnfig=True,figsize=(8,6))
         ax=axes[0]
         entry=signal.get('limit_price'); stop=signal.get('stop_loss'); tps=signal.get('take_profits')
         if entry and stop:
