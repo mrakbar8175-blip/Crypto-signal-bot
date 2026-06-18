@@ -2,6 +2,7 @@
 """
 Crypto Swing Bot – Top 50 liquid coins via CoinGecko, TP1 Optimized (0.5R), 5 TPs
 Signal formatting: Elite 7-angle Binance Square posts
+Moderate stop loss (0.5‑2.0%) for 4H swing trades
 """
 
 import requests, json, os, traceback, random
@@ -40,7 +41,6 @@ def fetch_top_liquid_coins(limit=50):
             symbol = coin.get("symbol", "").upper()
             if symbol:
                 yf_symbols.append(f"{symbol}-USD")
-        # Preserve order, remove duplicates
         yf_symbols = list(dict.fromkeys(yf_symbols))
         print(f"Fetched {len(yf_symbols)} coins from CoinGecko: {', '.join(yf_symbols[:10])}...")
         return yf_symbols[:limit]
@@ -180,7 +180,7 @@ def update_portfolio(trade_result):
 
 # ========== DATA ==========
 def get_data(pair, interval='4h', days=14, start=None, end=None):
-    ysym = pair  # e.g., "BTC-USD"
+    ysym = pair
     if start is None:
         end = datetime.now()
         start = end - timedelta(days=days)
@@ -269,7 +269,6 @@ def score_pair(pair):
 
     price = df_4h['Close'].iloc[-1]
 
-    # Daily trend
     ema50_d = ema(df_d['Close'], 50)
     ema200_d = ema(df_d['Close'], 200)
     trend_daily = 0
@@ -280,7 +279,6 @@ def score_pair(pair):
     if trend_daily == 0:
         return 0, None, None, None, None
 
-    # 4h indicators
     ema50_4h = ema(df_4h['Close'], 50)
     ema200_4h = ema(df_4h['Close'], 200)
     adx_val, di_plus, di_minus = adx(df_4h)
@@ -289,7 +287,6 @@ def score_pair(pair):
     atr_val = atr(df_4h)
     res, sup = support_resistance_levels(df_4h, 20)
 
-    # 1h momentum
     rsi_1h = rsi(df_1h, 14)
     last_candle = df_1h.iloc[-1]
     prev_candle = df_1h.iloc[-2]
@@ -299,12 +296,10 @@ def score_pair(pair):
     else:
         bullish_momentum = 0
 
-    # Volume
     vol_last = df_4h['Volume'].iloc[-1]
     vol_avg = df_4h['Volume'].iloc[-6:-1].mean() if len(df_4h) >= 6 else vol_last
     vol_surge = vol_last > vol_avg * 1.2
 
-    # Market index alignment
     total_df = get_total_market_index(interval='4h', days=14)
     market_aligned = False
     if not total_df.empty:
@@ -455,9 +450,10 @@ def generate_signal():
     best = candidates[0]
     pair, score, direction, price, atr_val, swing_level = best
 
-    min_stop_pct = 0.002
-    max_stop_pct = 0.01
-    raw_stop = atr_val * 1.0
+    # === MODERATE STOP LOSS (0.5%–2.0%) ===
+    min_stop_pct = 0.005   # 0.5%
+    max_stop_pct = 0.02    # 2.0%
+    raw_stop = atr_val * 1.5   # use 1.5× ATR for more room
     min_stop = price * min_stop_pct
     max_stop = price * max_stop_pct
     stop_distance = np.clip(raw_stop, min_stop, max_stop)
@@ -504,7 +500,7 @@ def generate_signal():
     signal["ai_approved"] = True
     return signal
 
-# ========== TRADE MANAGEMENT ==========
+# ========== TRADE MANAGEMENT (ALERTS STILL HERE) ==========
 def check_open_trades():
     try:
         open_df = pd.read_csv(OPEN_TRADES_CSV)
@@ -706,10 +702,8 @@ def format_signal(sig):
     risk = abs(entry - stop)
     stop_pct = risk / entry * 100
 
-    # Randomly pick one of 7 angles
     angle = random.randint(1, 7)
 
-    # ----- Angle 1: Liquidity Hunter -----
     if angle == 1:
         if direction == "LONG":
             hook = f"{cashtag} just swept the 4H lows and printed a massive rejection wick – someone got trapped short, and the bounce is real."
@@ -725,8 +719,6 @@ def format_signal(sig):
                 f"Sellers absorbed the ask side, leaving a bearish engulfing candle. "
                 f"$BTC is also showing weakness, confirming the bearish pressure across the board."
             )
-
-    # ----- Angle 2: Structural S/R Flip -----
     elif angle == 2:
         if direction == "LONG":
             hook = f"{cashtag} is respecting a textbook higher‑low structure – the 4H trend continues to build bullish momentum."
@@ -740,8 +732,6 @@ def format_signal(sig):
                 f"The previous support has flipped to resistance, and the 4H trend is now making lower highs. "
                 f"With $BTC also losing its 4H market structure, this bearish continuation looks technically solid."
             )
-
-    # ----- Angle 3: Volatility Compression -----
     elif angle == 3:
         if direction == "LONG":
             hook = f"{cashtag} is coiling inside a tight range – EMAs are squeezing, and a volume explosion off the whale defense zone is imminent."
@@ -757,8 +747,6 @@ def format_signal(sig):
                 f"A massive sell‑side volume delta is building, suggesting whales are reloading shorts. "
                 f"$BTC’s sideways limp adds weight to this bearish compression play."
             )
-
-    # ----- Angle 4: Institutional Absorption -----
     elif angle == 4:
         if direction == "LONG":
             hook = f"{cashtag} is seeing massive passive bids absorbing every sell at the 4H demand block – institutions are loading."
@@ -772,8 +760,6 @@ def format_signal(sig):
                 f"Ask-side walls are absorbing buying pressure at the resistance, preventing any breakout. "
                 f"This distribution behavior, combined with $BTC's weakening trend, signals a potential dump."
             )
-
-    # ----- Angle 5: Market Imbalance Play -----
     elif angle == 5:
         if direction == "LONG":
             hook = f"{cashtag} left a Fair Value Gap below – price is magnetically drawing back to fill it before the next leg up."
@@ -787,8 +773,6 @@ def format_signal(sig):
                 f"The imbalance above is acting as a price magnet. A retracement to fill the gap before the bearish continuation is probable. "
                 f"$BTC is also correcting, reinforcing the fill‑then‑fall outlook."
             )
-
-    # ----- Angle 6: Trend Confluence Sync -----
     elif angle == 6:
         if direction == "LONG":
             hook = f"{cashtag} is perfectly synced: the 4H bull flag is aligning with the daily EMA breakout."
@@ -802,8 +786,6 @@ def format_signal(sig):
                 f"Lower timeframe indecision is aligning with a macro trend shift to the downside. "
                 f"With $BTC also breaking key levels, this bearish confluence is extremely powerful."
             )
-
-    # ----- Angle 7: Exhaustion Reversal -----
     else:  # angle == 7
         if direction == "LONG":
             hook = f"{cashtag} bears are exhausted – the 4H selling pressure just dried up at a key support."
@@ -818,7 +800,6 @@ def format_signal(sig):
                 f"This exhaustion at the resistance zone, coupled with $BTC's weakness, points to a bearish reversal."
             )
 
-    # Build the execution block
     tp_str = " / ".join([f"{tp:.5f}" for tp in tps])
 
     msg = (
