@@ -83,11 +83,10 @@ def get_yahoo_klines(symbol_usdt, interval='4h', days=60, start=None, end=None):
     return pd.DataFrame()
 
 def get_klines_with_fallback(symbol_usdt, interval='4h', days=10):
-    """Fetch 4h data; if insufficient, try 1h data (3 days)."""
     df = get_yahoo_klines(symbol_usdt, interval=interval, days=days)
     if not df.empty and len(df) >= 20:
         return df
-    # fallback to 1h
+    # fallback to 1h (3 days → up to 72 candles)
     df1 = get_yahoo_klines(symbol_usdt, interval='1h', days=3)
     if not df1.empty and len(df1) >= 20:
         return df1
@@ -181,6 +180,7 @@ def update_portfolio(trade_result):
 # ========== MACRO BIAS (CoinGecko, never zero) ==========
 def get_macro_bias():
     bias = 0.0
+    # 1. BTC 24h change
     try:
         cg_simple = fetch_coingecko(
             "https://api.coingecko.com/api/v3/simple/price?ids=bitcoin&vs_currencies=usd&include_24hr_change=true"
@@ -190,6 +190,7 @@ def get_macro_bias():
             bias += max(-1.0, min(1.0, change / 5.0)) * 0.6
     except:
         pass
+    # 2. BTC 7-day EMA trend
     try:
         cg_daily = fetch_coingecko(
             "https://api.coingecko.com/api/v3/coins/bitcoin/market_chart?vs_currency=usd&days=14"
@@ -209,7 +210,7 @@ def get_macro_bias():
         pass
     return max(-1.0, min(1.0, bias))
 
-# ========== LAYERS WITH DATA FALLBACK ==========
+# ========== FAST PRICE‑ACTION LAYERS ==========
 def safe_ema(series, span):
     try:
         return series.ewm(span=span, adjust=False).mean()
@@ -228,6 +229,7 @@ def get_4h_atr(symbol_usdt, current_price):
         return current_price * 0.02
 
 def candle_conviction_score(symbol_usdt, direction, atr):
+    """How strongly the last candle closed in the trade direction. Returns -1..+1."""
     try:
         df = get_klines_with_fallback(symbol_usdt, interval='4h', days=2)
         if df.empty: return 0
@@ -237,67 +239,37 @@ def candle_conviction_score(symbol_usdt, direction, atr):
         if candle_range <= 0: return 0
         if direction == "LONG":
             if last['Close'] > last['Open']:
-                close_pos = (last['Close'] - last['Low']) / candle_range
+                close_pos = (last['Close'] - last['Low']) / candle_range  # 0..1
                 body_ratio = body / candle_range
-                return (close_pos * 0.6 + body_ratio * 0.4) * 0.8
+                return (close_pos * 0.6 + body_ratio * 0.4) * 0.9  # scale to 0.9 max
             else:
-                return -0.3
-        else:
+                return -0.5  # opposite candle, bearish for long
+        else:  # SHORT
             if last['Close'] < last['Open']:
                 close_pos = (last['High'] - last['Close']) / candle_range
                 body_ratio = body / candle_range
-                return (close_pos * 0.6 + body_ratio * 0.4) * 0.8
+                return (close_pos * 0.6 + body_ratio * 0.4) * 0.9
             else:
-                return -0.3
+                return -0.5
     except:
         return 0
 
-def momentum_score(symbol_usdt, direction, atr):
+def momentum_score(symbol_usdt, direction):
+    """3-period rate-of-change. Returns -1..+1."""
     try:
         df = get_klines_with_fallback(symbol_usdt, interval='4h', days=2)
-        if df.empty: return 0
-        last = df.iloc[-1]
-        candle_range = last['High'] - last['Low']
-        if atr <= 0: return 0
-        range_vs_atr = candle_range / atr
+        if df.empty or len(df) < 4: return 0
+        closes = df['Close']
+        roc = (closes.iloc[-1] / closes.iloc[-4] - 1) * 100  # percentage
         if direction == "LONG":
-            if last['Close'] > last['Open']:
-                return min(1.0, range_vs_atr * 0.6)
-            else:
-                return -min(1.0, range_vs_atr * 0.6)
+            return max(-1.0, min(1.0, roc / 2.0))  # 2% = 1.0
         else:
-            if last['Close'] < last['Open']:
-                return min(1.0, range_vs_atr * 0.6)
-            else:
-                return -min(1.0, range_vs_atr * 0.6)
+            return -max(-1.0, min(1.0, roc / 2.0))
     except:
         return 0
 
-def volume_surge_score(symbol_usdt, direction):
-    try:
-        df = get_klines_with_fallback(symbol_usdt, interval='4h', days=5)
-        if df.empty or len(df) < 21: return 0
-        last_vol = df['Volume'].iloc[-1]
-        avg_vol = df['Volume'].tail(21).mean()
-        if avg_vol <= 0: return 0
-        vol_ratio = last_vol / avg_vol
-        if vol_ratio > 5.0: vol_ratio = 5.0
-        surge = (vol_ratio - 1) / 4.0
-        last = df.iloc[-1]
-        if direction == "LONG":
-            if last['Close'] > last['Open']:
-                return max(-1.0, min(1.0, surge))
-            else:
-                return -max(-1.0, min(1.0, surge))
-        else:
-            if last['Close'] < last['Open']:
-                return max(-1.0, min(1.0, surge))
-            else:
-                return -max(-1.0, min(1.0, surge))
-    except:
-        return 0
-
-def ema_trend_score(symbol_usdt, direction):
+def trend_alignment_score(symbol_usdt, direction):
+    """EMA20 slope and price position. Returns -1..+1."""
     try:
         df = get_klines_with_fallback(symbol_usdt, interval='4h', days=10)
         if df.empty or len(df) < 20: return 0
@@ -323,20 +295,33 @@ def ema_trend_score(symbol_usdt, direction):
     except:
         return 0
 
-def rate_of_change_score(symbol_usdt, direction):
+def volume_surge_score(symbol_usdt, direction):
+    """Last candle volume vs 20‑period average. Returns -1..+1."""
     try:
-        df = get_klines_with_fallback(symbol_usdt, interval='4h', days=2)
-        if df.empty or len(df) < 4: return 0
-        closes = df['Close']
-        roc = (closes.iloc[-1] / closes.iloc[-4] - 1) * 100
+        df = get_klines_with_fallback(symbol_usdt, interval='4h', days=5)
+        if df.empty or len(df) < 21: return 0
+        last_vol = df['Volume'].iloc[-1]
+        avg_vol = df['Volume'].tail(21).mean()
+        if avg_vol <= 0: return 0
+        vol_ratio = last_vol / avg_vol
+        if vol_ratio > 5.0: vol_ratio = 5.0
+        surge = (vol_ratio - 1) / 4.0  # 1.0 avg=0, 5x=1.0
+        last = df.iloc[-1]
         if direction == "LONG":
-            return max(-1.0, min(1.0, roc / 2.0))
+            if last['Close'] > last['Open']:
+                return max(-1.0, min(1.0, surge))
+            else:
+                return -max(-1.0, min(1.0, surge))
         else:
-            return -max(-1.0, min(1.0, roc / 2.0))
+            if last['Close'] < last['Open']:
+                return max(-1.0, min(1.0, surge))
+            else:
+                return -max(-1.0, min(1.0, surge))
     except:
         return 0
 
 def relative_strength_score(symbol_usdt, direction, btc_df):
+    """Coin outperformance vs BTC over last 6 candles. Returns -1..+1."""
     try:
         df = get_klines_with_fallback(symbol_usdt, interval='4h', days=10)
         if df.empty or len(df) < 6 or btc_df is None or btc_df.empty or len(btc_df) < 6:
@@ -361,7 +346,7 @@ def score_coin(symbol, price, volume, macro_bias, coin_data_cache, btc_df):
             coin_data_cache[symbol] = df
 
         if df.empty or len(df) < 20:
-            return 0, {"conviction":0,"momentum":0,"volume":0,"ema_trend":0,"roc":0,"macro_bias":0,"rs":0}, "up", price*0.02
+            return 0, {"conviction":0,"momentum":0,"trend":0,"volume":0}, "up", price*0.02
 
         last_candle = df.iloc[-1]
         if last_candle['Close'] > last_candle['Open']:
@@ -372,42 +357,48 @@ def score_coin(symbol, price, volume, macro_bias, coin_data_cache, btc_df):
         atr_val = get_4h_atr(symbol, price)
 
         conv = candle_conviction_score(symbol, direction, atr_val)
-        mom = momentum_score(symbol, direction, atr_val)
+        mom = momentum_score(symbol, direction)
+        trend = trend_alignment_score(symbol, direction)
         vol = volume_surge_score(symbol, direction)
-        ema = ema_trend_score(symbol, direction)
-        roc = rate_of_change_score(symbol, direction)
         rs = relative_strength_score(symbol, direction, btc_df)
 
-        total = (0.20 * mom + 0.20 * conv + 0.15 * vol + 0.15 * ema + 0.10 * roc +
-                 0.10 * macro_bias + 0.10 * rs)
+        # Core score: weighted sum
+        core = (0.40 * conv + 0.30 * mom + 0.20 * trend + 0.10 * vol)
 
-        # Bonus for extreme close (>75% of range)
-        candle_range = last_candle['High'] - last_candle['Low']
-        if candle_range > 0:
-            if direction == "LONG":
-                close_pct = (last_candle['Close'] - last_candle['Low']) / candle_range
-                if close_pct > 0.75: total += 0.12
-            else:
-                close_pct = (last_candle['High'] - last_candle['Close']) / candle_range
-                if close_pct > 0.75: total += 0.12
+        # Apply macro multiplier: bullish macro amplifies bullish scores, dampens bearish ones
+        if core >= 0:
+            macro_mult = 1.0 + 0.3 * macro_bias  # macro_bias from -1 to +1, so mult from 0.7 to 1.3
+        else:
+            macro_mult = 1.0 - 0.3 * macro_bias  # for bearish core, bearish macro (negative) increases mult
 
-        total = max(-3, min(3, total))
+        total = core * macro_mult
+
+        # Relative strength bonus (small)
+        total += rs * 0.10
+
+        # Alignment bonus: if 3 or more of conv, mom, trend, vol are in the same direction (positive for LONG, negative for SHORT)
+        signs = [1 if s > 0.1 else (-1 if s < -0.1 else 0) for s in [conv, mom, trend, vol]]
+        aligned = sum(1 for s in signs if (direction == "LONG" and s == 1) or (direction == "SHORT" and s == -1))
+        if aligned >= 3:
+            total += 0.25 if direction == "LONG" else -0.25
+
+        total = max(-3.0, min(3.0, total))
+
         layers = {
             "conviction": conv,
             "momentum": mom,
+            "trend": trend,
             "volume": vol,
-            "ema_trend": ema,
-            "roc": roc,
             "macro_bias": macro_bias,
             "rs": rs
         }
         return total, layers, direction, atr_val
     except Exception as e:
         print(f"score_coin error {symbol}: {e}")
-        return 0, {"conviction":0,"momentum":0,"volume":0,"ema_trend":0,"roc":0,"macro_bias":0,"rs":0}, "up", price*0.02
+        return 0, {"conviction":0,"momentum":0,"trend":0,"volume":0,"macro_bias":0,"rs":0}, "up", price*0.02
 
 def compute_confidence(layers):
-    scores = [layers["momentum"], layers["conviction"], layers["volume"], layers["ema_trend"]]
+    scores = [layers["conviction"], layers["momentum"], layers["trend"], layers["volume"]]
     bear = sum(1 for s in scores if s < -0.3)
     bull = sum(1 for s in scores if s > 0.3)
     aligned = max(bear, bull)
@@ -427,8 +418,7 @@ def evaluate_deep(coin, direction, macro_bias):
         f"Symbol: {sym} | Direction: {direction} | Price: {price:.4f} | ATR: {atr:.4f}\n"
         f"Macro Bias (BTC): {macro_bias:.2f} (‑1 bearish, +1 bullish).\n"
         f"Layers: conviction={layers['conviction']:.2f}, momentum={layers['momentum']:.2f}, "
-        f"volume={layers['volume']:.2f}, ema_trend={layers['ema_trend']:.2f}, "
-        f"roc={layers['roc']:.2f}, rs={layers['rs']:.2f}.\n\n"
+        f"trend={layers['trend']:.2f}, volume={layers['volume']:.2f}, rs={layers['rs']:.2f}.\n\n"
         "You are a senior crypto analyst. Rate this setup from 1 to 10, where 10 is a perfect, high‑probability trade "
         "with strong trend alignment, clear momentum, and confirming volume. "
         "Be strict: only give a high rating if the setup is clean and has a clear edge. "
@@ -559,7 +549,7 @@ def generate_post(coin, direction, entry, stop, tps, sl_pct, qwen_reason=""):
         direction_icon = "📈" if direction=="LONG" else "📉"
         text = (
             f"{hook} {direction_icon}\n\n"
-            f"Momentum is {'bullish' if layers['momentum']>0 else 'bearish'}, and volume {'confirms' if layers['volume']>0 else 'is neutral'}. "
+            f"Candle conviction is {'bullish' if layers['conviction']>0 else 'bearish'}, and momentum {'confirms' if layers['momentum']>0 else 'warns'}. "
             f"The macro backdrop is {'supportive' if layers['macro_bias']>0 else 'cautious'} for altcoins.\n\n"
             f"🎯 Risk‑Managed Levels:\n"
             f"• Area of Interest: {entry:.6f}\n"
@@ -571,7 +561,7 @@ def generate_post(coin, direction, entry, stop, tps, sl_pct, qwen_reason=""):
         )
     return text.strip()
 
-# ========== TRADE MANAGER ==========
+# ========== TRADE MANAGER (unchanged) ==========
 def check_open_trades():
     try:
         open_df = pd.read_csv(OPEN_TRADES_CSV)
@@ -728,6 +718,7 @@ def generate_signal(balance_usdt):
         if not all_scored: return {"action":"HOLD","reasoning":"No valid scores.","summary":""}
         all_scored_sorted = sorted(all_scored, key=lambda x: abs(x["score"]), reverse=True)
         summary = " | ".join([f"{c['symbol'].replace('USDT','')}: {c['score']:.2f}" for c in all_scored_sorted[:30]])
+        # Llama filter on top 5
         top5 = all_scored_sorted[:5]
         best_combined = -999
         best_signal = None
