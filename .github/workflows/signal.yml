@@ -1,7 +1,7 @@
 name: Crypto Swing Signal with Trade Tracker
 
 on:
-  workflow_dispatch:                # manual trigger only (you run it when you want)
+  workflow_dispatch:                # manual trigger only
 
 jobs:
   run-bot:
