@@ -345,6 +345,18 @@ def get_volatility_score(symbol_usdt, price):
     except:
         return 0
 
+def volume_trend_score(symbol_usdt, direction=None):
+    try:
+        df = get_yahoo_klines(symbol_usdt, interval='4h', days=5)
+        if df.empty or len(df) < 12: return 0,"vol data insufficient"
+        recent = df['Volume'].tail(6)
+        first, second = recent[:3].mean(), recent[3:].mean()
+        if second > first*1.05: return -2 if direction=="down" else 2
+        elif second < first*0.95: return -2 if direction=="up" else -2
+        return 0,None
+    except:
+        return 0,"vol error"
+
 # ========== BONUS LAYERS ==========
 def candle_strength_score(symbol_usdt, direction, atr):
     try:
@@ -433,7 +445,6 @@ def compute_confidence(layers):
 
 # ========== QWEN QUALITY FILTER ==========
 def evaluate_deep(coin, direction, btc_score, macro_score):
-    """Ask Qwen to rate the trade setup 1-10 based on technicals."""
     sym = coin["symbol"]
     price = coin["price"]
     atr = coin["atr"]
@@ -444,7 +455,9 @@ def evaluate_deep(coin, direction, btc_score, macro_score):
     ema_slope = "rising" if trend_dir == "up" else "falling"
     vwap_score = anchored_vwap_score(get_yahoo_klines(sym, interval='4h', days=14), price)
     vwap_rel = "above" if vwap_score > 0 else "below" if vwap_score < 0 else "near"
-    vol_trend = "increasing" if layers["volume_trend"] > 0 else "decreasing" if layers["volume_trend"] < 0 else "flat"
+    # Volume trend from dedicated function
+    vol_trend_s, _ = volume_trend_score(sym, direction)
+    vol_trend = "increasing" if vol_trend_s > 0 else "decreasing" if vol_trend_s < 0 else "flat"
 
     prompt = (
         f"Symbol: {sym} | Direction: {direction} | Price: {price:.4f} | ATR: {atr:.4f}\n"
@@ -489,7 +502,7 @@ def evaluate_deep(coin, direction, btc_score, macro_score):
             reason = reason_match.group(1).strip()
     return rating, reason
 
-# ========== VIRAL BINANCE SQUARE POST (patterns + craving hook) ==========
+# ========== VIRAL BINANCE SQUARE POST (pattern‑rich) ==========
 def generate_post(coin, direction, entry, stop, tps, sl_pct, qwen_reason=""):
     sym = coin["symbol"]; ticker = sym.replace("USDT","")
     price = coin["price"]; atr = coin["atr"]; layers = coin["layers"]
@@ -498,7 +511,9 @@ def generate_post(coin, direction, entry, stop, tps, sl_pct, qwen_reason=""):
     ema_slope = "rising" if trend_dir=="up" else "falling"
     vwap_score = anchored_vwap_score(get_yahoo_klines(sym, interval='4h', days=14), price)
     vwap_rel = "above" if vwap_score>0 else "below" if vwap_score<0 else "near"
-    vol_desc = "increasing" if candle_strength_score(sym, direction, atr) > 0 else "steady"
+    # Volume trend from dedicated function
+    vol_trend_s, _ = volume_trend_score(sym, direction)
+    vol_desc = "increasing" if vol_trend_s > 0 else "decreasing" if vol_trend_s < 0 else "steady"
     btc_bullish = btc_trend_score()[0] > 0
     btc_text = "bullish" if btc_bullish else "bearish"
 
@@ -539,7 +554,7 @@ def generate_post(coin, direction, entry, stop, tps, sl_pct, qwen_reason=""):
         f"- Price: {price:.4f}\n"
         f"- 50‑EMA is {ema_slope} and price is {ema_rel} it (trend direction).\n"
         f"- Anchored VWAP is {vwap_rel} price, acting as {'support' if vwap_rel=='below' else 'resistance' if vwap_rel=='above' else 'a magnet'}.\n"
-        f"- Volume has been {vol_desc}, signaling {'buyer/seller interest' if vol_desc!='flat' else 'indecision'}.\n"
+        f"- Volume has been {vol_desc}, signaling {'buyer/seller interest' if vol_desc!='steady' else 'indecision'}.\n"
         f"- $BTC is in a {btc_text} structure, {'giving altcoins a tailwind' if btc_bullish else 'adding caution'}.\n"
         f"{'Qwen analyst note: ' + qwen_reason if qwen_reason else ''}\n\n"
         f"Risk‑managed levels (use exactly these numbers):\n"
@@ -581,7 +596,6 @@ def generate_post(coin, direction, entry, stop, tps, sl_pct, qwen_reason=""):
         text = call_qwen(system_msg, user_prompt, 1.0)
 
     if not text:
-        # Fallback
         hooks = [
             f"I've been watching ${ticker} closely – the technicals just lined up in a way I can't ignore. ⚡",
             f"${ticker} is printing a textbook {direction.lower()} structure on the 4‑hour chart. 🚀",
@@ -777,7 +791,6 @@ def generate_signal(balance_usdt):
                 coin["qwen_reason"] = reason
                 best_signal = coin
         if best_signal is None or best_combined < 1.49:
-            # If no candidate passes, hold with message
             best_all = all_scored_sorted[0] if all_scored_sorted else None
             reason = ""
             if best_all:
