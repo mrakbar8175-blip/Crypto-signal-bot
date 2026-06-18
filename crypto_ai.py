@@ -174,8 +174,6 @@ def safe_ema(series, span):
         return pd.Series(index=series.index)
 
 def btc_trend_score():
-    """Attempt to fetch BTC trend with increasing persistence."""
-    # 1. Try 4h data twice
     for delay in [3, 5]:
         try:
             df = get_yahoo_klines("BTCUSDT", interval='4h', days=14)
@@ -196,7 +194,6 @@ def btc_trend_score():
         except:
             time.sleep(delay)
 
-    # 2. Try 1h data (last 50 hours)
     try:
         df_1h = get_yahoo_klines("BTCUSDT", interval='1h', days=3)
         if not df_1h.empty and len(df_1h) >= 50:
@@ -212,7 +209,6 @@ def btc_trend_score():
     except:
         pass
 
-    # 3. Try daily data (last 50 days)
     try:
         df_d = get_yahoo_klines("BTCUSDT", interval='1d', days=90)
         if not df_d.empty and len(df_d) >= 50:
@@ -228,12 +224,9 @@ def btc_trend_score():
     except:
         pass
 
-    # 4. Absolute last resort: CoinGecko live price + approximate EMA
     try:
         data = fetch_coingecko("https://api.coingecko.com/api/v3/simple/price?ids=bitcoin&vs_currencies=usd")
         if data and 'bitcoin' in data:
-            btc_price = data['bitcoin']['usd']
-            # Rough estimate: assume EMA50 is around the current price
             return 0, "live price only (neutral)"
     except:
         pass
@@ -293,10 +286,8 @@ def refined_buying_pressure(symbol_usdt):
 
 # ========== FALLBACK‑RESILIENT TECHNICALS ==========
 def get_technicals(symbol_usdt):
-    # Try 4h data first
     df = get_yahoo_klines(symbol_usdt, interval='4h', days=14)
     if df.empty or len(df) < 50:
-        # Fallback: try 1h data (last 3 days)
         df = get_yahoo_klines(symbol_usdt, interval='1h', days=3)
         if df.empty or len(df) < 50:
             return {"combined":0, "trend_dir":"up", "adx":0, "di_plus":0, "di_minus":0}
@@ -326,7 +317,6 @@ def get_technicals(symbol_usdt):
     di_minus_now = di_m.iloc[-1] if not di_m.empty else 0
     adx_score = 2.5 if adx_now>25 and di_plus_now>di_minus_now else (-2.5 if adx_now>25 else (1.0 if adx_now>20 and di_plus_now>di_minus_now else (-1.0 if adx_now>20 else 0)))
 
-    # Structure detection (same as before)
     window=7; lookback=min(50,len(highs))
     rh=highs.iloc[-lookback:]; rl=lows.iloc[-lookback:]
     sh, sl = [], []
@@ -469,7 +459,7 @@ def compute_confidence(layers):
     if aligned>=2: return 5
     return 4
 
-# ========== QWEN QUALITY FILTER ==========
+# ========== LLAMA QUALITY FILTER (ANTI‑HALLUCINATION) ==========
 def evaluate_deep(coin, direction, btc_score, macro_score):
     sym = coin["symbol"]
     price = coin["price"]
@@ -496,28 +486,30 @@ def evaluate_deep(coin, direction, btc_score, macro_score):
         "You are a senior crypto analyst. Rate this setup from 1 to 10, where 10 is a perfect, high‑probability trade "
         "with strong trend alignment, clear chart structure, and confirming volume. "
         "Be strict: only give a high rating if the setup is clean and has a clear edge. "
+        "If the data provided is insufficient to judge, return a rating of 5 and state that the data is limited. "
+        "Do not invent patterns or structures that are not explicitly supported by the given data. "
         "Give a very brief reason for your rating. Output format exactly:\n"
         "RATING: 8 | REASON: [short reason]"
     )
 
-    def call_qwen(p, temp=0.3):
+    def call_llama(p, temp=0.3):
         url = "https://api.groq.com/openai/v1/chat/completions"
         headers = {"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"}
         payload = {
-            "model": "qwen-2.5-72b",
+            "model": "llama-3.3-70b-versatile",
             "messages": [{"role": "user", "content": p}],
             "temperature": temp,
             "max_tokens": 150
         }
         try:
-            r = requests.post(url, headers=headers, json=payload, timeout=30)
+            r = requests.post(url, headers=headers, json=payload, timeout=40)
             if r.status_code == 200:
                 return r.json()["choices"][0]["message"]["content"]
         except:
             pass
         return None
 
-    text = call_qwen(prompt, 0.3)
+    text = call_llama(prompt, 0.3)
     rating = 5
     reason = ""
     if text:
@@ -530,7 +522,7 @@ def evaluate_deep(coin, direction, btc_score, macro_score):
             reason = reason_match.group(1).strip()
     return rating, reason
 
-# ========== VIRAL BINANCE SQUARE POST (pattern‑rich) ==========
+# ========== VIRAL POST GENERATOR (LLAMA, pattern‑rich) ==========
 def generate_post(coin, direction, entry, stop, tps, sl_pct, qwen_reason=""):
     sym = coin["symbol"]; ticker = sym.replace("USDT","")
     price = coin["price"]; atr = coin["atr"]; layers = coin["layers"]
@@ -547,7 +539,6 @@ def generate_post(coin, direction, entry, stop, tps, sl_pct, qwen_reason=""):
     btc_bullish = btc_trend_score()[0] > 0
     btc_text = "bullish" if btc_bullish else "bearish"
 
-    # Get recent candle data for pattern detection
     recent_candles = ""
     try:
         df_4h = get_yahoo_klines(sym, interval='4h', days=2)
@@ -573,8 +564,9 @@ def generate_post(coin, direction, entry, stop, tps, sl_pct, qwen_reason=""):
         "You always include exact risk‑managed levels and end with an engaging question. "
         "Use emojis sparingly but effectively to highlight key points. "
         "Never output 'RATING:' or any meta commentary. "
-        "Important: Base your analysis on the candle data and indicators provided – mention specific patterns "
-        "(like bullish engulfing, doji, breakout of triangle, etc.) if you see them."
+        "IMPORTANT: Mention specific candlestick patterns (e.g., bullish engulfing, doji, hammer, shooting star) "
+        "and chart structures (e.g., ascending triangle, double bottom, breakout of resistance) only if they are clearly "
+        "visible in the candle data provided. If the data is insufficient, focus on the technical indicators."
     )
 
     user_prompt = (
@@ -586,7 +578,7 @@ def generate_post(coin, direction, entry, stop, tps, sl_pct, qwen_reason=""):
         f"- Anchored VWAP is {vwap_rel} price, acting as {'support' if vwap_rel=='below' else 'resistance' if vwap_rel=='above' else 'a magnet'}.\n"
         f"- Volume has been {vol_desc}, signaling {'buyer/seller interest' if vol_desc!='steady' else 'indecision'}.\n"
         f"- $BTC is in a {btc_text} structure, {'giving altcoins a tailwind' if btc_bullish else 'adding caution'}.\n"
-        f"{'Qwen analyst note: ' + qwen_reason if qwen_reason else ''}\n\n"
+        f"{'Analyst note: ' + qwen_reason if qwen_reason else ''}\n\n"
         f"Risk‑managed levels (use exactly these numbers):\n"
         f"- Area of Interest: {entry:.6f}\n"
         f"- Technical Invalidation: {stop:.6f} ({sl_pct:.2f}%)\n"
@@ -601,11 +593,11 @@ def generate_post(coin, direction, entry, stop, tps, sl_pct, qwen_reason=""):
         "and the standard disclaimer."
     )
 
-    def call_qwen(sys_msg, usr_msg, temp=0.9):
+    def call_llama(sys_msg, usr_msg, temp=0.9):
         url = "https://api.groq.com/openai/v1/chat/completions"
         headers = {"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"}
         payload = {
-            "model": "qwen-2.5-72b",
+            "model": "llama-3.3-70b-versatile",
             "messages": [
                 {"role": "system", "content": sys_msg},
                 {"role": "user", "content": usr_msg}
@@ -621,9 +613,9 @@ def generate_post(coin, direction, entry, stop, tps, sl_pct, qwen_reason=""):
             pass
         return None
 
-    text = call_qwen(system_msg, user_prompt, 0.9)
+    text = call_llama(system_msg, user_prompt, 0.9)
     if not text or len(text) < 200:
-        text = call_qwen(system_msg, user_prompt, 1.0)
+        text = call_llama(system_msg, user_prompt, 1.0)
 
     if not text:
         hooks = [
@@ -770,7 +762,7 @@ def check_open_trades():
     save_portfolio(portfolio)
     if alerts: send_telegram("\n".join(alerts))
 
-# ========== SIGNAL GENERATION (Qwen quality filter) ==========
+# ========== SIGNAL GENERATION (Top‑20 Llama scoring) ==========
 def generate_signal(balance_usdt):
     try:
         coins_data = fetch_coingecko("https://api.coingecko.com/api/v3/coins/markets?vs_currency=usd&order=volume_desc&per_page=100&page=1")
@@ -805,11 +797,11 @@ def generate_signal(balance_usdt):
         if not all_scored: return {"action":"HOLD","reasoning":"No valid scores.","summary":""}
         all_scored_sorted = sorted(all_scored, key=lambda x: abs(x["score"]), reverse=True)
         summary = " | ".join([f"{c['symbol'].replace('USDT','')}: {c['score']:.2f}" for c in all_scored_sorted[:30]])
-        # Qwen filter on top 5
-        top5 = all_scored_sorted[:5]
+        # Take top 20 for Llama evaluation
+        top_candidates = all_scored_sorted[:20]
         best_combined = -999
         best_signal = None
-        for coin in top5:
+        for coin in top_candidates:
             if abs(coin["score"]) < 0.5: continue
             direction = "LONG" if coin["score"] >= 0 else "SHORT"
             rating, reason = evaluate_deep(coin, direction, btc_score, macro)
@@ -818,7 +810,7 @@ def generate_signal(balance_usdt):
                 best_combined = combined
                 coin["direction"] = direction
                 coin["rating"] = rating
-                coin["qwen_reason"] = reason
+                coin["llama_reason"] = reason
                 best_signal = coin
         if best_signal is None or best_combined < 1.49:
             best_all = all_scored_sorted[0] if all_scored_sorted else None
@@ -827,7 +819,7 @@ def generate_signal(balance_usdt):
                 layer_str = "; ".join([f"{k}={v:.2f}" for k,v in best_all["layers"].items()])
                 reason = (
                     f"No strong conviction. Best internal score: {best_all['score']:.2f} for {best_all['symbol']}.\n"
-                    f"Qwen filter active – no candidate passed the quality check.\n"
+                    f"Llama filter active – no candidate passed the quality check.\n"
                     f"Layers: {layer_str}\n"
                     f"Top coins: {summary}"
                 )
@@ -836,7 +828,6 @@ def generate_signal(balance_usdt):
             else:
                 reason = "No valid coins to evaluate."
             return {"action":"HOLD", "reasoning": reason, "summary": summary}
-        # Use best_signal
         coin = best_signal
         direction = coin["direction"]
         entry = coin.get("bid", coin["price"]*0.999) if direction=="LONG" else coin.get("ask", coin["price"]*1.001)
@@ -860,7 +851,7 @@ def generate_signal(balance_usdt):
             else:
                 tps.append(round(entry - m * risk_per_share, 6))
         sl_pct = abs(entry - stop)/entry*100
-        post = generate_post(coin, direction, entry, stop, tps, sl_pct, qwen_reason=coin.get("qwen_reason",""))
+        post = generate_post(coin, direction, entry, stop, tps, sl_pct, qwen_reason=coin.get("llama_reason",""))
         return {
             "action": direction,
             "symbol": coin["symbol"],
