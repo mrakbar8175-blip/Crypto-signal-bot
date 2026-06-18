@@ -2,7 +2,9 @@
 """
 Crypto Swing Bot – Top 50 liquid coins via CoinGecko, TP1 Optimized (0.5R), 5 TPs
 Signal formatting: Elite 7-angle Binance Square posts
-Moderate stop loss (0.5‑2.0%) for 4H swing trades
+Moderate stop loss (dynamic: 0.3‑2.0%) based on coin rank
+Breakeven after TP1, allows new signals on same pair
+BLACKLIST for unwanted coins (stablecoins, QUQ, etc.)
 """
 
 import requests, json, os, traceback, random
@@ -18,16 +20,23 @@ GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
 if not GROQ_API_KEY:
     print("WARNING: GROQ_API_KEY not set – AI filtering disabled.")
 
-# ========== DYNAMIC COIN LIST (CoinGecko) ==========
+# ========== BLACKLIST – COINS WE NEVER TRADE ==========
+BLACKLIST = {
+    "QUQ",       # as requested
+    "USDT", "USDC", "DAI", "BUSD", "TUSD", "USDP", "FDUSD"  # stablecoins
+}
+
+# ========== DYNAMIC COIN LIST (CoinGecko) WITH FILTERING ==========
 def fetch_top_liquid_coins(limit=50):
     """
-    Fetch top N coins by 24h trading volume (USDT pairs) using CoinGecko API.
-    Returns list of yfinance symbols like 'BTC-USD'.
+    Fetch top N coins by market cap (most liquid) using CoinGecko API.
+    Filters out blacklisted coins and returns yfinance symbols like 'BTC-USD'.
+    Also stores the coin's market cap rank for stop loss adjustment.
     """
     url = "https://api.coingecko.com/api/v3/coins/markets"
     params = {
         "vs_currency": "usd",
-        "order": "volume_desc",
+        "order": "market_cap_desc",    # most liquid coins are top by market cap
         "per_page": limit,
         "page": 1,
         "sparkline": False,
@@ -37,16 +46,22 @@ def fetch_top_liquid_coins(limit=50):
         resp = requests.get(url, params=params, timeout=15)
         data = resp.json()
         yf_symbols = []
+        global COIN_RANK    # store rank for stop‑loss logic
+        COIN_RANK = {}
+        rank = 1
         for coin in data:
             symbol = coin.get("symbol", "").upper()
-            if symbol:
-                yf_symbols.append(f"{symbol}-USD")
-        yf_symbols = list(dict.fromkeys(yf_symbols))
-        print(f"Fetched {len(yf_symbols)} coins from CoinGecko: {', '.join(yf_symbols[:10])}...")
+            if symbol and symbol not in BLACKLIST:
+                yf_sym = f"{symbol}-USD"
+                if yf_sym not in yf_symbols:   # avoid duplicates
+                    yf_symbols.append(yf_sym)
+                    COIN_RANK[yf_sym] = rank
+                    rank += 1
+        print(f"Fetched {len(yf_symbols)} coins (blacklist filtered): {', '.join(yf_symbols[:10])}...")
         return yf_symbols[:limit]
     except Exception as e:
         print(f"CoinGecko API failed: {e}. Using fallback list.")
-        return [
+        fallback = [
             "BTC-USD", "ETH-USD", "BNB-USD", "SOL-USD", "XRP-USD",
             "ADA-USD", "DOGE-USD", "DOT-USD", "MATIC-USD", "LINK-USD",
             "UNI-USD", "AVAX-USD", "LTC-USD", "FIL-USD", "TRX-USD",
@@ -57,8 +72,13 @@ def fetch_top_liquid_coins(limit=50):
             "AAVE-USD", "MKR-USD", "SNX-USD", "CRV-USD", "COMP-USD",
             "ZEC-USD", "BAT-USD", "ENJ-USD", "CHZ-USD", "HOT-USD",
             "KSM-USD", "DASH-USD", "CELO-USD", "QTUM-USD", "IOST-USD"
-        ][:limit]
+        ]
+        # Assign ranks to fallback
+        global COIN_RANK
+        COIN_RANK = {sym: i+1 for i, sym in enumerate(fallback)}
+        return fallback[:limit]
 
+COIN_RANK = {}   # will be populated by fetch_top_liquid_coins
 CRYPTO_PAIRS = fetch_top_liquid_coins(50)
 print(f"Trading universe: {len(CRYPTO_PAIRS)} coins")
 
@@ -119,7 +139,7 @@ def initialize_trade_files():
                              "TP1","TP2","TP3","TP4","TP5","score","ai_approved"])
     init_csv(OPEN_TRADES_CSV, ["timestamp","symbol","action","entry","stop",
                                "TP1","TP2","TP3","TP4","TP5","status",
-                               "quantity","original_qty","highest_tp"])
+                               "quantity","original_qty","highest_tp","breakeven"])
     init_csv(TRADE_RESULTS_CSV, ["timestamp","symbol","action","entry","stop",
                                  "TP1","TP2","TP3","TP4","TP5","status",
                                  "hit_level","close_time","exit_price","quantity","pnl"])
@@ -156,7 +176,8 @@ def add_open_trade(sig):
         "status": "open",
         "quantity": sig["quantity"],
         "original_qty": sig["quantity"],
-        "highest_tp": -1
+        "highest_tp": -1,
+        "breakeven": False
     }
     append_csv(OPEN_TRADES_CSV, pd.DataFrame([row]))
 
@@ -425,19 +446,23 @@ def ai_confirm_trade(signal_dict):
         pass
     return True
 
-# ========== SIGNAL GENERATION (TPs: 0.5/1/2/3/5R) ==========
+# ========== SIGNAL GENERATION (DYNAMIC STOP LOSS) ==========
 def generate_signal():
-    open_symbols = set()
+    open_symbols_risky = set()
     try:
         open_df = pd.read_csv(OPEN_TRADES_CSV)
         if not open_df.empty:
-            open_symbols = set(open_df["symbol"].values)
+            if "breakeven" in open_df.columns:
+                risky = open_df[open_df["breakeven"] == False]
+            else:
+                risky = open_df
+            open_symbols_risky = set(risky["symbol"].values)
     except:
         pass
 
     candidates = []
     for pair in CRYPTO_PAIRS:
-        if pair in open_symbols:
+        if pair in open_symbols_risky:
             continue
         score, direction, price, atr_val, swing_level = score_pair(pair)
         if direction and score >= 6.5:
@@ -450,10 +475,16 @@ def generate_signal():
     best = candidates[0]
     pair, score, direction, price, atr_val, swing_level = best
 
-    # === MODERATE STOP LOSS (0.5%–2.0%) ===
-    min_stop_pct = 0.005   # 0.5%
-    max_stop_pct = 0.02    # 2.0%
-    raw_stop = atr_val * 1.5   # use 1.5× ATR for more room
+    # ----- DYNAMIC STOP LOSS BASED ON RANK -----
+    rank = COIN_RANK.get(pair, 99)
+    if rank <= 10:          # Top 10 most liquid
+        min_stop_pct = 0.003   # 0.3%
+        max_stop_pct = 0.015   # 1.5%
+    else:                   # Other coins
+        min_stop_pct = 0.005   # 0.5%
+        max_stop_pct = 0.02    # 2.0%
+
+    raw_stop = atr_val * 1.5
     min_stop = price * min_stop_pct
     max_stop = price * max_stop_pct
     stop_distance = np.clip(raw_stop, min_stop, max_stop)
@@ -500,7 +531,7 @@ def generate_signal():
     signal["ai_approved"] = True
     return signal
 
-# ========== TRADE MANAGEMENT (ALERTS STILL HERE) ==========
+# ========== TRADE MANAGEMENT (BREAKEVEN AFTER TP1) ==========
 def check_open_trades():
     try:
         open_df = pd.read_csv(OPEN_TRADES_CSV)
@@ -513,9 +544,14 @@ def check_open_trades():
     else:
         open_df = open_df.drop_duplicates(subset="symbol", keep="last")
 
-    for col in ["highest_tp", "quantity", "original_qty"]:
+    for col in ["highest_tp", "quantity", "original_qty", "breakeven"]:
         if col not in open_df.columns:
-            open_df[col] = 0.0 if col != "highest_tp" else -1
+            if col == "breakeven":
+                open_df[col] = False
+            elif col == "highest_tp":
+                open_df[col] = -1
+            else:
+                open_df[col] = 0.0
 
     results = []
     still_open = []
@@ -530,6 +566,7 @@ def check_open_trades():
         stop_orig = float(trade["stop"])
         original_qty = float(trade.get("original_qty", trade.get("quantity", 0)))
         remaining_qty = float(trade.get("quantity", original_qty))
+        breakeven = trade.get("breakeven", False)
 
         tps = [float(trade[f"TP{i+1}"]) for i in range(5)]
 
@@ -545,12 +582,14 @@ def check_open_trades():
             continue
 
         highest_tp_idx = int(trade.get("highest_tp", -1))
-        current_stop = entry if highest_tp_idx >= 0 else stop_orig
+        # current stop: entry if already breakeven, else the original stop
+        current_stop = entry if breakeven else stop_orig
 
         for candle_time, candle in df_1h.iterrows():
             high = candle['High']
             low = candle['Low']
 
+            # Check take profit hits
             new_tp_idx = None
             if direction == "LONG":
                 for i in range(len(tps)-1, -1, -1):
@@ -585,6 +624,8 @@ def check_open_trades():
                         remaining_qty -= exit_qty
                         highest_tp_idx = i
                         if i == 0:
+                            # TP1 hit -> set breakeven, move SL to entry
+                            breakeven = True
                             current_stop = entry
                     alerts.append(f"🚀 {sym} {direction} TP{i+1} hit — {fraction*100:.0f}% closed, SL to BE")
                     send_closed_trade_chart(trade, f"TP{i+1}", exit_price, pnl, remaining_qty)
@@ -592,13 +633,18 @@ def check_open_trades():
                 if remaining_qty <= 0:
                     break
 
+            # Check stop loss (only if still open)
             if remaining_qty > 0:
                 sl_hit = (low <= current_stop) if direction == "LONG" else (high >= current_stop)
                 if sl_hit:
                     exit_price = current_stop
                     pnl = (exit_price - entry) * remaining_qty if direction == "LONG" else (entry - exit_price) * remaining_qty
                     final = trade.to_dict()
-                    desc = "STOP LOSS" if highest_tp_idx == -1 else f"STOP LOSS after TP{highest_tp_idx+1}"
+                    if breakeven:
+                        desc = "BREAKEVEN STOP"
+                        pnl = 0.0   # force zero pnl when stopped at entry
+                    else:
+                        desc = "STOP LOSS" if highest_tp_idx == -1 else f"STOP LOSS after TP{highest_tp_idx+1}"
                     final["hit_level"] = desc
                     final["close_time"] = now.strftime("%Y-%m-%d %H:%M:%S")
                     final["exit_price"] = exit_price
@@ -614,6 +660,7 @@ def check_open_trades():
         if remaining_qty > 0:
             trade["highest_tp"] = highest_tp_idx
             trade["quantity"] = remaining_qty
+            trade["breakeven"] = breakeven
             still_open.append(trade)
 
     if results:
