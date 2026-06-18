@@ -47,66 +47,53 @@ TRADE_LOG_CSV = "trade_log.csv"
 OPEN_TRADES_CSV = "open_trades.csv"
 TRADE_RESULTS_CSV = "trade_results.csv"
 
-# ========== KRAKEN DATA FETCH ==========
-KRAKEN_SYMBOL_MAP = {
-    "BTCUSDT": "XBTUSDT",
-    "BCHUSDT": "BCHUSDT",
-    "ETHUSDT": "ETHUSDT",
-    "XRPUSDT": "XRPUSDT",
-    "DOTUSDT": "DOTUSDT",
-    "SOLUSDT": "SOLUSDT",
-    "ADAUSDT": "ADAUSDT",
-    "LTCUSDT": "LTCUSDT",
-    "DOGEUSDT": "DOGEUSDT",
-    "LINKUSDT": "LINKUSDT",
-    "FILUSDT": "FILUSDT",
-    "AVAXUSDT": "AVAXUSDT",
-    "BNBUSDT": "BNBUSDT",
-    "XLMUSDT": "XLMUSDT",
-    "TRXUSDT": "TRXUSDT",
-    "NEARUSDT": "NEARUSDT",
-    "AAVEUSDT": "AAVEUSDT",
-    "INJUSDT": "INJUSDT",
-    "ZECUSDT": "ZECUSDT",
-}
+# ========== BINANCE DATA FETCH ==========
+def get_binance_klines(symbol_usdt, interval='4h', days=60, start=None, end=None):
+    """
+    Fetch OHLC candles from Binance public API.
+    No API key required.
+    """
+    interval_map = {'1h': '1h', '4h': '4h', '1d': '1d'}
+    binance_interval = interval_map.get(interval, '4h')
+    symbol = symbol_usdt.upper()   # e.g., BTCUSDT
 
-def get_kraken_klines(symbol_usdt, interval='240', days=10):
-    kraken_symbol = KRAKEN_SYMBOL_MAP.get(symbol_usdt, symbol_usdt)
-    end_dt = datetime.now()
-    start_dt = end_dt - timedelta(days=days)
-    since = int(start_dt.timestamp())
-    url = f"https://api.kraken.com/0/public/OHLC?pair={kraken_symbol}&interval={interval}&since={since}"
+    # Determine time range
+    if start is None and days is not None:
+        end_dt = datetime.now()
+        start_dt = end_dt - timedelta(days=days)
+    elif start is not None:
+        start_dt = start
+        end_dt = end if end is not None else datetime.now()
+    else:
+        end_dt = datetime.now()
+        start_dt = end_dt - timedelta(days=60)
+
+    start_ts = int(start_dt.timestamp() * 1000)
+    end_ts = int(end_dt.timestamp() * 1000)
+
+    url = f"https://api.binance.com/api/v3/klines?symbol={symbol}&interval={binance_interval}&startTime={start_ts}&endTime={end_ts}&limit=1000"
     try:
         resp = requests.get(url, timeout=10)
         if resp.status_code != 200:
             return pd.DataFrame()
         data = resp.json()
-        if data.get("error") and data["error"]:
+        if not data:
             return pd.DataFrame()
-        result = data.get("result")
-        if not result:
-            return pd.DataFrame()
-        pair_key = list(result.keys())[0]
-        ohlc_list = result[pair_key]
-        if not ohlc_list:
-            return pd.DataFrame()
-        df = pd.DataFrame(ohlc_list, columns=[
-            "time", "open", "high", "low", "close", "vwap", "volume", "count"
+        df = pd.DataFrame(data, columns=[
+            'timestamp','open','high','low','close','volume',
+            'close_time','quote_vol','trades','taker_buy_base','taker_buy_quote','ignore'
         ])
-        df["time"] = pd.to_datetime(df["time"].astype(float), unit='s')
-        df.set_index("time", inplace=True)
-        for col in ["open", "high", "low", "close", "volume"]:
+        df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
+        df.set_index('timestamp', inplace=True)
+        for col in ['open','high','low','close','volume']:
             df[col] = pd.to_numeric(df[col])
-        df = df[["open", "high", "low", "close", "volume"]]
-        df.columns = ["Open", "High", "Low", "Close", "Volume"]
+        df = df[['open','high','low','close','volume']]
+        df.columns = ['Open','High','Low','Close','Volume']
         return df
     except:
         return pd.DataFrame()
 
-def get_4h_klines(symbol_usdt, days=10):
-    return get_kraken_klines(symbol_usdt, interval='240', days=days)
-
-# ========== COINGECKO MACRO BIAS ==========
+# ========== MACRO BIAS (CoinGecko – used for BTC context only) ==========
 def fetch_coingecko(url, retries=2):
     for attempt in range(retries):
         try:
@@ -253,7 +240,6 @@ def get_atr(df, current_price):
         return current_price * 0.02
 
 def trend_strength_score(df, direction):
-    """EMA50 slope + ADX, returns -1..+1"""
     try:
         n = len(df)
         if n < 20:
@@ -270,7 +256,6 @@ def trend_strength_score(df, direction):
             slope_up = True
         price_above = current > ema_now
 
-        # ADX
         period = 14
         dm_plus = highs.diff()
         dm_minus = -lows.diff()
@@ -302,14 +287,12 @@ def trend_strength_score(df, direction):
         return 0
 
 def sustained_momentum_score(df, direction):
-    """6‑period and 12‑period ROC combined"""
     try:
         if len(df) < 13:
             return 0
         closes = df['Close']
         roc6 = (closes.iloc[-1] / closes.iloc[-7] - 1) * 100
         roc12 = (closes.iloc[-1] / closes.iloc[-13] - 1) * 100
-        # Scale: 2% change = 1.0
         score6 = max(-1.0, min(1.0, roc6 / 2.0))
         score12 = max(-1.0, min(1.0, roc12 / 2.0))
         combined = score6 * 0.6 + score12 * 0.4
@@ -321,7 +304,6 @@ def sustained_momentum_score(df, direction):
         return 0
 
 def volume_expansion_score(df, direction):
-    """Compare avg volume of last 12 candles to last 48 candles"""
     try:
         if len(df) < 48:
             return 0
@@ -330,10 +312,8 @@ def volume_expansion_score(df, direction):
         if long_vol == 0:
             return 0
         ratio = short_vol / long_vol
-        # Normalise: 1.0 means equal, >1 means expansion
-        expansion = (ratio - 1) * 2   # 1.5 ratio -> 1.0
+        expansion = (ratio - 1) * 2
         expansion = max(-1.0, min(1.0, expansion))
-        # Only positive if the last candle confirms direction
         last = df.iloc[-1]
         if direction == "LONG":
             if last['Close'] > last['Open']:
@@ -349,7 +329,6 @@ def volume_expansion_score(df, direction):
         return 0
 
 def breakout_candle_score(df, direction, atr):
-    """Body > 1.5*ATR and close near extreme = potential breakout"""
     try:
         if df.empty:
             return 0
@@ -374,7 +353,6 @@ def breakout_candle_score(df, direction, atr):
         return 0
 
 def relative_strength_score(df, direction, btc_df):
-    """Coin outperformance vs BTC over last 12 candles"""
     try:
         if df.empty or len(df) < 13 or btc_df.empty or len(btc_df) < 13:
             return 0
@@ -394,7 +372,7 @@ def score_coin(symbol, price, volume, macro_bias, coin_data_cache, btc_df):
         if symbol in coin_data_cache:
             df = coin_data_cache[symbol]
         else:
-            df = get_4h_klines(symbol, days=14)   # 14 days = 84 candles for EMA50
+            df = get_binance_klines(symbol, interval='4h', days=14)
             coin_data_cache[symbol] = df
 
         if df.empty or len(df) < 48:
@@ -416,15 +394,13 @@ def score_coin(symbol, price, volume, macro_bias, coin_data_cache, btc_df):
 
         core = (0.30 * trend + 0.25 * mom + 0.20 * vol + 0.15 * brk + 0.10 * rs)
 
-        # Stronger macro multiplier for TP5
         if core >= 0:
-            macro_mult = 1.0 + 0.5 * macro_bias   # macro bias now has a bigger impact
+            macro_mult = 1.0 + 0.5 * macro_bias
         else:
             macro_mult = 1.0 - 0.5 * macro_bias
 
         total = core * macro_mult
 
-        # Alignment bonus: if all 5 layers agree
         signs = [1 if s > 0.2 else (-1 if s < -0.2 else 0) for s in [trend, mom, vol, brk, rs]]
         aligned = sum(1 for s in signs if (direction == "LONG" and s == 1) or (direction == "SHORT" and s == -1))
         if aligned >= 4:
@@ -513,7 +489,7 @@ def generate_post(coin, direction, entry, stop, tps, sl_pct, qwen_reason=""):
 
     recent_candles = ""
     try:
-        df = get_4h_klines(sym, days=2)
+        df = get_binance_klines(sym, interval='4h', days=2)
         if not df.empty:
             last_candles = df.tail(6)
             candle_list = []
@@ -632,7 +608,7 @@ def check_open_trades():
             tps = []
             for i in range(1,6):
                 tps.append(float(trade[f"TP{i}"]))
-            df_1h = get_kraken_klines(sym, interval='60', days=3)
+            df_1h = get_binance_klines(sym, interval='1h', days=3)
             if df_1h.empty: still_open.append(trade); continue
             current_stop = entry if highest_tp_idx >= 0 else stop_orig
             full_close_data = None
@@ -759,7 +735,7 @@ def generate_signal(balance_usdt):
         if not candidates: return {"action":"HOLD","reasoning":"No liquid coins.","summary":""}
         macro_bias = get_macro_bias()
         coin_data_cache = {}
-        btc_df = get_4h_klines("BTCUSDT", days=14)
+        btc_df = get_binance_klines("BTCUSDT", interval='4h', days=14)
         all_scored = []
         for coin in candidates:
             total, layers, trend_dir, atr = score_coin(coin["symbol"], coin["price"], coin["volume"], macro_bias, coin_data_cache, btc_df)
@@ -800,7 +776,7 @@ def generate_signal(balance_usdt):
         direction = coin["direction"]
         entry = coin.get("bid", coin["price"]*0.999) if direction=="LONG" else coin.get("ask", coin["price"]*1.001)
         atr = coin["atr"]
-        df_1h_recent = get_kraken_klines(coin["symbol"], interval='60', days=1)
+        df_1h_recent = get_binance_klines(coin["symbol"], interval='1h', days=1)
         confirm = False
         if not df_1h_recent.empty:
             last_candle = df_1h_recent.iloc[-1]
@@ -840,7 +816,7 @@ def generate_signal(balance_usdt):
 def send_trade_chart(signal, title_suffix=""):
     try:
         import matplotlib; matplotlib.use('Agg'); import matplotlib.pyplot as plt; import mplfinance as mpf
-        sym = signal['symbol']; df = get_4h_klines(sym, days=10)
+        sym = signal['symbol']; df = get_binance_klines(sym, interval='4h', days=10)
         if df.empty: return
         style = mpf.make_mpf_style(base_mpf_style='nightclouds', facecolor='#000000', gridcolor='#2a2e39',
                                    rc={'axes.labelcolor':'white','xtick.color':'white','ytick.color':'white','axes.titlecolor':'white'})
