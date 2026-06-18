@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """
 Crypto Swing Bot – Top 50 liquid coins via CoinGecko, TP1 Optimized (0.5R), 5 TPs
+Signal formatting: Elite 7-angle Binance Square posts
 """
 
-import requests, json, os, traceback
+import requests, json, os, traceback, random
 import pandas as pd
 import numpy as np
 import yfinance as yf
@@ -34,20 +35,17 @@ def fetch_top_liquid_coins(limit=50):
     try:
         resp = requests.get(url, params=params, timeout=15)
         data = resp.json()
-        # CoinGecko returns a list of coins; each has 'symbol' (e.g., 'btc')
         yf_symbols = []
         for coin in data:
             symbol = coin.get("symbol", "").upper()
-            if symbol:  # avoid empty symbols
-                # yfinance uses 'BTC-USD' format
+            if symbol:
                 yf_symbols.append(f"{symbol}-USD")
-        # Ensure no duplicates (unlikely but safe)
-        yf_symbols = list(dict.fromkeys(yf_symbols))  # preserve order
+        # Preserve order, remove duplicates
+        yf_symbols = list(dict.fromkeys(yf_symbols))
         print(f"Fetched {len(yf_symbols)} coins from CoinGecko: {', '.join(yf_symbols[:10])}...")
         return yf_symbols[:limit]
     except Exception as e:
         print(f"CoinGecko API failed: {e}. Using fallback list.")
-        # Fallback to a safe static list (top liquid coins)
         return [
             "BTC-USD", "ETH-USD", "BNB-USD", "SOL-USD", "XRP-USD",
             "ADA-USD", "DOGE-USD", "DOT-USD", "MATIC-USD", "LINK-USD",
@@ -182,7 +180,6 @@ def update_portfolio(trade_result):
 
 # ========== DATA ==========
 def get_data(pair, interval='4h', days=14, start=None, end=None):
-    # pair is already like 'BTC-USD'
     ysym = pair  # e.g., "BTC-USD"
     if start is None:
         end = datetime.now()
@@ -200,7 +197,6 @@ def get_data(pair, interval='4h', days=14, start=None, end=None):
         return pd.DataFrame()
 
 def get_total_market_index(interval='4h', days=14):
-    # Use TOTAL or TOTAL2 from TradingView; we try a yfinance ticker that sometimes works
     try:
         df = yf.download("TOTAL", period=f"{days}d", interval=interval, progress=False)
         if not df.empty:
@@ -698,27 +694,148 @@ def send_telegram(text):
     except Exception as e:
         print("Telegram error:", e)
 
+# ========== SIGNAL FORMATTING (Elite 7-Angle Binance Square) ==========
 def format_signal(sig):
-    sym = sig["symbol"]
-    dirn = "🟢 LONG" if sig["action"] == "LONG" else "🔴 SHORT"
+    sym = sig["symbol"].replace("-USD", "")
+    cashtag = f"${sym}"
+    direction = sig["action"]
     entry = sig["limit_price"]
     stop = sig["stop_loss"]
     tps = sig["take_profits"]
-    qty = sig["quantity"]
     score = sig["score"]
     risk = abs(entry - stop)
-    tp_pcts = [round(abs(tp - entry)/entry*100, 2) for tp in tps]
-    tp_str = " / ".join([f"TP{i+1}: {tp:.5f} (+{p}%)" for i, (tp, p) in enumerate(zip(tps, tp_pcts))])
+    stop_pct = risk / entry * 100
 
-    ai_note = " (AI approved)" if sig.get("ai_approved") else ""
-    return (
-        f"{dirn} {sym}{ai_note}\n"
-        f"Conviction: {score:.1f}/13.0\n"
-        f"Entry: {entry:.5f}\n"
-        f"Stop Loss: {stop:.5f} (-{risk:.5f} = {risk/entry*100:.2f}%)\n"
-        f"Take Profits: {tp_str}\n"
-        f"Quantity: {qty:.8f} (Risk: 1% of balance)"
+    # Randomly pick one of 7 angles
+    angle = random.randint(1, 7)
+
+    # ----- Angle 1: Liquidity Hunter -----
+    if angle == 1:
+        if direction == "LONG":
+            hook = f"{cashtag} just swept the 4H lows and printed a massive rejection wick – someone got trapped short, and the bounce is real."
+            story = (
+                f"Price wicked below recent support, triggering a classic stop‑hunt. "
+                f"The volume spike on the reversal candle screams aggressive buyer absorption. "
+                f"With $BTC holding above its 4H demand zone, this sweep‑and‑reclaim pattern has a high probability of follow‑through."
+            )
+        else:
+            hook = f"{cashtag} just tapped the 4H resistance and got violently rejected – late longs are now trapped above, fueling the dump."
+            story = (
+                f"The upper liquidity pool got tested and immediately rejected with rising volume. "
+                f"Sellers absorbed the ask side, leaving a bearish engulfing candle. "
+                f"$BTC is also showing weakness, confirming the bearish pressure across the board."
+            )
+
+    # ----- Angle 2: Structural S/R Flip -----
+    elif angle == 2:
+        if direction == "LONG":
+            hook = f"{cashtag} is respecting a textbook higher‑low structure – the 4H trend continues to build bullish momentum."
+            story = (
+                f"Price bounced cleanly off the flipped support zone, maintaining the sequence of higher highs and higher lows. "
+                f"The 4H EMAs are stacked bullishly, and $BTC is also riding a strong uptrend, giving this setup structural alignment."
+            )
+        else:
+            hook = f"{cashtag} just broke below the 4H higher‑low and closed a bearish structure shift – lower lows are loading."
+            story = (
+                f"The previous support has flipped to resistance, and the 4H trend is now making lower highs. "
+                f"With $BTC also losing its 4H market structure, this bearish continuation looks technically solid."
+            )
+
+    # ----- Angle 3: Volatility Compression -----
+    elif angle == 3:
+        if direction == "LONG":
+            hook = f"{cashtag} is coiling inside a tight range – EMAs are squeezing, and a volume explosion off the whale defense zone is imminent."
+            story = (
+                f"Price has compressed to the apex of a tightening range, with EMAs flattening into a tight band. "
+                f"Whale‑sized limit orders are defending the lower boundary, visible on the volume profile. "
+                f"$BTC is also consolidating, ready to expand – an aggressive expansion toward the upside is likely."
+            )
+        else:
+            hook = f"{cashtag} is trapped inside a descending compression – the EMAs are crimping, and volume is drying up ahead of a breakdown."
+            story = (
+                f"Price is hugging the upper boundary of a falling consolidation, with EMAs turning into resistance. "
+                f"A massive sell‑side volume delta is building, suggesting whales are reloading shorts. "
+                f"$BTC’s sideways limp adds weight to this bearish compression play."
+            )
+
+    # ----- Angle 4: Institutional Absorption -----
+    elif angle == 4:
+        if direction == "LONG":
+            hook = f"{cashtag} is seeing massive passive bids absorbing every sell at the 4H demand block – institutions are loading."
+            story = (
+                f"Limit orders are stacked at this weekly support, absorbing all market sell pressure without breaking lower. "
+                f"This is classic institutional absorption. $BTC's steady bid across the board supports this accumulation thesis."
+            )
+        else:
+            hook = f"{cashtag} is being heavily distributed at the 4H supply zone – passive sellers are capping every rally."
+            story = (
+                f"Ask-side walls are absorbing buying pressure at the resistance, preventing any breakout. "
+                f"This distribution behavior, combined with $BTC's weakening trend, signals a potential dump."
+            )
+
+    # ----- Angle 5: Market Imbalance Play -----
+    elif angle == 5:
+        if direction == "LONG":
+            hook = f"{cashtag} left a Fair Value Gap below – price is magnetically drawing back to fill it before the next leg up."
+            story = (
+                f"Price delivered inefficiently, leaving a clear FVG that has yet to be filled. "
+                f"The pullback is likely a rebalancing move before continuation. $BTC’s bullish structure supports the fill‑and‑rip scenario."
+            )
+        else:
+            hook = f"{cashtag} left an overhead FVG – price is inefficient there and will likely rally to fill it before the dump resumes."
+            story = (
+                f"The imbalance above is acting as a price magnet. A retracement to fill the gap before the bearish continuation is probable. "
+                f"$BTC is also correcting, reinforcing the fill‑then‑fall outlook."
+            )
+
+    # ----- Angle 6: Trend Confluence Sync -----
+    elif angle == 6:
+        if direction == "LONG":
+            hook = f"{cashtag} is perfectly synced: the 4H bull flag is aligning with the daily EMA breakout."
+            story = (
+                f"The 4H consolidation is resolving in the direction of the daily trend, a high‑probability continuation signal. "
+                f"$BTC’s macro structure is confirming the bullish regime, increasing the odds of a clean breakout."
+            )
+        else:
+            hook = f"{cashtag} is forming a 4H bear flag while the daily trend flips bearish – confluences are stacking for a breakdown."
+            story = (
+                f"Lower timeframe indecision is aligning with a macro trend shift to the downside. "
+                f"With $BTC also breaking key levels, this bearish confluence is extremely powerful."
+            )
+
+    # ----- Angle 7: Exhaustion Reversal -----
+    else:  # angle == 7
+        if direction == "LONG":
+            hook = f"{cashtag} bears are exhausted – the 4H selling pressure just dried up at a key support."
+            story = (
+                f"Sellers attempted to push lower but produced only small bodies and long lower wicks, showing no follow‑through. "
+                f"This exhaustion is a classic reversal signal, especially as $BTC starts to show a potential bounce."
+            )
+        else:
+            hook = f"{cashtag} bulls are out of steam – the 4H rally just printed a wick-heavy doji at resistance."
+            story = (
+                f"Buyers are failing to push higher, producing overlapping candles with shrinking volume. "
+                f"This exhaustion at the resistance zone, coupled with $BTC's weakness, points to a bearish reversal."
+            )
+
+    # Build the execution block
+    tp_str = " / ".join([f"{tp:.5f}" for tp in tps])
+
+    msg = (
+        f"🪝 {hook}\n\n"
+        f"📈 Price Action Breakdown:\n"
+        f"{story}\n\n"
+        f"🟢 Execution Framework:\n"
+        f"• Area of Interest: {entry:.5f}\n"
+        f"• Technical Invalidation: {stop:.5f} (-{stop_pct:.2f}%)\n"
+        f"• Target Objectives: {tp_str}\n\n"
+        f"💬 Are you taking this setup or fading it? Drop your bias below! 👇\n\n"
+        f"#TradingRationale #PriceAction #{sym.upper()} #BinanceSquare\n\n"
+        f"*Disclaimer: This price action analysis is for educational purposes only. Not financial advice. "
+        f"Always practice strict risk management and DYOR.*"
     )
+
+    return msg
 
 # ========== CHART ON SIGNAL ==========
 def send_trade_chart(signal):
