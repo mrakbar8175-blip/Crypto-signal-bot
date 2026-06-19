@@ -6,6 +6,7 @@ Elite 20-angle Binance Square signal formatting.
 Breakeven after TP1, allows new signals on same pair.
 BLACKLIST for stablecoins & QUQ. HOLD shows scores & layer breakdown.
 Alert messages now persist across runs (workflow commits files).
+Notifications via Discord webhook.
 """
 
 import requests, json, os, traceback, random, math
@@ -15,8 +16,7 @@ import yfinance as yf
 from datetime import datetime, timedelta
 
 # ========== ENVIRONMENT ==========
-TELEGRAM_TOKEN = os.environ["TELEGRAM_TOKEN"]
-CHAT_ID = os.environ["CHAT_ID"]
+DISCORD_WEBHOOK_URL = os.environ["DISCORD_WEBHOOK_URL"]
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
 if not GROQ_API_KEY:
     print("WARNING: GROQ_API_KEY not set – AI filtering disabled.")
@@ -228,7 +228,7 @@ def support_resistance_levels(df, lookback=20):
     recent = df.tail(lookback)
     return recent['High'].max(), recent['Low'].min()
 
-# ========== SCORING (same as before, with failure reporting) ==========
+# ========== SCORING ==========
 def score_pair(pair):
     layers = {}
     df_d = get_data(pair, interval='1d', days=90)
@@ -326,7 +326,7 @@ def ai_confirm_trade(signal_dict):
     except: pass
     return True
 
-# ========== SIGNAL GENERATION (wider stop) ==========
+# ========== SIGNAL GENERATION ==========
 def generate_signal():
     open_symbols_risky = set()
     try:
@@ -376,6 +376,26 @@ def generate_signal():
         return None, top5, top_layers
     signal["ai_approved"] = True
     return signal, top5, top_layers
+
+# ========== DISCORD HELPERS ==========
+def send_discord_message(text):
+    """Send a plain text message to the Discord webhook."""
+    try:
+        requests.post(DISCORD_WEBHOOK_URL, json={"content": text}, timeout=10)
+    except Exception as e:
+        print("Discord send error:", e)
+
+def send_discord_image(image_path, caption=None):
+    """Send an image file to Discord webhook with optional caption."""
+    try:
+        with open(image_path, 'rb') as img:
+            files = {'file': img}
+            payload = {}
+            if caption:
+                payload['content'] = caption
+            requests.post(DISCORD_WEBHOOK_URL, data=payload, files=files, timeout=15)
+    except Exception as e:
+        print("Discord image send error:", e)
 
 # ========== TRADE MANAGEMENT ==========
 def check_open_trades():
@@ -456,7 +476,7 @@ def check_open_trades():
     save_portfolio(portfolio)
     if alerts:
         print("ALERTS:", alerts)
-        send_telegram("Crypto trade updates:\n" + "\n".join(alerts))
+        send_discord_message("Crypto trade updates:\n" + "\n".join(alerts))
     else: print("No trade closures this run.")
 
 def send_closed_trade_chart(trade, hit_level, exit_price, pnl, remaining_qty):
@@ -481,17 +501,11 @@ def send_closed_trade_chart(trade, hit_level, exit_price, pnl, remaining_qty):
         ax.legend(loc='upper left', facecolor='#000000', edgecolor='white', labelcolor='white')
         chart_path = f"{sym}_close_{datetime.now().strftime('%Y%m%d_%H%M%S')}.png"
         fig.savefig(chart_path, dpi=150, bbox_inches='tight', facecolor='black'); plt.close(fig)
-        url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendPhoto"
-        with open(chart_path,'rb') as img: requests.post(url, data={'chat_id':CHAT_ID}, files={'photo':img})
+        send_discord_image(chart_path, caption=f"Trade closed: {sym} {direction} – {hit_level} (PnL: {pnl:.2f}$)")
         os.remove(chart_path)
     except Exception as e: print(f"Closed trade chart error: {e}")
 
-# ========== TELEGRAM ==========
-def send_telegram(text):
-    try: requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage", data={"chat_id":CHAT_ID,"text":text}, timeout=10)
-    except Exception as e: print("Telegram error:", e)
-
-# ========== 20-ANGLE SIGNAL FORMATTING ==========
+# ========== SIGNAL FORMATTING (20-angle) ==========
 def format_signal(sig):
     sym = sig["symbol"].replace("-USD", "")
     cashtag = f"${sym}"
@@ -504,7 +518,6 @@ def format_signal(sig):
 
     angle = random.randint(1, 20)
 
-    # Angle 1: Liquidity Sweep
     if angle == 1:
         if direction == "LONG":
             hook = f"{cashtag} just swept the 4H lows and printed a massive rejection wick – someone got trapped short, and the bounce is real."
@@ -516,7 +529,6 @@ def format_signal(sig):
             story = (f"The upper liquidity pool got tested and immediately rejected with rising volume. "
                      f"Sellers absorbed the ask side, leaving a bearish engulfing candle. "
                      f"$BTC is also showing weakness, confirming the bearish pressure across the board.")
-    # Angle 2: Structural S/R Flip
     elif angle == 2:
         if direction == "LONG":
             hook = f"{cashtag} is respecting a textbook higher‑low structure – the 4H trend continues to build bullish momentum."
@@ -526,7 +538,6 @@ def format_signal(sig):
             hook = f"{cashtag} just broke below the 4H higher‑low and closed a bearish structure shift – lower lows are loading."
             story = (f"The previous support has flipped to resistance, and the 4H trend is now making lower highs. "
                      f"With $BTC also losing its 4H market structure, this bearish continuation looks technically solid.")
-    # Angle 3: Volatility Squeeze
     elif angle == 3:
         if direction == "LONG":
             hook = f"{cashtag} is coiling inside a tight range – EMAs are squeezing, and a volume explosion off the whale defense zone is imminent."
@@ -538,7 +549,6 @@ def format_signal(sig):
             story = (f"Price is hugging the upper boundary of a falling consolidation, with EMAs turning into resistance. "
                      f"A massive sell‑side volume delta is building, suggesting whales are reloading shorts. "
                      f"$BTC’s sideways limp adds weight to this bearish compression play.")
-    # Angle 4: Institutional Demand
     elif angle == 4:
         if direction == "LONG":
             hook = f"{cashtag} is seeing massive passive bids absorbing every sell at the 4H demand block – institutions are loading."
@@ -548,7 +558,6 @@ def format_signal(sig):
             hook = f"{cashtag} is being heavily distributed at the 4H supply zone – passive sellers are capping every rally."
             story = (f"Ask-side walls are absorbing buying pressure at the resistance, preventing any breakout. "
                      f"This distribution behavior, combined with $BTC's weakening trend, signals a potential dump.")
-    # Angle 5: Imbalance Play (FVG)
     elif angle == 5:
         if direction == "LONG":
             hook = f"{cashtag} left a Fair Value Gap below – price is magnetically drawing back to fill it before the next leg up."
@@ -558,7 +567,6 @@ def format_signal(sig):
             hook = f"{cashtag} left an overhead FVG – price is inefficient there and will likely rally to fill it before the dump resumes."
             story = (f"The imbalance above is acting as a price magnet. A retracement to fill the gap before the bearish continuation is probable. "
                      f"$BTC is also correcting, reinforcing the fill‑then‑fall outlook.")
-    # Angle 6: Timeframe Confluence
     elif angle == 6:
         if direction == "LONG":
             hook = f"{cashtag} is perfectly synced: the 4H bull flag is aligning with the daily EMA breakout."
@@ -568,7 +576,6 @@ def format_signal(sig):
             hook = f"{cashtag} is forming a 4H bear flag while the daily trend flips bearish – confluences are stacking for a breakdown."
             story = (f"Lower timeframe indecision is aligning with a macro trend shift to the downside. "
                      f"With $BTC also breaking key levels, this bearish confluence is extremely powerful.")
-    # Angle 7: Exhaustion Reversal
     elif angle == 7:
         if direction == "LONG":
             hook = f"{cashtag} bears are exhausted – the 4H selling pressure just dried up at a key support."
@@ -578,7 +585,6 @@ def format_signal(sig):
             hook = f"{cashtag} bulls are out of steam – the 4H rally just printed a wick-heavy doji at resistance."
             story = (f"Buyers are failing to push higher, producing overlapping candles with shrinking volume. "
                      f"This exhaustion at the resistance zone, coupled with $BTC's weakness, points to a bearish reversal.")
-    # Angle 8: Wyckoff Shakeout
     elif angle == 8:
         if direction == "LONG":
             hook = f"{cashtag} just executed a textbook Wyckoff Spring – a fake breakdown below support that got instantly reclaimed."
@@ -588,7 +594,6 @@ def format_signal(sig):
             hook = f"{cashtag} is showing an Upthrust pattern – a fake breakout above resistance that's reversing sharply."
             story = (f"Buyers trapped above the breakout level are now underwater. The rapid rejection signifies distribution. "
                      f"With $BTC also weakening, this Upthrust is a high‑probability short setup.")
-    # Angle 9: Failed Breakdown Trap
     elif angle == 9:
         if direction == "LONG":
             hook = f"{cashtag} broke below a key 4H level, but the breakout failed — a massive bear trap is now fueling the reversal."
@@ -600,7 +605,6 @@ def format_signal(sig):
             story = (f"The false breakout above resistance trapped breakout longs. "
                      f"Price collapsed back below the level, triggering stops. "
                      f"$BTC’s weakness confirms the distribution bias.")
-    # Angle 10: Volume Profile POC
     elif angle == 10:
         if direction == "LONG":
             hook = f"{cashtag} bounced right off the 4H Point of Control – the highest‑volume node is acting as a launchpad."
@@ -610,7 +614,6 @@ def format_signal(sig):
             hook = f"{cashtag} got rejected exactly at the 4H Volume POC – sellers are using the highest‑activity node as a barrier."
             story = (f"Price tested the volume‑weighted average level where most participation occurred and got slammed. "
                      f"Rejecting off the POC signals strong overhead supply. $BTC's similar behaviour supports the short.")
-    # Angle 11: Golden Pocket (Fibonacci)
     elif angle == 11:
         if direction == "LONG":
             hook = f"{cashtag} has retraced precisely to the 0.618–0.65 golden pocket – the optimal entry zone for a continuation."
@@ -620,7 +623,6 @@ def format_signal(sig):
             hook = f"{cashtag} rallied into the 0.618–0.65 golden pocket of the prior decline – a perfect low‑risk short opportunity."
             story = (f"Price has retraced to the Fibonacci resistance zone where sellers typically reload. "
                      f"The rejection is already printing a wick. $BTC's similar rejection reinforces the setup.")
-    # Angle 12: Dynamic EMA Floor
     elif angle == 12:
         if direction == "LONG":
             hook = f"{cashtag} is using the 50‑EMA on the 4H as a dynamic trampoline – multi‑tap validation confirms the floor."
@@ -630,7 +632,6 @@ def format_signal(sig):
             hook = f"{cashtag} keeps getting rejected at the 50‑EMA on the 4H – the dynamic resistance is unbreakable."
             story = (f"Every rally attempt fails at the 50‑EMA, confirming the bearish trend. "
                      f"The MA is sloping downward. $BTC also below its 50‑EMA keeps the pressure on.")
-    # Angle 13: Triangle Compression
     elif angle == 13:
         if direction == "LONG":
             hook = f"{cashtag} is forming an Ascending Triangle – higher lows pressing against flat resistance, ready to rip higher."
@@ -640,7 +641,6 @@ def format_signal(sig):
             hook = f"{cashtag} is forming a Descending Triangle – lower highs pressing against flat support, ready to break down."
             story = (f"Sellers are growing stronger, pushing price into the support line. "
                      f"Each bounce is weaker. $BTC’s downtrend adds to the bearish pressure.")
-    # Angle 14: Mean Reversion
     elif angle == 14:
         if direction == "LONG":
             hook = f"{cashtag} is at the very bottom of its 4H range – mean reversion traders are loading for the ride back to equilibrium."
@@ -650,7 +650,6 @@ def format_signal(sig):
             hook = f"{cashtag} is stretched at the top of its 4H range – mean reversion sellers are stepping in for the pullback."
             story = (f"The extreme deviation from the range equilibrium is unsustainable. "
                      f"Price is likely to rotate back to the mean. $BTC at its range high reinforces the reversion play.")
-    # Angle 15: Catalyst Momentum Sync
     elif angle == 15:
         if direction == "LONG":
             hook = f"{cashtag} is breaking out on rising volume, perfectly syncing with the latest bullish narrative shift – momentum is accelerating."
@@ -660,7 +659,6 @@ def format_signal(sig):
             hook = f"{cashtag} is dumping on heavy volume, aligning with the sudden bearish shift in market sentiment."
             story = (f"The technical breakdown is accompanied by a fundamental catalyst, making the move sustainable. "
                      f"$BTC also crumbling on the same news adds to the bearish conviction.")
-    # Angle 16: Momentum Divergence
     elif angle == 16:
         if direction == "LONG":
             hook = f"{cashtag} printed a lower low, but the RSI made a higher low – classic hidden bullish divergence building."
@@ -670,7 +668,6 @@ def format_signal(sig):
             hook = f"{cashtag} made a higher high, but the RSI made a lower high – a bearish divergence is flashing weakness."
             story = (f"Price looks strong on the surface, but momentum is diverging, indicating the rally is running on fumes. "
                      f"$BTC also displaying bearish divergence adds credibility to this short setup.")
-    # Angle 17: Equal Highs/Lows Magnet
     elif angle == 17:
         if direction == "LONG":
             hook = f"{cashtag} has a stack of equal lows resting above – smart money will hunt those stops before the real rally begins."
@@ -680,7 +677,6 @@ def format_signal(sig):
             hook = f"{cashtag} has equal highs sitting just above – those are the target for the next liquidity grab before the dump."
             story = (f"Price is likely to tap the equal highs, trap breakout longs, then reverse. "
                      f"We position early for the fade. $BTC also has equal highs above, adding to the trap scenario.")
-    # Angle 18: Change of Character (ChoCh)
     elif angle == 18:
         if direction == "LONG":
             hook = f"{cashtag} just printed a 4H Change of Character – the first bullish structural break after a long downtrend."
@@ -690,7 +686,6 @@ def format_signal(sig):
             hook = f"{cashtag} just printed a 4H Change of Character – the first bearish structural break after a long uptrend."
             story = (f"Price broke a key swing low, signaling the trend may be reversing. "
                      f"We enter early for the macro shift. $BTC also showing a ChoCh creates a powerful bearish alignment.")
-    # Angle 19: Premium vs. Discount
     elif angle == 19:
         if direction == "LONG":
             hook = f"{cashtag} is trading deep in the discount zone of its macro range – we're buying value here."
@@ -700,7 +695,6 @@ def format_signal(sig):
             hook = f"{cashtag} is trading at a premium within its macro range – this is where smart money starts distributing."
             story = (f"Price is above the equilibrium, offering a high‑probability short zone. "
                      f"$BTC also at a premium reinforces the sell‑side bias.")
-    # Angle 20: Order Book Wall
     elif angle == 20:
         if direction == "LONG":
             hook = f"{cashtag} has a massive bid wall stacking at this level – the order book is screaming defence."
@@ -728,7 +722,7 @@ def format_signal(sig):
     )
     return msg
 
-# ========== HOLD MESSAGE (unchanged) ==========
+# ========== HOLD MESSAGE ==========
 def format_hold_message(top5, top_layers):
     if not top5: return "HOLD – No valid trade setups found. Market is fully trendless."
     lines = [f"HOLD – No high‑conviction crypto setup found.\n📊 **Top Coin Scores** (of {len(top5)})"]
@@ -772,8 +766,7 @@ def send_trade_chart(signal):
             ax.legend(loc='upper left', facecolor='#000000', edgecolor='white', labelcolor='white')
         chart_path = f"{sym}_chart.png"
         fig.savefig(chart_path, dpi=150, bbox_inches='tight', facecolor='black'); plt.close(fig)
-        url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendPhoto"
-        with open(chart_path,'rb') as img: requests.post(url, data={'chat_id':CHAT_ID}, files={'photo':img})
+        send_discord_image(chart_path, caption=f"New signal: {format_signal(sig)[:2000]}")
         os.remove(chart_path)
     except Exception as e: print(f"Chart error: {e}")
 
@@ -787,19 +780,19 @@ def main():
             print(f"Currently {len(open_df)} open trade(s).")
         except: print("No open trades file.")
         if daily_pnl() <= portfolio['daily_loss_limit']:
-            send_telegram("Daily loss limit reached. No new trades today.")
+            send_discord_message("Daily loss limit reached. No new trades today.")
             return
         sig, top5, top_layers = generate_signal()
         if sig:
             log_signal(sig); add_open_trade(sig)
             portfolio['open_positions'] += 1; save_portfolio(portfolio)
-            send_telegram(format_signal(sig))
+            send_discord_message(format_signal(sig))
             send_trade_chart(sig)
         else:
-            send_telegram(format_hold_message(top5, top_layers))
+            send_discord_message(format_hold_message(top5, top_layers))
     except Exception as e:
         err = f"Bot crashed: {traceback.format_exc()[:500]}"
-        print(err); send_telegram(err)
+        print(err); send_discord_message(err)
 
 if __name__ == "__main__":
     main()
