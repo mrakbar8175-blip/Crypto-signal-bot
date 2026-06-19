@@ -379,23 +379,25 @@ def generate_signal():
 
 # ========== DISCORD HELPERS ==========
 def send_discord_message(text):
-    """Send a plain text message to the Discord webhook."""
+    """Send a plain text message to Discord."""
     try:
-        requests.post(DISCORD_WEBHOOK_URL, json={"content": text}, timeout=10)
+        requests.post(DISCORD_WEBHOOK_URL, json={"content": text[:2000]}, timeout=10)
     except Exception as e:
-        print("Discord send error:", e)
+        print("Discord text error:", e)
 
-def send_discord_image(image_path, caption=None):
-    """Send an image file to Discord webhook with optional caption."""
+def send_discord_image(image_path, caption=""):
+    """Send an image file to Discord with optional short caption."""
+    if not os.path.exists(image_path):
+        print(f"Image file not found: {image_path}")
+        return
     try:
         with open(image_path, 'rb') as img:
             files = {'file': img}
-            payload = {}
-            if caption:
-                payload['content'] = caption
-            requests.post(DISCORD_WEBHOOK_URL, data=payload, files=files, timeout=15)
+            payload = {'content': caption[:2000]} if caption else {}
+            resp = requests.post(DISCORD_WEBHOOK_URL, data=payload, files=files, timeout=15)
+            print(f"Image sent, status: {resp.status_code}")
     except Exception as e:
-        print("Discord image send error:", e)
+        print("Discord image error:", e)
 
 # ========== TRADE MANAGEMENT ==========
 def check_open_trades():
@@ -445,8 +447,12 @@ def check_open_trades():
                             results.append(partial); update_portfolio({'pnl': pnl})
                             remaining_qty -= exit_qty; highest_tp_idx = i
                             if i == 0: breakeven = True; current_stop = entry
-                        alerts.append(f"🚀 {sym} {direction} TP{i+1} hit — {fraction*100:.0f}% closed, SL to BE")
+                        alert_msg = f"🚀 {sym} {direction} TP{i+1} hit — {fraction*100:.0f}% closed, SL to BE"
+                        alerts.append(alert_msg)
+                        print("ALERT:", alert_msg)
+                        # Send chart and immediate alert
                         send_closed_trade_chart(trade, f"TP{i+1}", exit_price, pnl, remaining_qty)
+                        send_discord_message(alert_msg)
                     if remaining_qty <= 0: break
                 if remaining_qty > 0:
                     sl_hit = (low <= current_stop) if direction=="LONG" else (high >= current_stop)
@@ -459,8 +465,11 @@ def check_open_trades():
                         final["hit_level"] = desc; final["close_time"] = now.strftime("%Y-%m-%d %H:%M:%S")
                         final["exit_price"] = exit_price; final["quantity"] = remaining_qty; final["pnl"] = round(pnl,4)
                         results.append(final); update_portfolio({'pnl': pnl}); remaining_qty = 0
-                        alerts.append(f"🔴 {sym} {direction} → {desc}")
+                        alert_msg = f"🔴 {sym} {direction} → {desc}"
+                        alerts.append(alert_msg)
+                        print("ALERT:", alert_msg)
                         send_closed_trade_chart(trade, desc, exit_price, pnl, 0)
+                        send_discord_message(alert_msg)
                         break
             if remaining_qty > 0:
                 trade["highest_tp"] = highest_tp_idx; trade["quantity"] = remaining_qty; trade["breakeven"] = breakeven
@@ -474,10 +483,8 @@ def check_open_trades():
         save_csv(OPEN_TRADES_CSV, pd.DataFrame())
         portfolio['open_positions'] = 0
     save_portfolio(portfolio)
-    if alerts:
-        print("ALERTS:", alerts)
-        send_discord_message("Crypto trade updates:\n" + "\n".join(alerts))
-    else: print("No trade closures this run.")
+    if not alerts:
+        print("No trade closures this run.")
 
 def send_closed_trade_chart(trade, hit_level, exit_price, pnl, remaining_qty):
     sym = trade["symbol"]; entry = float(trade["entry"]); stop = float(trade["stop"])
@@ -500,12 +507,13 @@ def send_closed_trade_chart(trade, hit_level, exit_price, pnl, remaining_qty):
         ax.axhline(y=exit_price, color='#e67e22', linewidth=2, label=f'Exit ({hit_level})')
         ax.legend(loc='upper left', facecolor='#000000', edgecolor='white', labelcolor='white')
         chart_path = f"{sym}_close_{datetime.now().strftime('%Y%m%d_%H%M%S')}.png"
-        fig.savefig(chart_path, dpi=150, bbox_inches='tight', facecolor='black'); plt.close(fig)
-        send_discord_image(chart_path, caption=f"Trade closed: {sym} {direction} – {hit_level} (PnL: {pnl:.2f}$)")
+        fig.savefig(chart_path, dpi=100, bbox_inches='tight', facecolor='black')
+        plt.close(fig)
+        send_discord_image(chart_path, caption=f"{sym} {direction} – {hit_level}")
         os.remove(chart_path)
     except Exception as e: print(f"Closed trade chart error: {e}")
 
-# ========== SIGNAL FORMATTING (20-angle) ==========
+# ========== SIGNAL FORMATTING (20-angle, NO hashtags) ==========
 def format_signal(sig):
     sym = sig["symbol"].replace("-USD", "")
     cashtag = f"${sym}"
@@ -716,7 +724,6 @@ def format_signal(sig):
         f"• Technical Invalidation: {stop:.5f} (-{stop_pct:.2f}%)\n"
         f"• Target Objectives: {tp_str}\n\n"
         f"💬 Are you taking this setup or fading it? Drop your bias below! 👇\n\n"
-        f"#TradingRationale #{sym.upper()} #PriceAction #BinanceSquare\n\n"
         f"*Disclaimer: This price action analysis is for educational purposes only. Not financial advice. "
         f"Always practice strict risk management and DYOR.*"
     )
@@ -765,10 +772,17 @@ def send_trade_chart(signal):
                     ax.axhline(y=tp, color='#2ecc71', linestyle='--', linewidth=1, alpha=0.8, label=f'TP{i+1}' if i==0 else None)
             ax.legend(loc='upper left', facecolor='#000000', edgecolor='white', labelcolor='white')
         chart_path = f"{sym}_chart.png"
-        fig.savefig(chart_path, dpi=150, bbox_inches='tight', facecolor='black'); plt.close(fig)
-        send_discord_image(chart_path, caption=f"New signal: {format_signal(sig)[:2000]}")
+        fig.savefig(chart_path, dpi=100, bbox_inches='tight', facecolor='black')
+        plt.close(fig)
+        # Send image with short caption, then the analysis text
+        send_discord_image(chart_path, caption=f"{sym} – {signal['action']} Setup (4H)")
         os.remove(chart_path)
-    except Exception as e: print(f"Chart error: {e}")
+        # Send the full analysis as a separate message
+        send_discord_message(format_signal(signal))
+    except Exception as e:
+        print(f"Chart error: {e}")
+        # Fallback: send text only
+        send_discord_message(format_signal(signal))
 
 # ========== MAIN ==========
 def main():
@@ -786,7 +800,6 @@ def main():
         if sig:
             log_signal(sig); add_open_trade(sig)
             portfolio['open_positions'] += 1; save_portfolio(portfolio)
-            send_discord_message(format_signal(sig))
             send_trade_chart(sig)
         else:
             send_discord_message(format_hold_message(top5, top_layers))
