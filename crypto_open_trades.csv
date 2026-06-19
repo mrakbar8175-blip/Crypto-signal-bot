@@ -1,0 +1,2 @@
+timestamp,symbol,action,entry,stop,TP1,TP2,TP3,TP4,TP5,status,quantity,original_qty,highest_tp,breakeven
+2026-06-19 18:04:11,XLM-USD,LONG,0.221343994140625,0.208063,0.227984,0.234625,0.247906,0.261187,0.287749,open,752.95568194,752.95568194,-1,False
