@@ -2,11 +2,10 @@
 """
 Crypto Swing Bot – Top 50 liquid coins via CoinGecko, 0.5R TP1, 5 TPs (0.5/1/2/3/5R)
 Wider stop (2.5x ATR, 1.0‑6.0%) for swing tolerance.
-Elite 20-angle Binance Square signal formatting.
-Breakeven after TP1, allows new signals on same pair.
+Elite 20‑angle Binance Square signal formatting (Discord).
+Position splitting: 30%/10%/10%/10%/40%. Trailing stop logic.
+Breakeven after TP1, trailing stop after subsequent TPs.
 BLACKLIST for stablecoins & QUQ. HOLD shows scores & layer breakdown.
-Alert messages now persist across runs (workflow commits files).
-Notifications via Discord webhook.
 """
 
 import requests, json, os, traceback, random, math
@@ -379,14 +378,12 @@ def generate_signal():
 
 # ========== DISCORD HELPERS ==========
 def send_discord_message(text):
-    """Send a plain text message to Discord."""
     try:
         requests.post(DISCORD_WEBHOOK_URL, json={"content": text[:2000]}, timeout=10)
     except Exception as e:
         print("Discord text error:", e)
 
 def send_discord_image(image_path, caption=""):
-    """Send an image file to Discord with optional short caption."""
     if not os.path.exists(image_path):
         print(f"Image file not found: {image_path}")
         return
@@ -399,83 +396,180 @@ def send_discord_image(image_path, caption=""):
     except Exception as e:
         print("Discord image error:", e)
 
-# ========== TRADE MANAGEMENT ==========
+# ========== TRAILING STOP CALCULATION ==========
+def get_current_stop(trade):
+    """
+    Compute the current stop based on highest TP reached and the original stops.
+    """
+    entry = float(trade["entry"])
+    stop_orig = float(trade["stop"])
+    tps = [float(trade[f"TP{i+1}"]) for i in range(5)]
+    highest_tp_idx = int(trade.get("highest_tp", -1))
+    breakeven = trade.get("breakeven", False)
+
+    if not breakeven and highest_tp_idx == -1:
+        return stop_orig  # initial stop
+    if highest_tp_idx >= 0:
+        # after TP1, SL to entry
+        if highest_tp_idx == 0:
+            return entry
+        # after TP2, SL to TP1
+        elif highest_tp_idx == 1:
+            return tps[0]
+        # after TP3, SL to TP2
+        elif highest_tp_idx == 2:
+            return tps[1]
+        # after TP4, SL to TP3
+        elif highest_tp_idx >= 3:
+            return tps[2]  # after TP4 (or more), SL is TP3 (even if TP5 partially hit)
+    return stop_orig
+
+# ========== TRADE MANAGEMENT (NEW SPLITTING & TRAILING) ==========
 def check_open_trades():
     try:
         open_df = pd.read_csv(OPEN_TRADES_CSV)
-    except: return
-    if open_df.empty: return
-    for col in ["highest_tp","quantity","original_qty","breakeven"]:
+    except:
+        return
+    if open_df.empty:
+        return
+
+    # Ensure required columns exist
+    for col in ["highest_tp", "quantity", "original_qty", "breakeven"]:
         if col not in open_df.columns:
-            open_df[col] = -1 if col=="highest_tp" else (False if col=="breakeven" else 0.0)
-    results = []; still_open = []; alerts = []
-    now = datetime.now(); fractions = [0.20]*5
+            open_df[col] = -1 if col == "highest_tp" else (False if col == "breakeven" else 0.0)
+
+    results = []
+    still_open = []
+    now = datetime.now()
+    fractions = [0.30, 0.10, 0.10, 0.10, 0.40]  # 30/10/10/10/40
+
     for idx, trade in open_df.iterrows():
         try:
-            sym = trade["symbol"]; direction = trade["action"]
-            entry = float(trade["entry"]); stop_orig = float(trade["stop"])
-            original_qty = float(trade.get("original_qty", trade.get("quantity",0)))
+            sym = trade["symbol"]
+            direction = trade["action"]
+            entry = float(trade["entry"])
+            original_qty = float(trade.get("original_qty", trade.get("quantity", 0)))
             remaining_qty = float(trade.get("quantity", original_qty))
-            breakeven = trade.get("breakeven", False)
             tps = [float(trade[f"TP{i+1}"]) for i in range(5)]
-            try: entry_time = datetime.strptime(trade["timestamp"], "%Y-%m-%d %H:%M:%S")
-            except: still_open.append(trade); continue
+
+            try:
+                entry_time = datetime.strptime(trade["timestamp"], "%Y-%m-%d %H:%M:%S")
+            except:
+                still_open.append(trade)
+                continue
+
             df_1h = get_data(sym, interval='1h', start=entry_time, end=now)
-            if df_1h.empty: still_open.append(trade); continue
+            if df_1h.empty:
+                still_open.append(trade)
+                continue
+
             highest_tp_idx = int(trade.get("highest_tp", -1))
-            current_stop = entry if breakeven else stop_orig
+            current_stop = get_current_stop(trade)
+
+            trade_closed = False
+
             for candle_time, candle in df_1h.iterrows():
-                high = candle['High']; low = candle['Low']
+                high = candle['High']
+                low = candle['Low']
+
+                # Check for new TP hits
                 new_tp_idx = None
                 if direction == "LONG":
-                    for i in range(len(tps)-1,-1,-1):
-                        if high >= tps[i] and i > highest_tp_idx: new_tp_idx = i; break
+                    for i in range(len(tps)-1, -1, -1):
+                        if high >= tps[i] and i > highest_tp_idx:
+                            new_tp_idx = i
+                            break
                 else:
-                    for i in range(len(tps)-1,-1,-1):
-                        if low <= tps[i] and i > highest_tp_idx: new_tp_idx = i; break
+                    for i in range(len(tps)-1, -1, -1):
+                        if low <= tps[i] and i > highest_tp_idx:
+                            new_tp_idx = i
+                            break
+
                 if new_tp_idx is not None:
                     for i in range(highest_tp_idx+1, new_tp_idx+1):
-                        if remaining_qty <= 0: break
-                        fraction = fractions[i]; exit_qty = original_qty * fraction
-                        if exit_qty > remaining_qty: exit_qty = remaining_qty
+                        if remaining_qty <= 0:
+                            break
+                        fraction = fractions[i]
+                        exit_qty = original_qty * fraction
+                        if exit_qty > remaining_qty:
+                            exit_qty = remaining_qty
                         if exit_qty > 0:
                             exit_price = tps[i]
-                            pnl = (exit_price - entry) * exit_qty if direction=="LONG" else (entry - exit_price) * exit_qty
+                            pnl = (exit_price - entry) * exit_qty if direction == "LONG" else (entry - exit_price) * exit_qty
                             partial = trade.to_dict()
-                            partial["hit_level"] = f"TP{i+1}"; partial["close_time"] = now.strftime("%Y-%m-%d %H:%M:%S")
-                            partial["exit_price"] = exit_price; partial["quantity"] = exit_qty; partial["pnl"] = round(pnl,4)
-                            results.append(partial); update_portfolio({'pnl': pnl})
-                            remaining_qty -= exit_qty; highest_tp_idx = i
-                            if i == 0: breakeven = True; current_stop = entry
-                        alert_msg = f"🚀 {sym} {direction} TP{i+1} hit — {fraction*100:.0f}% closed, SL to BE"
-                        alerts.append(alert_msg)
-                        print("ALERT:", alert_msg)
-                        # Send chart and immediate alert
-                        send_closed_trade_chart(trade, f"TP{i+1}", exit_price, pnl, remaining_qty)
-                        send_discord_message(alert_msg)
-                    if remaining_qty <= 0: break
+                            partial["hit_level"] = f"TP{i+1}"
+                            partial["close_time"] = now.strftime("%Y-%m-%d %H:%M:%S")
+                            partial["exit_price"] = exit_price
+                            partial["quantity"] = exit_qty
+                            partial["pnl"] = round(pnl, 4)
+                            results.append(partial)
+                            update_portfolio({'pnl': pnl})
+                            remaining_qty -= exit_qty
+                            highest_tp_idx = i
+                            # Update trailing stop in the trade dict
+                            trade["highest_tp"] = highest_tp_idx
+                            trade["quantity"] = remaining_qty
+                            if i == 0:
+                                trade["breakeven"] = True
+                            # Send beautiful Discord alert
+                            tp_emoji = "🎯"
+                            if i == 0: msg = f"{tp_emoji} **TP1 Hit!** 30% closed. SL moved to Breakeven. 🛡️"
+                            elif i == 1: msg = f"{tp_emoji} **TP2 Hit!** 10% closed. SL moved to TP1 (1R locked). 🔒"
+                            elif i == 2: msg = f"{tp_emoji} **TP3 Hit!** 10% closed. SL moved to TP2 (2R locked). 🔒"
+                            elif i == 3: msg = f"{tp_emoji} **TP4 Hit!** 10% closed. SL moved to TP3 (3R locked). 🔒"
+                            elif i == 4: msg = f"{tp_emoji} **TP5 Hit!** Final 40% closed – Home run! 🏆💰"
+                            send_discord_message(f"**{sym} {direction}**\n{msg}\nP&L: {pnl:.2f} USDT | Remaining: {remaining_qty:.6f} units")
+                            if remaining_qty <= 0:
+                                trade_closed = True
+                                break
+                    if remaining_qty <= 0:
+                        break
+                    # Update current stop for next checks
+                    current_stop = get_current_stop(trade)
+
+                # Check stop loss
                 if remaining_qty > 0:
-                    sl_hit = (low <= current_stop) if direction=="LONG" else (high >= current_stop)
+                    sl_hit = (low <= current_stop) if direction == "LONG" else (high >= current_stop)
                     if sl_hit:
                         exit_price = current_stop
-                        pnl = (exit_price - entry) * remaining_qty if direction=="LONG" else (entry - exit_price) * remaining_qty
+                        pnl = (exit_price - entry) * remaining_qty if direction == "LONG" else (entry - exit_price) * remaining_qty
                         final = trade.to_dict()
-                        if breakeven: desc = "BREAKEVEN STOP"; pnl = 0.0
-                        else: desc = "STOP LOSS" if highest_tp_idx==-1 else f"STOP LOSS after TP{highest_tp_idx+1}"
-                        final["hit_level"] = desc; final["close_time"] = now.strftime("%Y-%m-%d %H:%M:%S")
-                        final["exit_price"] = exit_price; final["quantity"] = remaining_qty; final["pnl"] = round(pnl,4)
-                        results.append(final); update_portfolio({'pnl': pnl}); remaining_qty = 0
-                        alert_msg = f"🔴 {sym} {direction} → {desc}"
-                        alerts.append(alert_msg)
-                        print("ALERT:", alert_msg)
-                        send_closed_trade_chart(trade, desc, exit_price, pnl, 0)
-                        send_discord_message(alert_msg)
+                        if trade.get("breakeven", False):
+                            desc = "BREAKEVEN STOP"
+                            pnl = 0.0
+                        else:
+                            desc = "STOP LOSS" if highest_tp_idx == -1 else f"STOP LOSS after TP{highest_tp_idx+1}"
+                        final["hit_level"] = desc
+                        final["close_time"] = now.strftime("%Y-%m-%d %H:%M:%S")
+                        final["exit_price"] = exit_price
+                        final["quantity"] = remaining_qty
+                        final["pnl"] = round(pnl, 4)
+                        results.append(final)
+                        update_portfolio({'pnl': pnl})
+                        remaining_qty = 0
+                        trade_closed = True
+                        # Send final closure alert + chart
+                        send_discord_message(f"**{sym} {direction}**\n{'🔴' if 'STOP' in desc else '🛑'} {desc}\nP&L: {pnl:.2f} USDT")
+                        send_trade_close_chart(trade, desc, exit_price, pnl)
                         break
-            if remaining_qty > 0:
-                trade["highest_tp"] = highest_tp_idx; trade["quantity"] = remaining_qty; trade["breakeven"] = breakeven
+
+                if remaining_qty <= 0:
+                    break
+
+            if remaining_qty > 0 and not trade_closed:
+                # Update trade and keep in still_open
+                trade["quantity"] = remaining_qty
+                trade["highest_tp"] = highest_tp_idx
                 still_open.append(trade)
-        except Exception as e: print(f"Error processing trade {trade.get('symbol','?')}: {e}")
-    if results: append_csv(TRADE_RESULTS_CSV, pd.DataFrame(results))
+            elif remaining_qty <= 0:
+                # Trade fully closed, no action needed
+                pass
+        except Exception as e:
+            print(f"Error processing trade {trade.get('symbol','?')}: {e}")
+
+    # Save results and open trades
+    if results:
+        append_csv(TRADE_RESULTS_CSV, pd.DataFrame(results))
     if still_open:
         save_csv(OPEN_TRADES_CSV, pd.DataFrame(still_open))
         portfolio['open_positions'] = len(still_open)
@@ -483,18 +577,22 @@ def check_open_trades():
         save_csv(OPEN_TRADES_CSV, pd.DataFrame())
         portfolio['open_positions'] = 0
     save_portfolio(portfolio)
-    if not alerts:
-        print("No trade closures this run.")
 
-def send_closed_trade_chart(trade, hit_level, exit_price, pnl, remaining_qty):
-    sym = trade["symbol"]; entry = float(trade["entry"]); stop = float(trade["stop"])
-    tps = [float(trade[f"TP{i+1}"]) for i in range(5)]; direction = trade["action"]
+def send_trade_close_chart(trade, hit_level, exit_price, pnl):
+    sym = trade["symbol"]
+    entry = float(trade["entry"])
+    stop = float(trade["stop"])
+    tps = [float(trade[f"TP{i+1}"]) for i in range(5)]
+    direction = trade["action"]
     try:
-        import matplotlib; matplotlib.use('Agg')
-        import matplotlib.pyplot as plt; import mplfinance as mpf
+        import matplotlib
+        matplotlib.use('Agg')
+        import matplotlib.pyplot as plt
+        import mplfinance as mpf
         entry_time = datetime.strptime(trade["timestamp"], "%Y-%m-%d %H:%M:%S")
         df = get_data(sym, interval='1h', start=entry_time, end=datetime.now())
-        if df.empty: return
+        if df.empty:
+            return
         mpf_style = mpf.make_mpf_style(base_mpf_style='nightclouds', facecolor='#000000', gridcolor='#2a2e39',
                                        rc={'axes.labelcolor':'white','xtick.color':'white','ytick.color':'white','axes.titlecolor':'white'})
         fig, ax = mpf.plot(df, type='candle', style=mpf_style,
@@ -511,7 +609,8 @@ def send_closed_trade_chart(trade, hit_level, exit_price, pnl, remaining_qty):
         plt.close(fig)
         send_discord_image(chart_path, caption=f"{sym} {direction} – {hit_level}")
         os.remove(chart_path)
-    except Exception as e: print(f"Closed trade chart error: {e}")
+    except Exception as e:
+        print(f"Close chart error: {e}")
 
 # ========== SIGNAL FORMATTING (20-angle, NO hashtags) ==========
 def format_signal(sig):
@@ -774,14 +873,11 @@ def send_trade_chart(signal):
         chart_path = f"{sym}_chart.png"
         fig.savefig(chart_path, dpi=100, bbox_inches='tight', facecolor='black')
         plt.close(fig)
-        # Send image with short caption, then the analysis text
         send_discord_image(chart_path, caption=f"{sym} – {signal['action']} Setup (4H)")
         os.remove(chart_path)
-        # Send the full analysis as a separate message
         send_discord_message(format_signal(signal))
     except Exception as e:
         print(f"Chart error: {e}")
-        # Fallback: send text only
         send_discord_message(format_signal(signal))
 
 # ========== MAIN ==========
