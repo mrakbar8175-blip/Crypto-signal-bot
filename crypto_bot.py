@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 """
-Crypto Swing Bot – Top 50 liquid coins via CoinGecko, 1R TP1 Optimized, 5 TPs (1/2/3/4/5R)
+Crypto Swing Bot – Top 50 liquid coins via CoinGecko, 0.5R TP1 Optimized, 5 TPs (0.5/1/2/3/5R)
+Wider stop loss (2.5x ATR, 1.0‑6.0% bounds) for swing tolerance
 Signal formatting: Elite 7-angle Binance Square posts
-Dynamic stop loss (0.3‑2.0%) based on coin rank
 Breakeven after TP1, allows new signals on same pair
 BLACKLIST for unwanted coins (stablecoins, QUQ, etc.)
 HOLD message shows conviction scores + layer breakdown (with failure reasons)
+Enhanced alert visibility with console prints & error handling.
 """
 
 import requests, json, os, traceback, random, math
@@ -23,11 +24,11 @@ if not GROQ_API_KEY:
 
 # ========== BLACKLIST – COINS WE NEVER TRADE ==========
 BLACKLIST = {
-    "QUQ",       # as requested
-    "USDT", "USDC", "DAI", "BUSD", "TUSD", "USDP", "FDUSD"  # stablecoins
+    "QUQ",
+    "USDT", "USDC", "DAI", "BUSD", "TUSD", "USDP", "FDUSD"
 }
 
-# ========== DYNAMIC COIN LIST (CoinGecko) WITH FILTERING ==========
+# ========== DYNAMIC COIN LIST (CoinGecko) ==========
 def fetch_top_liquid_coins(limit=50):
     global COIN_RANK
     url = "https://api.coingecko.com/api/v3/coins/markets"
@@ -271,7 +272,7 @@ def support_resistance_levels(df, lookback=20):
     low = recent['Low'].min()
     return high, low
 
-# ========== MULTI‑LAYER SCORING (1R TP1 optimized, failure reporting) ==========
+# ========== MULTI‑LAYER SCORING (0.5R TP1 optimized, failure reporting) ==========
 def score_pair(pair):
     layers = {}
 
@@ -429,7 +430,7 @@ def ai_confirm_trade(signal_dict):
         f"Entry: {entry:.5f}\n"
         f"Stop Loss: {stop:.5f}\n"
         f"Technical Conviction Score: {score:.1f}/13.5\n\n"
-        f"Will this trade likely hit TP1 (1x the stop distance) before hitting the stop? "
+        f"Will this trade likely hit TP1 (0.5x the stop distance) before hitting the stop? "
         f"Answer with exactly one word: PASS or FAIL."
     )
 
@@ -458,7 +459,7 @@ def ai_confirm_trade(signal_dict):
         pass
     return True
 
-# ========== SIGNAL GENERATION ==========
+# ========== SIGNAL GENERATION (WIDER STOP, 0.5R TP1) ==========
 def generate_signal():
     open_symbols_risky = set()
     try:
@@ -496,15 +497,16 @@ def generate_signal():
     best = candidates[0]
     pair, score, direction, price, atr_val, swing_level, layers = best
 
+    # ---- WIDER STOP LOSS ----
     rank = COIN_RANK.get(pair, 99)
-    if rank <= 10:
-        min_stop_pct = 0.003
-        max_stop_pct = 0.015
-    else:
-        min_stop_pct = 0.005
-        max_stop_pct = 0.02
+    if rank <= 10:           # Top 10 most liquid
+        min_stop_pct = 0.01   # 1.0%
+        max_stop_pct = 0.04   # 4.0%
+    else:                    # Other coins
+        min_stop_pct = 0.02   # 2.0%
+        max_stop_pct = 0.06   # 6.0%
 
-    raw_stop = atr_val * 1.5 if (atr_val is not None and not math.isnan(atr_val)) else price * 0.01
+    raw_stop = (atr_val * 2.5) if (atr_val is not None and not math.isnan(atr_val)) else price * 0.02
     min_stop = price * min_stop_pct
     max_stop = price * max_stop_pct
     stop_distance = np.clip(raw_stop, min_stop, max_stop)
@@ -512,16 +514,17 @@ def generate_signal():
     if direction == "LONG":
         stop = price - stop_distance
         if swing_level is not None and swing_level > price - stop_distance * 1.2:
-            stop = min(stop, swing_level - 0.05 * (atr_val if atr_val else price*0.005))
+            stop = min(stop, swing_level - 0.05 * (atr_val if atr_val else price*0.01))
     else:
         stop = price + stop_distance
         if swing_level is not None and swing_level < price + stop_distance * 1.2:
-            stop = max(stop, swing_level + 0.05 * (atr_val if atr_val else price*0.005))
+            stop = max(stop, swing_level + 0.05 * (atr_val if atr_val else price*0.01))
 
     stop = round(stop, 6)
     risk = abs(price - stop)
 
-    tp_multipliers = [1.0, 2.0, 3.0, 4.0, 5.0]
+    # TP multipliers: 0.5, 1, 2, 3, 5R
+    tp_multipliers = [0.5, 1.0, 2.0, 3.0, 5.0]
     tps = [round(price + m * risk, 6) if direction == "LONG" else round(price - m * risk, 6) for m in tp_multipliers]
 
     risk_amount = portfolio['balance'] * 0.01
@@ -545,14 +548,17 @@ def generate_signal():
     signal["ai_approved"] = True
     return signal, top5, top_layers
 
-# ========== TRADE MANAGEMENT ==========
+# ========== TRADE MANAGEMENT (Enhanced with prints) ==========
 def check_open_trades():
     try:
         open_df = pd.read_csv(OPEN_TRADES_CSV)
     except (FileNotFoundError, pd.errors.EmptyDataError):
+        print("No open trades file or empty.")
         return
     if open_df.empty:
+        print("Open trades file empty.")
         return
+
     if "timestamp" in open_df.columns:
         open_df = open_df.sort_values("timestamp").drop_duplicates(subset="symbol", keep="last")
     else:
@@ -574,104 +580,107 @@ def check_open_trades():
     fractions = [0.20, 0.20, 0.20, 0.20, 0.20]
 
     for idx, trade in open_df.iterrows():
-        sym = trade["symbol"]
-        direction = trade["action"]
-        entry = float(trade["entry"])
-        stop_orig = float(trade["stop"])
-        original_qty = float(trade.get("original_qty", trade.get("quantity", 0)))
-        remaining_qty = float(trade.get("quantity", original_qty))
-        breakeven = trade.get("breakeven", False)
-
-        tps = [float(trade[f"TP{i+1}"]) for i in range(5)]
-
         try:
-            entry_time = datetime.strptime(trade["timestamp"], "%Y-%m-%d %H:%M:%S")
-        except:
-            still_open.append(trade)
-            continue
+            sym = trade["symbol"]
+            direction = trade["action"]
+            entry = float(trade["entry"])
+            stop_orig = float(trade["stop"])
+            original_qty = float(trade.get("original_qty", trade.get("quantity", 0)))
+            remaining_qty = float(trade.get("quantity", original_qty))
+            breakeven = trade.get("breakeven", False)
 
-        df_1h = get_data(sym, interval='1h', start=entry_time, end=now)
-        if df_1h.empty:
-            still_open.append(trade)
-            continue
+            tps = [float(trade[f"TP{i+1}"]) for i in range(5)]
 
-        highest_tp_idx = int(trade.get("highest_tp", -1))
-        current_stop = entry if breakeven else stop_orig
+            try:
+                entry_time = datetime.strptime(trade["timestamp"], "%Y-%m-%d %H:%M:%S")
+            except:
+                still_open.append(trade)
+                continue
 
-        for candle_time, candle in df_1h.iterrows():
-            high = candle['High']
-            low = candle['Low']
+            df_1h = get_data(sym, interval='1h', start=entry_time, end=now)
+            if df_1h.empty:
+                still_open.append(trade)
+                continue
 
-            new_tp_idx = None
-            if direction == "LONG":
-                for i in range(len(tps)-1, -1, -1):
-                    if high >= tps[i] and i > highest_tp_idx:
-                        new_tp_idx = i
-                        break
-            else:
-                for i in range(len(tps)-1, -1, -1):
-                    if low <= tps[i] and i > highest_tp_idx:
-                        new_tp_idx = i
-                        break
+            highest_tp_idx = int(trade.get("highest_tp", -1))
+            current_stop = entry if breakeven else stop_orig
 
-            if new_tp_idx is not None:
-                for i in range(highest_tp_idx+1, new_tp_idx+1):
+            for candle_time, candle in df_1h.iterrows():
+                high = candle['High']
+                low = candle['Low']
+
+                new_tp_idx = None
+                if direction == "LONG":
+                    for i in range(len(tps)-1, -1, -1):
+                        if high >= tps[i] and i > highest_tp_idx:
+                            new_tp_idx = i
+                            break
+                else:
+                    for i in range(len(tps)-1, -1, -1):
+                        if low <= tps[i] and i > highest_tp_idx:
+                            new_tp_idx = i
+                            break
+
+                if new_tp_idx is not None:
+                    for i in range(highest_tp_idx+1, new_tp_idx+1):
+                        if remaining_qty <= 0:
+                            break
+                        fraction = fractions[i]
+                        exit_qty = original_qty * fraction
+                        if exit_qty > remaining_qty:
+                            exit_qty = remaining_qty
+                        if exit_qty > 0:
+                            exit_price = tps[i]
+                            pnl = (exit_price - entry) * exit_qty if direction == "LONG" else (entry - exit_price) * exit_qty
+                            partial = trade.to_dict()
+                            partial["hit_level"] = f"TP{i+1}"
+                            partial["close_time"] = now.strftime("%Y-%m-%d %H:%M:%S")
+                            partial["exit_price"] = exit_price
+                            partial["quantity"] = exit_qty
+                            partial["pnl"] = round(pnl, 4)
+                            results.append(partial)
+                            update_portfolio({'pnl': pnl})
+                            remaining_qty -= exit_qty
+                            highest_tp_idx = i
+                            if i == 0:
+                                breakeven = True
+                                current_stop = entry
+                        alerts.append(f"🚀 {sym} {direction} TP{i+1} hit — {fraction*100:.0f}% closed, SL to BE")
+                        send_closed_trade_chart(trade, f"TP{i+1}", exit_price, pnl, remaining_qty)
+
                     if remaining_qty <= 0:
                         break
-                    fraction = fractions[i]
-                    exit_qty = original_qty * fraction
-                    if exit_qty > remaining_qty:
-                        exit_qty = remaining_qty
-                    if exit_qty > 0:
-                        exit_price = tps[i]
-                        pnl = (exit_price - entry) * exit_qty if direction == "LONG" else (entry - exit_price) * exit_qty
-                        partial = trade.to_dict()
-                        partial["hit_level"] = f"TP{i+1}"
-                        partial["close_time"] = now.strftime("%Y-%m-%d %H:%M:%S")
-                        partial["exit_price"] = exit_price
-                        partial["quantity"] = exit_qty
-                        partial["pnl"] = round(pnl, 4)
-                        results.append(partial)
-                        update_portfolio({'pnl': pnl})
-                        remaining_qty -= exit_qty
-                        highest_tp_idx = i
-                        if i == 0:
-                            breakeven = True
-                            current_stop = entry
-                    alerts.append(f"🚀 {sym} {direction} TP{i+1} hit — {fraction*100:.0f}% closed, SL to BE")
-                    send_closed_trade_chart(trade, f"TP{i+1}", exit_price, pnl, remaining_qty)
 
-                if remaining_qty <= 0:
-                    break
+                if remaining_qty > 0:
+                    sl_hit = (low <= current_stop) if direction == "LONG" else (high >= current_stop)
+                    if sl_hit:
+                        exit_price = current_stop
+                        pnl = (exit_price - entry) * remaining_qty if direction == "LONG" else (entry - exit_price) * remaining_qty
+                        final = trade.to_dict()
+                        if breakeven:
+                            desc = "BREAKEVEN STOP"
+                            pnl = 0.0
+                        else:
+                            desc = "STOP LOSS" if highest_tp_idx == -1 else f"STOP LOSS after TP{highest_tp_idx+1}"
+                        final["hit_level"] = desc
+                        final["close_time"] = now.strftime("%Y-%m-%d %H:%M:%S")
+                        final["exit_price"] = exit_price
+                        final["quantity"] = remaining_qty
+                        final["pnl"] = round(pnl, 4)
+                        results.append(final)
+                        update_portfolio({'pnl': pnl})
+                        remaining_qty = 0
+                        alerts.append(f"🔴 {sym} {direction} → {desc}")
+                        send_closed_trade_chart(trade, desc, exit_price, pnl, 0)
+                        break
 
             if remaining_qty > 0:
-                sl_hit = (low <= current_stop) if direction == "LONG" else (high >= current_stop)
-                if sl_hit:
-                    exit_price = current_stop
-                    pnl = (exit_price - entry) * remaining_qty if direction == "LONG" else (entry - exit_price) * remaining_qty
-                    final = trade.to_dict()
-                    if breakeven:
-                        desc = "BREAKEVEN STOP"
-                        pnl = 0.0
-                    else:
-                        desc = "STOP LOSS" if highest_tp_idx == -1 else f"STOP LOSS after TP{highest_tp_idx+1}"
-                    final["hit_level"] = desc
-                    final["close_time"] = now.strftime("%Y-%m-%d %H:%M:%S")
-                    final["exit_price"] = exit_price
-                    final["quantity"] = remaining_qty
-                    final["pnl"] = round(pnl, 4)
-                    results.append(final)
-                    update_portfolio({'pnl': pnl})
-                    remaining_qty = 0
-                    alerts.append(f"🔴 {sym} {direction} → {desc}")
-                    send_closed_trade_chart(trade, desc, exit_price, pnl, 0)
-                    break
-
-        if remaining_qty > 0:
-            trade["highest_tp"] = highest_tp_idx
-            trade["quantity"] = remaining_qty
-            trade["breakeven"] = breakeven
-            still_open.append(trade)
+                trade["highest_tp"] = highest_tp_idx
+                trade["quantity"] = remaining_qty
+                trade["breakeven"] = breakeven
+                still_open.append(trade)
+        except Exception as e:
+            print(f"Error processing trade {trade.get('symbol','?')}: {e}")
 
     if results:
         append_csv(TRADE_RESULTS_CSV, pd.DataFrame(results))
@@ -684,7 +693,10 @@ def check_open_trades():
     save_portfolio(portfolio)
 
     if alerts:
+        print("ALERTS:", alerts)
         send_telegram("Crypto trade updates:\n" + "\n".join(alerts))
+    else:
+        print("No trade closures this run.")
 
 # ========== CHART ON TRADE CLOSE ==========
 def send_closed_trade_chart(trade, hit_level, exit_price, pnl, remaining_qty):
@@ -967,6 +979,13 @@ def main():
     try:
         initialize_trade_files()
         check_open_trades()
+
+        # Show current open trade count in log
+        try:
+            open_df = pd.read_csv(OPEN_TRADES_CSV)
+            print(f"Currently {len(open_df)} open trade(s).")
+        except:
+            print("No open trades file found.")
 
         if daily_pnl() <= portfolio['daily_loss_limit']:
             send_telegram("Daily loss limit reached. No new trades today.")
