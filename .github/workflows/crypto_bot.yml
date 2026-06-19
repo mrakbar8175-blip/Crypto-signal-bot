@@ -11,13 +11,6 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: List files for debugging
-        run: |
-          pwd
-          ls -la
-          echo "---"
-          ls -la crypto_bot.py || echo "crypto_bot.py NOT FOUND"
-
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
@@ -34,3 +27,10 @@ jobs:
           CHAT_ID: ${{ secrets.CHAT_ID }}
           GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
         run: python crypto_bot.py
+
+      - name: Commit trade files back to repo
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add crypto_portfolio.json crypto_open_trades.csv crypto_trade_results.csv crypto_trade_log.csv || true
+          git diff --staged --quiet || (git commit -m "Update trade files after bot run" && git push)
