@@ -2,17 +2,17 @@
 """
 Crypto Swing Bot – Top 50 liquid coins via CoinGecko, 0.5R TP1, 5 TPs (0.5/1/2/3/5R)
 Wider stop (2.5x ATR, 1.0‑6.0%) for swing tolerance.
-Elite 20‑angle Binance Square signal formatting (Discord).
+Compact Discord signals + full alert system.
 Position splitting: 30%/10%/10%/10%/40%. Trailing stop logic.
 Breakeven after TP1, trailing stop after subsequent TPs.
 BLACKLIST for stablecoins & QUQ. HOLD shows scores & layer breakdown.
-Data failure warnings in signals.
+BTC market context fetched from CoinGecko (no Yahoo fails).
+1h trade data fallback to 4h if 1h fetch fails.
 """
 
 import requests, json, os, traceback, random, math
 import pandas as pd
 import numpy as np
-import yfinance as yf
 from datetime import datetime, timedelta
 
 # ========== ENVIRONMENT ==========
@@ -160,8 +160,12 @@ def update_portfolio(trade_result):
     portfolio['realized_pnl'] += trade_result['pnl']
     save_portfolio(portfolio)
 
-# ========== DATA ==========
+# ========== DATA FETCH ==========
+# Removed yfinance import completely, using CoinGecko for BTC and yfinance only for coin price data.
+import yfinance as yf  # we still need yfinance for the individual coin data, but we'll handle failures better
+
 def get_data(pair, interval='4h', days=14, start=None, end=None):
+    """Fetch OHLCV from yfinance, returns DataFrame (may be empty)."""
     ysym = pair
     if start is None:
         end = datetime.now()
@@ -170,19 +174,34 @@ def get_data(pair, interval='4h', days=14, start=None, end=None):
         end = end if end else datetime.now()
     try:
         df = yf.download(ysym, start=start, end=end, interval=interval, progress=False)
-        if df.empty: return pd.DataFrame()
-        if isinstance(df.columns, pd.MultiIndex): df.columns = df.columns.get_level_values(0)
+        if df.empty:
+            return pd.DataFrame()
+        if isinstance(df.columns, pd.MultiIndex):
+            df.columns = df.columns.get_level_values(0)
         return df
-    except: return pd.DataFrame()
+    except Exception as e:
+        print(f"YFinance error for {pair}: {e}")
+        return pd.DataFrame()
 
-def get_total_market_index(interval='4h', days=14):
+# ---------- BTC market context from CoinGecko (reliable) ----------
+def get_btc_ohlc_coingecko(days=14):
+    """Fetch BTC/USD 4h OHLC data from CoinGecko. Returns DataFrame with columns: Open, High, Low, Close, or empty DataFrame."""
+    url = f"https://api.coingecko.com/api/v3/coins/bitcoin/ohlc"
+    params = {"vs_currency": "usd", "days": days}
     try:
-        df = yf.download("TOTAL", period=f"{days}d", interval=interval, progress=False)
-        if not df.empty:
-            if isinstance(df.columns, pd.MultiIndex): df.columns = df.columns.get_level_values(0)
-            return df
-    except: pass
-    return pd.DataFrame()
+        resp = requests.get(url, params=params, timeout=15)
+        data = resp.json()
+        if not isinstance(data, list) or len(data) == 0:
+            raise ValueError("Empty or invalid response")
+        # data is list of [timestamp, open, high, low, close]
+        df = pd.DataFrame(data, columns=["timestamp", "Open", "High", "Low", "Close"])
+        df["timestamp"] = pd.to_datetime(df["timestamp"], unit='ms')
+        df.set_index("timestamp", inplace=True)
+        # we only need OHLCV for EMA calculation, so volume not required
+        return df[["Open", "High", "Low", "Close"]]
+    except Exception as e:
+        print(f"CoinGecko BTC OHLC error: {e}")
+        return pd.DataFrame()
 
 # ========== TECHNICAL INDICATORS ==========
 def ema(series, period): return series.ewm(span=period, adjust=False).mean()
@@ -228,7 +247,7 @@ def support_resistance_levels(df, lookback=20):
     recent = df.tail(lookback)
     return recent['High'].max(), recent['Low'].min()
 
-# ========== MULTI‑LAYER SCORING (all 11 layers) ==========
+# ========== SCORING (uses CoinGecko BTC) ==========
 def score_pair(pair):
     layers = {}
     df_d = get_data(pair, interval='1d', days=90)
@@ -256,52 +275,47 @@ def score_pair(pair):
     vol_last = df_4h['Volume'].iloc[-1]
     vol_avg = df_4h['Volume'].iloc[-6:-1].mean() if len(df_4h) >= 6 else vol_last
     vol_surge = vol_last > vol_avg * 1.2 if vol_avg > 0 else False
-    total_df = get_total_market_index(interval='4h', days=14)
+
+    # ------ BTC context from CoinGecko ------
+    btc_df = get_btc_ohlc_coingecko(days=14)
     market_aligned = False
-    if not total_df.empty and len(total_df) >= 50:
-        total_ema50 = ema(total_df['Close'], 50)
-        market_trend_up = total_df['Close'].iloc[-1] > total_ema50.iloc[-1]
-        if trend_daily == 1 and market_trend_up: market_aligned = True
-        elif trend_daily == -1 and not market_trend_up: market_aligned = True
-    else: layers["Market"] = (0, 0.5, "FAIL: TOTAL data unavailable")
+    if not btc_df.empty and len(btc_df) >= 50:
+        btc_ema50 = ema(btc_df['Close'], 50)
+        btc_trend_up = btc_df['Close'].iloc[-1] > btc_ema50.iloc[-1]
+        if trend_daily == 1 and btc_trend_up: market_aligned = True
+        elif trend_daily == -1 and not btc_trend_up: market_aligned = True
+    else:
+        layers["Market"] = (0, 0.5, "FAIL: BTC data unavailable")
+
     def bool_score(cond): return 1 if cond else 0
     direction = "LONG" if trend_daily == 1 else "SHORT"
-    # 1. EMA Align
+
+    # Layers
     if direction == "LONG": ema_align = price > ema50_4h.iloc[-1] and ema50_4h.iloc[-1] > ema200_4h.iloc[-1]
     else: ema_align = price < ema50_4h.iloc[-1] and ema50_4h.iloc[-1] < ema200_4h.iloc[-1]
     layers["EMA Align"] = (bool_score(ema_align) * 1.5, 1.5, "OK")
-    # 2. ADX
     adx_trending = adx_val > 20
     adx_dir = (di_plus > di_minus) if direction == "LONG" else (di_minus > di_plus)
     layers["ADX"] = (bool_score(adx_trending and adx_dir) * 1.0, 1.0, "OK")
-    # 3. RSI
     if rsi_val is not None: layers["RSI"] = (bool_score((direction=="LONG" and rsi_val>50) or (direction=="SHORT" and rsi_val<50)) * 1.5, 1.5, "OK")
     else: layers["RSI"] = (0, 1.5, "FAIL: RSI NaN")
-    # 4. MACD
     macd_expanding = (direction=="LONG" and macd_hist>0 and macd_hist>macd_hist_prev) or (direction=="SHORT" and macd_hist<0 and macd_hist<macd_hist_prev)
     layers["MACD"] = (bool_score(macd_expanding) * 1.0, 1.0, "OK")
-    # 5. S/R
     if atr_val and atr_val>0:
         if direction=="LONG": sr_score = bool_score((price-sup) < atr_val*0.5)
         else: sr_score = bool_score((res-price) < atr_val*0.5)
         layers["S/R"] = (sr_score*1.0, 1.0, "OK")
     else: layers["S/R"] = (0, 1.0, "FAIL: ATR missing")
-    # 6. Volume
     layers["Volume"] = (bool_score(vol_surge)*0.5, 0.5, "OK")
-    # 7. Market
     if "Market" not in layers: layers["Market"] = (bool_score(market_aligned)*0.5, 0.5, "OK")
-    # 8. Candle Mom
     candle_ok = (bullish_momentum > 0.5) if direction=="LONG" else (bullish_momentum < -0.5)
     layers["Candle Mom"] = (bool_score(candle_ok)*2.0, 2.0, "OK")
-    # 9. RSI 1h
     if rsi_1h_val is not None:
         rsi_1h_ok = (rsi_1h_val < 63) if direction=="LONG" else (rsi_1h_val > 37)
         layers["RSI 1h"] = (bool_score(rsi_1h_ok)*1.5, 1.5, "OK")
     else: layers["RSI 1h"] = (0, 1.5, "FAIL: RSI 1h NaN")
-    # 10. ATR
     if atr_val and price>0: layers["ATR"] = (bool_score(atr_val > price*0.005)*1.0, 1.0, "OK")
     else: layers["ATR"] = (0, 1.0, "FAIL: ATR missing")
-    # 11. Micro Trend
     if direction=="LONG": micro_ok = last_candle['Close'] > last_candle['Open'] and prev_candle['Close'] > prev_candle['Open']
     else: micro_ok = last_candle['Close'] < last_candle['Open'] and prev_candle['Close'] < prev_candle['Open']
     layers["Micro Trend"] = (bool_score(micro_ok)*2.0, 2.0, "OK")
@@ -371,7 +385,7 @@ def generate_signal():
     quantity = round((portfolio['balance']*0.01) / risk, 8)
     signal = {"action": direction, "symbol": pair, "quantity": quantity,
               "limit_price": price, "stop_loss": stop, "take_profits": tps,
-              "score": score, "atr": atr_val, "layers": layers}
+              "score": score, "atr": atr_val}
     if not ai_confirm_trade(signal):
         print(f"AI rejected {pair} {direction} (score {score:.1f})")
         return None, top5, top_layers
@@ -396,10 +410,9 @@ def send_discord_image(image_path, caption=""):
             print(f"Image sent, status: {resp.status_code}")
     except Exception as e: print("Discord image error:", e)
 
-# ========== TRAILING STOP CALCULATION ==========
+# ========== TRAILING STOP ==========
 def get_current_stop(trade):
-    entry = float(trade["entry"])
-    stop_orig = float(trade["stop"])
+    entry = float(trade["entry"]); stop_orig = float(trade["stop"])
     tps = [float(trade[f"TP{i+1}"]) for i in range(5)]
     highest_tp_idx = int(trade.get("highest_tp", -1))
     breakeven = trade.get("breakeven", False)
@@ -411,90 +424,157 @@ def get_current_stop(trade):
         elif highest_tp_idx >= 3: return tps[2]
     return stop_orig
 
-# ========== TRADE MANAGEMENT (new splitting & trailing) ==========
+# ========== TRADE MANAGEMENT (with fallback for empty 1h data) ==========
 def check_open_trades():
     try:
         open_df = pd.read_csv(OPEN_TRADES_CSV)
-    except: return
-    if open_df.empty: return
+    except:
+        return
+    if open_df.empty:
+        return
+
     for col in ["highest_tp","quantity","original_qty","breakeven"]:
         if col not in open_df.columns:
             open_df[col] = -1 if col=="highest_tp" else (False if col=="breakeven" else 0.0)
-    results = []; still_open = []
+
+    results = []
+    still_open = []
+    alerts = []
     now = datetime.now()
     fractions = [0.30, 0.10, 0.10, 0.10, 0.40]
+
     for idx, trade in open_df.iterrows():
         try:
-            sym = trade["symbol"]; direction = trade["action"]
-            entry = float(trade["entry"]); stop_orig = float(trade["stop"])
+            sym = trade["symbol"]
+            direction = trade["action"]
+            entry = float(trade["entry"])
+            stop_orig = float(trade["stop"])
             original_qty = float(trade.get("original_qty", trade.get("quantity",0)))
             remaining_qty = float(trade.get("quantity", original_qty))
+            breakeven = trade.get("breakeven", False)
+
             tps = [float(trade[f"TP{i+1}"]) for i in range(5)]
-            try: entry_time = datetime.strptime(trade["timestamp"], "%Y-%m-%d %H:%M:%S")
-            except: still_open.append(trade); continue
+
+            try:
+                entry_time = datetime.strptime(trade["timestamp"], "%Y-%m-%d %H:%M:%S")
+            except:
+                still_open.append(trade)
+                continue
+
+            # Attempt 1h data fetch
             df_1h = get_data(sym, interval='1h', start=entry_time, end=now)
-            if df_1h.empty: still_open.append(trade); continue
+            if df_1h.empty:
+                print(f"WARNING: No 1h data for {sym} from {entry_time} to {now}. Trying 4h as fallback.")
+                # Fallback to 4h
+                df_1h = get_data(sym, interval='4h', start=entry_time, end=now)
+                if df_1h.empty:
+                    print(f"ERROR: No data at all for {sym}. Trade NOT checked this run.")
+                    still_open.append(trade)
+                    continue
+                else:
+                    print(f"Fallback successful: using 4h data for {sym}.")
+
             highest_tp_idx = int(trade.get("highest_tp", -1))
             current_stop = get_current_stop(trade)
+
             trade_closed = False
             for candle_time, candle in df_1h.iterrows():
-                high = candle['High']; low = candle['Low']
+                high = candle['High']
+                low = candle['Low']
+
                 new_tp_idx = None
                 if direction == "LONG":
-                    for i in range(len(tps)-1,-1,-1):
-                        if high >= tps[i] and i > highest_tp_idx: new_tp_idx = i; break
+                    for i in range(len(tps)-1, -1, -1):
+                        if high >= tps[i] and i > highest_tp_idx:
+                            new_tp_idx = i
+                            break
                 else:
-                    for i in range(len(tps)-1,-1,-1):
-                        if low <= tps[i] and i > highest_tp_idx: new_tp_idx = i; break
+                    for i in range(len(tps)-1, -1, -1):
+                        if low <= tps[i] and i > highest_tp_idx:
+                            new_tp_idx = i
+                            break
+
                 if new_tp_idx is not None:
                     for i in range(highest_tp_idx+1, new_tp_idx+1):
-                        if remaining_qty <= 0: break
-                        fraction = fractions[i]; exit_qty = original_qty * fraction
-                        if exit_qty > remaining_qty: exit_qty = remaining_qty
+                        if remaining_qty <= 0:
+                            break
+                        fraction = fractions[i]
+                        exit_qty = original_qty * fraction
+                        if exit_qty > remaining_qty:
+                            exit_qty = remaining_qty
                         if exit_qty > 0:
                             exit_price = tps[i]
-                            pnl = (exit_price - entry) * exit_qty if direction=="LONG" else (entry - exit_price) * exit_qty
+                            pnl = (exit_price - entry) * exit_qty if direction == "LONG" else (entry - exit_price) * exit_qty
                             partial = trade.to_dict()
-                            partial["hit_level"] = f"TP{i+1}"; partial["close_time"] = now.strftime("%Y-%m-%d %H:%M:%S")
-                            partial["exit_price"] = exit_price; partial["quantity"] = exit_qty; partial["pnl"] = round(pnl,4)
-                            results.append(partial); update_portfolio({'pnl': pnl})
-                            remaining_qty -= exit_qty; highest_tp_idx = i
-                            trade["highest_tp"] = highest_tp_idx; trade["quantity"] = remaining_qty
-                            if i == 0: trade["breakeven"] = True
-                            # Beautiful Discord alert for TP hit
+                            partial["hit_level"] = f"TP{i+1}"
+                            partial["close_time"] = now.strftime("%Y-%m-%d %H:%M:%S")
+                            partial["exit_price"] = exit_price
+                            partial["quantity"] = exit_qty
+                            partial["pnl"] = round(pnl,4)
+                            results.append(partial)
+                            update_portfolio({'pnl': pnl})
+                            remaining_qty -= exit_qty
+                            highest_tp_idx = i
+                            trade["highest_tp"] = highest_tp_idx
+                            trade["quantity"] = remaining_qty
+                            if i == 0:
+                                trade["breakeven"] = True
                             tp_emoji = "🎯"
                             if i == 0: msg = f"{tp_emoji} **TP1 Hit!** 30% closed. SL moved to Breakeven. 🛡️"
                             elif i == 1: msg = f"{tp_emoji} **TP2 Hit!** 10% closed. SL moved to TP1 (1R locked). 🔒"
                             elif i == 2: msg = f"{tp_emoji} **TP3 Hit!** 10% closed. SL moved to TP2 (2R locked). 🔒"
                             elif i == 3: msg = f"{tp_emoji} **TP4 Hit!** 10% closed. SL moved to TP3 (3R locked). 🔒"
                             elif i == 4: msg = f"{tp_emoji} **TP5 Hit!** Final 40% closed – Home run! 🏆💰"
-                            send_discord_message(f"**{sym} {direction}**\n{msg}\nP&L: {pnl:.2f} USDT | Remaining: {remaining_qty:.6f} units")
+                            alert_line = f"**{sym} {direction}**\n{msg}\nP&L: {pnl:.2f} USDT | Remaining: {remaining_qty:.6f} units"
+                            alerts.append(alert_line)
+                            print("ALERT:", alert_line)
+                            send_discord_message(alert_line)
                             if remaining_qty <= 0:
-                                trade_closed = True; break
-                    if remaining_qty <= 0: break
+                                trade_closed = True
+                                break
+                    if remaining_qty <= 0:
+                        break
                     current_stop = get_current_stop(trade)
+
                 if remaining_qty > 0:
-                    sl_hit = (low <= current_stop) if direction=="LONG" else (high >= current_stop)
+                    sl_hit = (low <= current_stop) if direction == "LONG" else (high >= current_stop)
                     if sl_hit:
                         exit_price = current_stop
-                        pnl = (exit_price - entry) * remaining_qty if direction=="LONG" else (entry - exit_price) * remaining_qty
+                        pnl = (exit_price - entry) * remaining_qty if direction == "LONG" else (entry - exit_price) * remaining_qty
                         final = trade.to_dict()
-                        if trade.get("breakeven", False): desc = "BREAKEVEN STOP"; pnl = 0.0
-                        else: desc = "STOP LOSS" if highest_tp_idx==-1 else f"STOP LOSS after TP{highest_tp_idx+1}"
-                        final["hit_level"] = desc; final["close_time"] = now.strftime("%Y-%m-%d %H:%M:%S")
-                        final["exit_price"] = exit_price; final["quantity"] = remaining_qty; final["pnl"] = round(pnl,4)
-                        results.append(final); update_portfolio({'pnl': pnl}); remaining_qty = 0
+                        if trade.get("breakeven", False):
+                            desc = "BREAKEVEN STOP"
+                            pnl = 0.0
+                        else:
+                            desc = "STOP LOSS" if highest_tp_idx == -1 else f"STOP LOSS after TP{highest_tp_idx+1}"
+                        final["hit_level"] = desc
+                        final["close_time"] = now.strftime("%Y-%m-%d %H:%M:%S")
+                        final["exit_price"] = exit_price
+                        final["quantity"] = remaining_qty
+                        final["pnl"] = round(pnl,4)
+                        results.append(final)
+                        update_portfolio({'pnl': pnl})
+                        remaining_qty = 0
                         trade_closed = True
-                        send_discord_message(f"**{sym} {direction}**\n{'🔴' if 'STOP' in desc else '🛑'} {desc}\nP&L: {pnl:.2f} USDT")
+                        alert_line = f"**{sym} {direction}**\n{'🔴' if 'STOP' in desc else '🛑'} {desc}\nP&L: {pnl:.2f} USDT"
+                        alerts.append(alert_line)
+                        print("ALERT:", alert_line)
+                        send_discord_message(alert_line)
                         send_trade_close_chart(trade, desc, exit_price, pnl)
                         break
-                if remaining_qty <= 0: break
+
+                if remaining_qty <= 0:
+                    break
+
             if remaining_qty > 0 and not trade_closed:
-                trade["quantity"] = remaining_qty; trade["highest_tp"] = highest_tp_idx
+                trade["quantity"] = remaining_qty
+                trade["highest_tp"] = highest_tp_idx
                 still_open.append(trade)
         except Exception as e:
             print(f"Error processing trade {trade.get('symbol','?')}: {e}")
-    if results: append_csv(TRADE_RESULTS_CSV, pd.DataFrame(results))
+
+    if results:
+        append_csv(TRADE_RESULTS_CSV, pd.DataFrame(results))
     if still_open:
         save_csv(OPEN_TRADES_CSV, pd.DataFrame(still_open))
         portfolio['open_positions'] = len(still_open)
@@ -502,6 +582,16 @@ def check_open_trades():
         save_csv(OPEN_TRADES_CSV, pd.DataFrame())
         portfolio['open_positions'] = 0
     save_portfolio(portfolio)
+
+    # Summary
+    risky_count = sum(1 for t in still_open if t.get("breakeven", False) == False)
+    be_count = len(still_open) - risky_count
+    summary = f"🔍 Open trades status: {risky_count} risky (TP1 not hit yet), {be_count} breakeven (risk-free). Total: {len(still_open)}"
+    print(summary)
+    send_discord_message(summary)
+    print(f"Trade closures processed: {len(results)}. Still open: {len(still_open)}.")
+    if not alerts:
+        print("No trade closures this run.")
 
 def send_trade_close_chart(trade, hit_level, exit_price, pnl):
     sym = trade["symbol"]; entry = float(trade["entry"]); stop = float(trade["stop"])
@@ -511,6 +601,9 @@ def send_trade_close_chart(trade, hit_level, exit_price, pnl):
         import matplotlib.pyplot as plt; import mplfinance as mpf
         entry_time = datetime.strptime(trade["timestamp"], "%Y-%m-%d %H:%M:%S")
         df = get_data(sym, interval='1h', start=entry_time, end=datetime.now())
+        if df.empty:
+            # fallback to 4h for chart
+            df = get_data(sym, interval='4h', start=entry_time, end=datetime.now())
         if df.empty: return
         mpf_style = mpf.make_mpf_style(base_mpf_style='nightclouds', facecolor='#000000', gridcolor='#2a2e39',
                                        rc={'axes.labelcolor':'white','xtick.color':'white','ytick.color':'white','axes.titlecolor':'white'})
@@ -530,222 +623,23 @@ def send_trade_close_chart(trade, hit_level, exit_price, pnl):
         os.remove(chart_path)
     except Exception as e: print(f"Close chart error: {e}")
 
-# ========== SIGNAL FORMATTING (20 angles fully written) ==========
+# ========== COMPACT SIGNAL FORMATTING ==========
 def format_signal(sig):
-    sym = sig["symbol"].replace("-USD", ""); cashtag = f"${sym}"
-    direction = sig["action"]; entry = sig["limit_price"]; stop = sig["stop_loss"]
-    tps = sig["take_profits"]; risk = abs(entry - stop); stop_pct = risk / entry * 100
-    layers = sig.get("layers", {})
-
-    angle = random.randint(1, 20)
-
-    if angle == 1:
-        if direction == "LONG":
-            hook = f"{cashtag} just swept the 4H lows and printed a massive rejection wick – someone got trapped short, and the bounce is real."
-            story = (f"Price wicked below recent support, triggering a classic stop‑hunt. "
-                     f"The volume spike on the reversal candle screams aggressive buyer absorption. "
-                     f"With $BTC holding above its 4H demand zone, this sweep‑and‑reclaim pattern has a high probability of follow‑through.")
-        else:
-            hook = f"{cashtag} just tapped the 4H resistance and got violently rejected – late longs are now trapped above, fueling the dump."
-            story = (f"The upper liquidity pool got tested and immediately rejected with rising volume. "
-                     f"Sellers absorbed the ask side, leaving a bearish engulfing candle. "
-                     f"$BTC is also showing weakness, confirming the bearish pressure across the board.")
-    elif angle == 2:
-        if direction == "LONG":
-            hook = f"{cashtag} is respecting a textbook higher‑low structure – the 4H trend continues to build bullish momentum."
-            story = (f"Price bounced cleanly off the flipped support zone, maintaining the sequence of higher highs and higher lows. "
-                     f"The 4H EMAs are stacked bullishly, and $BTC is also riding a strong uptrend, giving this setup structural alignment.")
-        else:
-            hook = f"{cashtag} just broke below the 4H higher‑low and closed a bearish structure shift – lower lows are loading."
-            story = (f"The previous support has flipped to resistance, and the 4H trend is now making lower highs. "
-                     f"With $BTC also losing its 4H market structure, this bearish continuation looks technically solid.")
-    elif angle == 3:
-        if direction == "LONG":
-            hook = f"{cashtag} is coiling inside a tight range – EMAs are squeezing, and a volume explosion off the whale defense zone is imminent."
-            story = (f"Price has compressed to the apex of a tightening range, with EMAs flattening into a tight band. "
-                     f"Whale‑sized limit orders are defending the lower boundary, visible on the volume profile. "
-                     f"$BTC is also consolidating, ready to expand – an aggressive expansion toward the upside is likely.")
-        else:
-            hook = f"{cashtag} is trapped inside a descending compression – the EMAs are crimping, and volume is drying up ahead of a breakdown."
-            story = (f"Price is hugging the upper boundary of a falling consolidation, with EMAs turning into resistance. "
-                     f"A massive sell‑side volume delta is building, suggesting whales are reloading shorts. "
-                     f"$BTC’s sideways limp adds weight to this bearish compression play.")
-    elif angle == 4:
-        if direction == "LONG":
-            hook = f"{cashtag} is seeing massive passive bids absorbing every sell at the 4H demand block – institutions are loading."
-            story = (f"Limit orders are stacked at this weekly support, absorbing all market sell pressure without breaking lower. "
-                     f"This is classic institutional absorption. $BTC's steady bid across the board supports this accumulation thesis.")
-        else:
-            hook = f"{cashtag} is being heavily distributed at the 4H supply zone – passive sellers are capping every rally."
-            story = (f"Ask-side walls are absorbing buying pressure at the resistance, preventing any breakout. "
-                     f"This distribution behavior, combined with $BTC's weakening trend, signals a potential dump.")
-    elif angle == 5:
-        if direction == "LONG":
-            hook = f"{cashtag} left a Fair Value Gap below – price is magnetically drawing back to fill it before the next leg up."
-            story = (f"Price delivered inefficiently, leaving a clear FVG that has yet to be filled. "
-                     f"The pullback is likely a rebalancing move before continuation. $BTC’s bullish structure supports the fill‑and‑rip scenario.")
-        else:
-            hook = f"{cashtag} left an overhead FVG – price is inefficient there and will likely rally to fill it before the dump resumes."
-            story = (f"The imbalance above is acting as a price magnet. A retracement to fill the gap before the bearish continuation is probable. "
-                     f"$BTC is also correcting, reinforcing the fill‑then‑fall outlook.")
-    elif angle == 6:
-        if direction == "LONG":
-            hook = f"{cashtag} is perfectly synced: the 4H bull flag is aligning with the daily EMA breakout."
-            story = (f"The 4H consolidation is resolving in the direction of the daily trend, a high‑probability continuation signal. "
-                     f"$BTC’s macro structure is confirming the bullish regime, increasing the odds of a clean breakout.")
-        else:
-            hook = f"{cashtag} is forming a 4H bear flag while the daily trend flips bearish – confluences are stacking for a breakdown."
-            story = (f"Lower timeframe indecision is aligning with a macro trend shift to the downside. "
-                     f"With $BTC also breaking key levels, this bearish confluence is extremely powerful.")
-    elif angle == 7:
-        if direction == "LONG":
-            hook = f"{cashtag} bears are exhausted – the 4H selling pressure just dried up at a key support."
-            story = (f"Sellers attempted to push lower but produced only small bodies and long lower wicks, showing no follow‑through. "
-                     f"This exhaustion is a classic reversal signal, especially as $BTC starts to show a potential bounce.")
-        else:
-            hook = f"{cashtag} bulls are out of steam – the 4H rally just printed a wick-heavy doji at resistance."
-            story = (f"Buyers are failing to push higher, producing overlapping candles with shrinking volume. "
-                     f"This exhaustion at the resistance zone, coupled with $BTC's weakness, points to a bearish reversal.")
-    elif angle == 8:
-        if direction == "LONG":
-            hook = f"{cashtag} just executed a textbook Wyckoff Spring – a fake breakdown below support that got instantly reclaimed."
-            story = (f"Price briefly broke below the range low, shaking out weak hands, then exploded back above. "
-                     f"This Spring pattern is a classic accumulation signal. $BTC's stability reinforces the bullish case.")
-        else:
-            hook = f"{cashtag} is showing an Upthrust pattern – a fake breakout above resistance that's reversing sharply."
-            story = (f"Buyers trapped above the breakout level are now underwater. The rapid rejection signifies distribution. "
-                     f"With $BTC also weakening, this Upthrust is a high‑probability short setup.")
-    elif angle == 9:
-        if direction == "LONG":
-            hook = f"{cashtag} broke below a key 4H level, but the breakout failed — a massive bear trap is now fueling the reversal."
-            story = (f"The failed breakdown below support activated a wave of short liquidations. "
-                     f"Price rocketed back above the level, trapping late short sellers. "
-                     f"$BTC’s bullish backdrop adds confluences to this trap play.")
-        else:
-            hook = f"{cashtag} attempted a breakout above resistance, but the move immediately stalled — a bull trap is now pulling the rug."
-            story = (f"The false breakout above resistance trapped breakout longs. "
-                     f"Price collapsed back below the level, triggering stops. "
-                     f"$BTC’s weakness confirms the distribution bias.")
-    elif angle == 10:
-        if direction == "LONG":
-            hook = f"{cashtag} bounced right off the 4H Point of Control – the highest‑volume node is acting as a launchpad."
-            story = (f"The POC is where the most volume has traded recently, and price reacted with precision. "
-                     f"Buyers defended this high‑activity zone with conviction. $BTC also holding its POC adds weight.")
-        else:
-            hook = f"{cashtag} got rejected exactly at the 4H Volume POC – sellers are using the highest‑activity node as a barrier."
-            story = (f"Price tested the volume‑weighted average level where most participation occurred and got slammed. "
-                     f"Rejecting off the POC signals strong overhead supply. $BTC's similar behaviour supports the short.")
-    elif angle == 11:
-        if direction == "LONG":
-            hook = f"{cashtag} has retraced precisely to the 0.618–0.65 golden pocket – the optimal entry zone for a continuation."
-            story = (f"A clean structural pullback has landed in the Fibonacci sweet spot. "
-                     f"This level often attracts algorithmic buyers. $BTC’s own retracement to a key fib adds confluence.")
-        else:
-            hook = f"{cashtag} rallied into the 0.618–0.65 golden pocket of the prior decline – a perfect low‑risk short opportunity."
-            story = (f"Price has retraced to the Fibonacci resistance zone where sellers typically reload. "
-                     f"The rejection is already printing a wick. $BTC's similar rejection reinforces the setup.")
-    elif angle == 12:
-        if direction == "LONG":
-            hook = f"{cashtag} is using the 50‑EMA on the 4H as a dynamic trampoline – multi‑tap validation confirms the floor."
-            story = (f"Price has bounced off the 50‑EMA repeatedly, showing strong trend support. "
-                     f"The moving average is sloping upward, and $BTC is also riding its 50‑EMA, creating a unified uptrend.")
-        else:
-            hook = f"{cashtag} keeps getting rejected at the 50‑EMA on the 4H – the dynamic resistance is unbreakable."
-            story = (f"Every rally attempt fails at the 50‑EMA, confirming the bearish trend. "
-                     f"The MA is sloping downward. $BTC also below its 50‑EMA keeps the pressure on.")
-    elif angle == 13:
-        if direction == "LONG":
-            hook = f"{cashtag} is forming an Ascending Triangle – higher lows pressing against flat resistance, ready to rip higher."
-            story = (f"Buyers are showing increasing strength with each dip, while sellers can't push lower. "
-                     f"A breakout is imminent. $BTC’s bullish consolidation supports the upward bias.")
-        else:
-            hook = f"{cashtag} is forming a Descending Triangle – lower highs pressing against flat support, ready to break down."
-            story = (f"Sellers are growing stronger, pushing price into the support line. "
-                     f"Each bounce is weaker. $BTC’s downtrend adds to the bearish pressure.")
-    elif angle == 14:
-        if direction == "LONG":
-            hook = f"{cashtag} is at the very bottom of its 4H range – mean reversion traders are loading for the ride back to equilibrium."
-            story = (f"Price has deviated far from the range midpoint, and the reversion trade is statistically favoured. "
-                     f"$BTC stabilizing near its own range low creates a market‑wide reversion environment.")
-        else:
-            hook = f"{cashtag} is stretched at the top of its 4H range – mean reversion sellers are stepping in for the pullback."
-            story = (f"The extreme deviation from the range equilibrium is unsustainable. "
-                     f"Price is likely to rotate back to the mean. $BTC at its range high reinforces the reversion play.")
-    elif angle == 15:
-        if direction == "LONG":
-            hook = f"{cashtag} is breaking out on rising volume, perfectly syncing with the latest bullish narrative shift – momentum is accelerating."
-            story = (f"The chart is reacting strongly to positive news/flow, with volume confirming the move. "
-                     f"$BTC also breaking higher on the same catalyst creates a powerful macro tailwind.")
-        else:
-            hook = f"{cashtag} is dumping on heavy volume, aligning with the sudden bearish shift in market sentiment."
-            story = (f"The technical breakdown is accompanied by a fundamental catalyst, making the move sustainable. "
-                     f"$BTC also crumbling on the same news adds to the bearish conviction.")
-    elif angle == 16:
-        if direction == "LONG":
-            hook = f"{cashtag} printed a lower low, but the RSI made a higher low – classic hidden bullish divergence building."
-            story = (f"While price dipped, momentum was already strengthening. This divergence signals fading seller energy. "
-                     f"$BTC also showing early signs of bullish divergence supports the reversal call.")
-        else:
-            hook = f"{cashtag} made a higher high, but the RSI made a lower high – a bearish divergence is flashing weakness."
-            story = (f"Price looks strong on the surface, but momentum is diverging, indicating the rally is running on fumes. "
-                     f"$BTC also displaying bearish divergence adds credibility to this short setup.")
-    elif angle == 17:
-        if direction == "LONG":
-            hook = f"{cashtag} has a stack of equal lows resting above – smart money will hunt those stops before the real rally begins."
-            story = (f"The equal lows are a liquidity magnet. Price often sweeps them before reversing. "
-                     f"We anticipate a quick dip to grab liquidity, then a sharp reversal. $BTC's setup is similar.")
-        else:
-            hook = f"{cashtag} has equal highs sitting just above – those are the target for the next liquidity grab before the dump."
-            story = (f"Price is likely to tap the equal highs, trap breakout longs, then reverse. "
-                     f"We position early for the fade. $BTC also has equal highs above, adding to the trap scenario.")
-    elif angle == 18:
-        if direction == "LONG":
-            hook = f"{cashtag} just printed a 4H Change of Character – the first bullish structural break after a long downtrend."
-            story = (f"Price broke a key swing high, signaling a potential trend reversal. "
-                     f"This is the earliest possible entry into a new uptrend. $BTC's similar ChoCh adds conviction.")
-        else:
-            hook = f"{cashtag} just printed a 4H Change of Character – the first bearish structural break after a long uptrend."
-            story = (f"Price broke a key swing low, signaling the trend may be reversing. "
-                     f"We enter early for the macro shift. $BTC also showing a ChoCh creates a powerful bearish alignment.")
-    elif angle == 19:
-        if direction == "LONG":
-            hook = f"{cashtag} is trading deep in the discount zone of its macro range – we're buying value here."
-            story = (f"Price is below the equilibrium, offering a favourable risk/reward for longs. "
-                     f"$BTC is also in its discount zone, creating a macro buying opportunity across the board.")
-        else:
-            hook = f"{cashtag} is trading at a premium within its macro range – this is where smart money starts distributing."
-            story = (f"Price is above the equilibrium, offering a high‑probability short zone. "
-                     f"$BTC also at a premium reinforces the sell‑side bias.")
-    elif angle == 20:
-        if direction == "LONG":
-            hook = f"{cashtag} has a massive bid wall stacking at this level – the order book is screaming defence."
-            story = (f"Visible bid support is absorbing all sell pressure, indicating a large player is protecting this price zone. "
-                     f"The order book depth suggests a floor. $BTC also showing strong bids adds to the bullish case.")
-        else:
-            hook = f"{cashtag} has a massive ask wall capping the price – the order book is a brick wall for buyers."
-            story = (f"Visible sell orders are stacked at resistance, preventing any upside. "
-                     f"This is a classic distribution signal. $BTC also facing heavy asks, confirming the bearish pressure.")
-
-    tp_str = " / ".join([f"{tp:.5f}" for tp in tps])
+    sym = sig["symbol"].replace("-USD", "")
+    direction = sig["action"]
+    entry = sig["limit_price"]
+    stop = sig["stop_loss"]
+    tps = sig["take_profits"]
+    risk = abs(entry - stop)
+    stop_pct = risk / entry * 100
     direction_icon = "🟢 LONG" if direction == "LONG" else "🔴 SHORT"
 
-    fail_warning = ""
-    if layers:
-        failed = [name for name, (_, _, status) in layers.items() if "FAIL" in status]
-        if failed:
-            fail_warning = f"\n⚠️ **Data Warning:** {', '.join(failed)} did not load properly – analysis may be incomplete."
+    tp_str = " / ".join([f"{tp:.2f}" for tp in tps])
 
     msg = (
-        f"🪝 {hook}\n\n"
-        f"📈 Price Action Logic:\n{story}\n\n"
-        f"{direction_icon} Execution Framework:\n"
-        f"• Area of Interest: {entry:.5f}\n"
-        f"• Technical Invalidation: {stop:.5f} (-{stop_pct:.2f}%)\n"
-        f"• Target Objectives: {tp_str}\n\n"
-        f"💬 Are you taking this setup or fading it? Drop your bias below! 👇\n\n"
-        f"{fail_warning}"
-        f"*Disclaimer: This price action analysis is for educational purposes only. Not financial advice. "
-        f"Always practice strict risk management and DYOR.*"
+        f"${sym} – {direction_icon} Setup (4H)\n"
+        f"Entry: {entry:.2f} | Stop: {stop:.2f} (-{stop_pct:.2f}%)\n"
+        f"TPs: {tp_str}"
     )
     return msg
 
