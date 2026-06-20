@@ -1,16 +1,18 @@
 #!/usr/bin/env python3
 """
-Crypto Swing Bot – KuCoin data, 0.5R TP1, 5 TPs (0.5/1/2/3/5R)
+Crypto Swing Bot – KuCoin data with Yahoo fallback, 0.5R TP1, 5 TPs
 Wider stop (2.5x ATR, 1.0‑6.0%) for swing tolerance.
 Compact Discord signals + full alert system.
 Position splitting: 30%/10%/10%/10%/40%. Trailing stop logic.
 BLACKLIST for stablecoins & QUQ.
-All price data from KuCoin public API (reliable, no IP blocks).
+KuCoin as primary source, Yahoo for coins not listed on KuCoin.
+Max 3 risky trades rule enforced.
 """
 
 import requests, json, os, traceback, random, math
 import pandas as pd
 import numpy as np
+import yfinance as yf
 from datetime import datetime, timedelta
 
 # ========== ENVIRONMENT ==========
@@ -24,7 +26,7 @@ BLACKLIST = {
     "QUQ", "USDT", "USDC", "DAI", "BUSD", "TUSD", "USDP", "FDUSD"
 }
 
-# ========== DYNAMIC COIN LIST (CoinGecko) – returns KuCoin symbols ==========
+# ========== DYNAMIC COIN LIST (CoinGecko → Yahoo symbols) ==========
 def fetch_top_liquid_coins(limit=50):
     global COIN_RANK
     url = "https://api.coingecko.com/api/v3/coins/markets"
@@ -39,24 +41,23 @@ def fetch_top_liquid_coins(limit=50):
     try:
         resp = requests.get(url, params=params, timeout=15)
         data = resp.json()
-        kucoin_symbols = []
+        yahoo_symbols = []
         COIN_RANK = {}
         rank = 1
         for coin in data:
             symbol = coin.get("symbol", "").upper()
             if symbol and symbol not in BLACKLIST:
-                # KuCoin uses "BTC-USDT" format
-                ksym = f"{symbol}-USDT"
-                if ksym not in kucoin_symbols:
-                    kucoin_symbols.append(ksym)
-                    COIN_RANK[ksym] = rank
+                ys = f"{symbol}-USD"
+                if ys not in yahoo_symbols:
+                    yahoo_symbols.append(ys)
+                    COIN_RANK[ys] = rank
                     rank += 1
-        print(f"Fetched {len(kucoin_symbols)} coins (blacklist filtered)")
-        return kucoin_symbols[:limit]
+        print(f"Fetched {len(yahoo_symbols)} coins (blacklist filtered)")
+        return yahoo_symbols[:limit]
     except Exception as e:
         print(f"CoinGecko API failed: {e}. Using fallback.")
-        fallback = ["BTC-USDT","ETH-USDT","BNB-USDT","SOL-USDT","XRP-USDT",
-                    "ADA-USDT","DOGE-USDT","DOT-USDT","MATIC-USDT","LINK-USDT"]
+        fallback = ["BTC-USD","ETH-USD","BNB-USD","SOL-USD","XRP-USD",
+                    "ADA-USD","DOGE-USD","DOT-USD","MATIC-USD","LINK-USD"]
         COIN_RANK = {sym: i+1 for i, sym in enumerate(fallback)}
         return fallback[:limit]
 
@@ -149,66 +150,94 @@ def update_portfolio(trade_result):
     portfolio['realized_pnl'] += trade_result['pnl']
     save_portfolio(portfolio)
 
+# ========== SYMBOL CONVERTER ==========
+def to_yahoo(sym):
+    """Convert any old symbol to Yahoo format: 'XLM-USD'."""
+    clean = sym.replace("-USD", "").replace("USDT", "").replace("-USDT", "")
+    clean = clean.strip("-")
+    return f"{clean}-USD"
+
+def yahoo_to_kucoin(sym_yahoo):
+    """Convert Yahoo symbol 'XLM-USD' to KuCoin symbol 'XLM-USDT'."""
+    base = sym_yahoo.replace("-USD", "")
+    return f"{base}-USDT"
+
 # ========== KUCOIN DATA FETCH ==========
-def get_kucoin_klines(symbol, interval, limit=100, start_time=None, end_time=None):
+def get_kucoin_klines(sym_kucoin, interval, limit=100, start_time=None, end_time=None):
     """
-    Fetch OHLCV from KuCoin. Symbol like 'BTC-USDT', interval '1hour','4hour','1day', etc.
-    Returns DataFrame with columns: Open, High, Low, Close, Volume
+    Fetch OHLCV from KuCoin. sym_kucoin like 'BTC-USDT'.
+    Returns DataFrame with Open, High, Low, Close, Volume.
     """
-    # KuCoin API expects interval in minutes: '1min','15min','30min','1hour','4hour','8hour','1day', etc.
-    # We'll map common intervals
-    interval_map = {
-        '1h': '1hour',
-        '4h': '4hour',
-        '1d': '1day',
-    }
+    interval_map = {'1h': '1hour', '4h': '4hour', '1d': '1day'}
     kucoin_interval = interval_map.get(interval, interval)
     base_url = "https://api.kucoin.com/api/v1/market/candles"
-    params = {
-        "type": kucoin_interval,
-        "symbol": symbol,
-    }
-    if start_time:
-        # KuCoin uses seconds, not milliseconds
-        params["startAt"] = int(start_time.timestamp())
-    if end_time:
-        params["endAt"] = int(end_time.timestamp())
-
+    params = {"type": kucoin_interval, "symbol": sym_kucoin}
+    if start_time: params["startAt"] = int(start_time.timestamp())
+    if end_time: params["endAt"] = int(end_time.timestamp())
     try:
         resp = requests.get(base_url, params=params, timeout=10)
         data = resp.json()
         if data.get("code") != "200000":
-            print(f"KuCoin error for {symbol}: {data}")
             return pd.DataFrame()
         candles = data["data"]
         if not candles:
             return pd.DataFrame()
-        # KuCoin returns: [time, open, close, high, low, volume, turnover]
-        # We need: open, high, low, close, volume
         rows = []
         for c in candles:
-            # c[0] is timestamp in seconds (string), convert to datetime
             ts = datetime.utcfromtimestamp(int(c[0]))
-            row = {
+            rows.append({
                 'open_time': ts,
                 'Open': float(c[1]),
                 'Close': float(c[2]),
                 'High': float(c[3]),
                 'Low': float(c[4]),
                 'Volume': float(c[5])
-            }
-            rows.append(row)
-        df = pd.DataFrame(rows)
-        df.set_index('open_time', inplace=True)
+            })
+        df = pd.DataFrame(rows).set_index('open_time').sort_index()
         df = df[['Open','High','Low','Close','Volume']]
-        df.sort_index(inplace=True)
-        # Limit number of candles if needed
-        if len(df) > limit:
-            df = df.tail(limit)
+        if len(df) > limit: df = df.tail(limit)
         return df
     except Exception as e:
-        print(f"KuCoin klines exception for {symbol}: {e}")
+        print(f"KuCoin error for {sym_kucoin}: {e}")
         return pd.DataFrame()
+
+# ========== YAHOO FALLBACK ==========
+def get_yahoo_klines(sym_yahoo, interval, days=14, start=None, end=None):
+    if start is None:
+        end = datetime.now()
+        start = end - timedelta(days=days)
+    else:
+        end = end if end else datetime.now()
+    try:
+        df = yf.download(sym_yahoo, start=start, end=end, interval=interval, progress=False)
+        if df.empty: return pd.DataFrame()
+        if isinstance(df.columns, pd.MultiIndex): df.columns = df.columns.get_level_values(0)
+        return df
+    except Exception as e:
+        print(f"Yahoo error for {sym_yahoo}: {e}")
+        return pd.DataFrame()
+
+def get_hybrid_klines(sym_yahoo, interval, days=14, start=None, end=None):
+    """
+    Primary: KuCoin (convert Yahoo symbol to KuCoin).
+    Fallback: Yahoo Finance.
+    If still empty and interval is 1h, try 4h Yahoo.
+    """
+    kucoin_sym = yahoo_to_kucoin(sym_yahoo)
+    df = get_kucoin_klines(kucoin_sym, interval, limit=500 if interval == '1h' else 100,
+                           start_time=start, end_time=end)
+    if not df.empty:
+        print(f"Using KuCoin data for {sym_yahoo}")
+        return df
+
+    print(f"KuCoin failed/unavailable for {sym_yahoo}, falling back to Yahoo")
+    df = get_yahoo_klines(sym_yahoo, interval, days=days, start=start, end=end)
+    if not df.empty: return df
+
+    if interval == '1h':
+        print(f"Yahoo 1h empty for {sym_yahoo}, trying 4h")
+        df = get_yahoo_klines(sym_yahoo, '4h', days=days, start=start, end=end)
+    return df
 
 # ========== TECHNICAL INDICATORS ==========
 def ema(series, period): return series.ewm(span=period, adjust=False).mean()
@@ -254,20 +283,18 @@ def support_resistance_levels(df, lookback=20):
     recent = df.tail(lookback)
     return recent['High'].max(), recent['Low'].min()
 
-# ========== SCORING (KuCoin data) ==========
+# ========== SCORING ==========
 def score_pair(pair):
-    """pair is KuCoin symbol like 'BTC-USDT'"""
     layers = {}
-    df_d = get_kucoin_klines(pair, '1d', limit=90)
+    df_d = get_yahoo_klines(pair, '1d', days=90)
     if df_d.empty or len(df_d) < 50: return 0, None, None, None, None, {"Daily data": (0,0,"FAIL: insufficient daily candles")}
-    df_4h = get_kucoin_klines(pair, '4h', limit=100)
+    df_4h = get_yahoo_klines(pair, '4h', days=14)
     if df_4h.empty or len(df_4h) < 50: return 0, None, None, None, None, {"4h data": (0,0,"FAIL: insufficient 4h candles")}
-    df_1h = get_kucoin_klines(pair, '1h', limit=72)
+    df_1h = get_hybrid_klines(pair, '1h', days=3)   # hybrid 1h
     if df_1h.empty or len(df_1h) < 10: return 0, None, None, None, None, {"1h data": (0,0,"FAIL: insufficient 1h candles")}
 
     price = df_4h['Close'].iloc[-1]
 
-    # Daily trend
     ema50_d = ema(df_d['Close'], 50)
     ema200_d = ema(df_d['Close'], 200)
     trend_daily = 0
@@ -276,16 +303,13 @@ def score_pair(pair):
     elif price < ema50_d.iloc[-1] and ema50_d.iloc[-1] < ema200_d.iloc[-1]:
         trend_daily = -1
 
-    # Fallback to 4h
     if trend_daily == 0:
         ema50_4h = ema(df_4h['Close'], 50)
         ema200_4h = ema(df_4h['Close'], 200)
         if price > ema50_4h.iloc[-1] and ema50_4h.iloc[-1] > ema200_4h.iloc[-1]:
             trend_daily = 1
-            print(f"{pair}: using 4h bullish fallback")
         elif price < ema50_4h.iloc[-1] and ema50_4h.iloc[-1] < ema200_4h.iloc[-1]:
             trend_daily = -1
-            print(f"{pair}: using 4h bearish fallback")
         else:
             return 0, None, None, None, None, {"Daily trend": (0,0,"FAIL: no clear trend (daily or 4h)")}
 
@@ -309,8 +333,8 @@ def score_pair(pair):
     vol_avg = df_4h['Volume'].iloc[-6:-1].mean() if len(df_4h) >= 6 else vol_last
     vol_surge = vol_last > vol_avg * 1.2 if vol_avg > 0 else False
 
-    # BTC context (KuCoin)
-    btc_df = get_kucoin_klines("BTC-USDT", '4h', limit=100)
+    # BTC context (hybrid)
+    btc_df = get_hybrid_klines("BTC-USD", '4h', days=14)
     market_aligned = False
     if not btc_df.empty and len(btc_df) >= 50:
         btc_ema50 = ema(btc_df['Close'], 50)
@@ -322,7 +346,6 @@ def score_pair(pair):
 
     def bool_score(cond): return 1 if cond else 0
 
-    # Layers
     if direction == "LONG":
         ema_align = price > ema50_4h.iloc[-1] and ema50_4h.iloc[-1] > ema200_4h.iloc[-1]
     else:
@@ -375,53 +398,54 @@ def ai_confirm_trade(signal_dict):
     except: pass
     return True
 
-# ========== SIGNAL GENERATION ==========
+# ========== SIGNAL GENERATION (max 3 risky trades) ==========
 def generate_signal():
-    open_symbols_risky = set()
+    risky_count = 0
     try:
         open_df = pd.read_csv(OPEN_TRADES_CSV)
         if not open_df.empty:
             if "symbol" in open_df.columns:
-                # Convert old formats to KuCoin if needed
-                def to_kucoin(s):
-                    s = s.replace("-USD", "-USDT")
-                    if not s.endswith("-USDT"):
-                        s = s + "-USDT"
-                    return s
-                open_df["symbol"] = open_df["symbol"].apply(to_kucoin)
+                open_df["symbol"] = open_df["symbol"].apply(to_yahoo)
+                save_csv(OPEN_TRADES_CSV, open_df)
             if "breakeven" in open_df.columns:
                 risky = open_df[open_df["breakeven"] == False]
             else:
                 risky = open_df
+            risky_count = len(risky)
+    except: pass
+
+    if risky_count >= 3:
+        print(f"Max 3 risky trades limit reached ({risky_count}). No new signals.")
+        return None, [], {}, 0, 0, risky_count
+
+    open_symbols_risky = set()
+    try:
+        open_df = pd.read_csv(OPEN_TRADES_CSV)
+        if not open_df.empty:
+            if "symbol" in open_df.columns: open_df["symbol"] = open_df["symbol"].apply(to_yahoo)
+            if "breakeven" in open_df.columns: risky = open_df[open_df["breakeven"] == False]
+            else: risky = open_df
             open_symbols_risky = set(risky["symbol"].values)
     except: pass
 
-    all_scored = []
-    top_overall = None
-    skipped_no_trend = 0
-    skipped_data = 0
-
+    all_scored = []; top_overall = None; skipped_no_trend = 0; skipped_data = 0
     for pair in CRYPTO_PAIRS:
-        if pair in open_symbols_risky:
-            continue
+        if pair in open_symbols_risky: continue
         score, direction, price, atr_val, swing_level, layers = score_pair(pair)
         if direction is None:
-            if "Daily trend" in layers:
-                skipped_no_trend += 1
-            else:
-                skipped_data += 1
+            if "Daily trend" in layers: skipped_no_trend += 1
+            else: skipped_data += 1
             continue
         all_scored.append((pair, score, direction, price, atr_val, swing_level, layers))
         if top_overall is None or score > top_overall[1]:
             top_overall = (pair, score, direction, price, atr_val, swing_level, layers)
 
     print(f"Scored pairs: {len(all_scored)} | No trend: {skipped_no_trend} | Data fail: {skipped_data}")
-
     top5 = sorted(all_scored, key=lambda x: x[1], reverse=True)[:5]
     top_layers = top_overall[6] if top_overall else {}
     candidates = [item for item in all_scored if item[1] >= 6.0]
     if not candidates:
-        return None, top5, top_layers, skipped_no_trend, skipped_data
+        return None, top5, top_layers, skipped_no_trend, skipped_data, risky_count
 
     candidates.sort(key=lambda x: x[1], reverse=True)
     pair, score, direction, price, atr_val, swing_level, layers = candidates[0]
@@ -438,19 +462,18 @@ def generate_signal():
         stop = price + stop_distance
         if swing_level and swing_level < price + stop_distance*1.2:
             stop = max(stop, swing_level + 0.05*(atr_val if atr_val else price*0.01))
-    stop = round(stop, 6)
-    risk = abs(price - stop)
+    stop = round(stop, 6); risk = abs(price - stop)
     tp_multipliers = [0.5, 1.0, 2.0, 3.0, 5.0]
     tps = [round(price + m*risk, 6) if direction=="LONG" else round(price - m*risk, 6) for m in tp_multipliers]
     quantity = round((portfolio['balance']*0.01) / risk, 8)
     signal = {"action": direction, "symbol": pair, "quantity": quantity,
               "limit_price": price, "stop_loss": stop, "take_profits": tps,
-              "score": score, "atr": atr_val}
+              "score": score, "atr": atr_val, "layers": layers}
     if not ai_confirm_trade(signal):
         print(f"AI rejected {pair} {direction} (score {score:.1f})")
-        return None, top5, top_layers, skipped_no_trend, skipped_data
+        return None, top5, top_layers, skipped_no_trend, skipped_data, risky_count
     signal["ai_approved"] = True
-    return signal, top5, top_layers, skipped_no_trend, skipped_data
+    return signal, top5, top_layers, skipped_no_trend, skipped_data, risky_count
 
 # ========== DISCORD HELPERS ==========
 def send_discord_message(text):
@@ -482,20 +505,14 @@ def get_current_stop(trade):
         elif highest_tp_idx >= 3: return tps[2]
     return stop_orig
 
-# ========== TRADE MANAGEMENT (KuCoin data) ==========
+# ========== TRADE MANAGEMENT ==========
 def check_open_trades():
     try:
         open_df = pd.read_csv(OPEN_TRADES_CSV)
     except: return
     if open_df.empty: return
 
-    # Convert old symbols to KuCoin format if needed
-    def to_kucoin(s):
-        s = s.replace("-USD", "-USDT")
-        if not s.endswith("-USDT"):
-            s = s + "-USDT"
-        return s
-    open_df["symbol"] = open_df["symbol"].apply(to_kucoin)
+    open_df["symbol"] = open_df["symbol"].apply(to_yahoo)
     save_csv(OPEN_TRADES_CSV, open_df)
 
     for col in ["highest_tp","quantity","original_qty","breakeven"]:
@@ -508,8 +525,7 @@ def check_open_trades():
 
     for idx, trade in open_df.iterrows():
         try:
-            sym = trade["symbol"]
-            direction = trade["action"]
+            sym = trade["symbol"]; direction = trade["action"]
             entry = float(trade["entry"]); stop_orig = float(trade["stop"])
             original_qty = float(trade.get("original_qty", trade.get("quantity",0)))
             remaining_qty = float(trade.get("quantity", original_qty))
@@ -518,14 +534,11 @@ def check_open_trades():
             try: entry_time = datetime.strptime(trade["timestamp"], "%Y-%m-%d %H:%M:%S")
             except: still_open.append(trade); continue
 
-            df_1h = get_kucoin_klines(sym, '1h', limit=500, start_time=entry_time, end_time=now)
+            df_1h = get_hybrid_klines(sym, '1h', start=entry_time, end=now)
             if df_1h.empty:
-                print(f"No KuCoin 1h data for {sym}. Trying 4h...")
-                df_1h = get_kucoin_klines(sym, '4h', limit=200, start_time=entry_time, end_time=now)
-                if df_1h.empty:
-                    print(f"No data at all for {sym}. Trade not checked.")
-                    still_open.append(trade)
-                    continue
+                print(f"No data for {sym}. Trade not checked.")
+                still_open.append(trade)
+                continue
 
             highest_tp_idx = int(trade.get("highest_tp", -1))
             current_stop = get_current_stop(trade)
@@ -615,8 +628,7 @@ def send_trade_close_chart(trade, hit_level, exit_price, pnl):
         import matplotlib; matplotlib.use('Agg')
         import matplotlib.pyplot as plt; import mplfinance as mpf
         entry_time = datetime.strptime(trade["timestamp"], "%Y-%m-%d %H:%M:%S")
-        df = get_kucoin_klines(sym, '1h', limit=500, start_time=entry_time, end_time=datetime.now())
-        if df.empty: df = get_kucoin_klines(sym, '4h', limit=200, start_time=entry_time, end_time=datetime.now())
+        df = get_hybrid_klines(sym, '1h', start=entry_time, end=datetime.now())
         if df.empty: return
         mpf_style = mpf.make_mpf_style(base_mpf_style='nightclouds', facecolor='#000000', gridcolor='#2a2e39',
                                        rc={'axes.labelcolor':'white','xtick.color':'white','ytick.color':'white','axes.titlecolor':'white'})
@@ -640,16 +652,25 @@ def send_trade_close_chart(trade, hit_level, exit_price, pnl):
 
 # ========== COMPACT SIGNAL FORMATTING ==========
 def format_signal(sig):
-    sym = sig["symbol"].replace("-USDT","")
+    sym = sig["symbol"].replace("-USD","")
     direction = sig["action"]
     entry = sig["limit_price"]; stop = sig["stop_loss"]; tps = sig["take_profits"]
     risk = abs(entry - stop); stop_pct = risk / entry * 100
     direction_icon = "🟢 LONG" if direction == "LONG" else "🔴 SHORT"
     tp_str = " / ".join([f"{tp:.2f}" for tp in tps])
-    return f"${sym} – {direction_icon} Setup (4H)\nEntry: {entry:.2f} | Stop: {stop:.2f} (-{stop_pct:.2f}%)\nTPs: {tp_str}"
+    score = sig["score"]
+    layers = sig.get("layers", {})
+    fail_warning = ""
+    if layers:
+        failed = [name for name, (_, _, status) in layers.items() if "FAIL" in status]
+        if failed:
+            fail_warning = f" ⚠️ Data: {', '.join(failed)}"
+    return f"${sym} – {direction_icon} Setup (4H) | Score: {score:.1f}/13.5\nEntry: {entry:.2f} | Stop: {stop:.2f} (-{stop_pct:.2f}%)\nTPs: {tp_str}{fail_warning}"
 
 # ========== HOLD MESSAGE ==========
-def format_hold_message(top5, top_layers, skipped_no_trend=0, skipped_data=0):
+def format_hold_message(top5, top_layers, skipped_no_trend=0, skipped_data=0, risky_limit=False):
+    if risky_limit:
+        return "HOLD – Maximum 3 risky trades limit reached. No new signals until a TP1 is hit."
     if not top5:
         msg = "HOLD – No valid trade setups found."
         if skipped_no_trend > 0 or skipped_data > 0:
@@ -659,10 +680,10 @@ def format_hold_message(top5, top_layers, skipped_no_trend=0, skipped_data=0):
         return msg
     lines = [f"HOLD – No high‑conviction crypto setup found.\n📊 **Top Coin Scores** (of {len(top5)})"]
     for idx, (pair, score, direction, _, _, _, _) in enumerate(top5, 1):
-        short = pair.replace("-USDT","")
+        short = pair.replace("-USD","")
         lines.append(f"{idx}. {short} → {direction} ({score:.1f}/13.5)")
     if top_layers:
-        top_pair = top5[0][0].replace("-USDT",""); top_score = top5[0][1]; top_dir = top5[0][2]
+        top_pair = top5[0][0].replace("-USD",""); top_score = top5[0][1]; top_dir = top5[0][2]
         lines.append(f"\n🔎 **Top Coin Layer Breakdown:** {top_pair} ({top_dir}, {top_score:.1f})")
         for name, (earned, max_, status) in top_layers.items():
             if "FAIL" in status: lines.append(f"• {name} ({max_}): ⚠️ {status}")
@@ -678,7 +699,7 @@ def send_trade_chart(signal):
     sym = signal['symbol']
     try:
         import matplotlib; matplotlib.use('Agg'); import matplotlib.pyplot as plt; import mplfinance as mpf
-        df = get_kucoin_klines(sym, '4h', limit=100)
+        df = get_hybrid_klines(sym, '4h', days=21)
         if df.empty or len(df) < 20: raise ValueError("not enough candles")
         mpf_style = mpf.make_mpf_style(base_mpf_style='nightclouds', facecolor='#000000', gridcolor='#2a2e39',
                                        rc={'axes.labelcolor':'white','xtick.color':'white','ytick.color':'white','axes.titlecolor':'white'})
@@ -720,13 +741,16 @@ def main():
         if daily_pnl() <= portfolio['daily_loss_limit']:
             send_discord_message("Daily loss limit reached. No new trades today.")
             return
-        sig, top5, top_layers, skipped_no_trend, skipped_data = generate_signal()
+        sig, top5, top_layers, skipped_no_trend, skipped_data, risky_count = generate_signal()
         if sig:
             log_signal(sig); add_open_trade(sig)
             portfolio['open_positions'] += 1; save_portfolio(portfolio)
             send_trade_chart(sig)
         else:
-            send_discord_message(format_hold_message(top5, top_layers, skipped_no_trend, skipped_data))
+            if risky_count >= 3:
+                send_discord_message(format_hold_message(top5, top_layers, risky_limit=True))
+            else:
+                send_discord_message(format_hold_message(top5, top_layers, skipped_no_trend, skipped_data))
     except Exception as e:
         err = f"Bot crashed: {traceback.format_exc()[:500]}"
         print(err); send_discord_message(err)
