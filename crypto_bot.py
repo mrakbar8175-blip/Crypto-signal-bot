@@ -1,12 +1,11 @@
 #!/usr/bin/env python3
 """
-Crypto Swing Bot – Binance data, 0.5R TP1, 5 TPs (0.5/1/2/3/5R)
+Crypto Swing Bot – KuCoin data, 0.5R TP1, 5 TPs (0.5/1/2/3/5R)
 Wider stop (2.5x ATR, 1.0‑6.0%) for swing tolerance.
 Compact Discord signals + full alert system.
 Position splitting: 30%/10%/10%/10%/40%. Trailing stop logic.
 BLACKLIST for stablecoins & QUQ.
-All price data from Binance public klines.
-Fallback direction from 4h when daily trend is unclear.
+All price data from KuCoin public API (reliable, no IP blocks).
 """
 
 import requests, json, os, traceback, random, math
@@ -25,7 +24,7 @@ BLACKLIST = {
     "QUQ", "USDT", "USDC", "DAI", "BUSD", "TUSD", "USDP", "FDUSD"
 }
 
-# ========== DYNAMIC COIN LIST (CoinGecko) ==========
+# ========== DYNAMIC COIN LIST (CoinGecko) – returns KuCoin symbols ==========
 def fetch_top_liquid_coins(limit=50):
     global COIN_RANK
     url = "https://api.coingecko.com/api/v3/coins/markets"
@@ -40,23 +39,24 @@ def fetch_top_liquid_coins(limit=50):
     try:
         resp = requests.get(url, params=params, timeout=15)
         data = resp.json()
-        symbols = []
+        kucoin_symbols = []
         COIN_RANK = {}
         rank = 1
         for coin in data:
             symbol = coin.get("symbol", "").upper()
             if symbol and symbol not in BLACKLIST:
-                sym = f"{symbol}USDT"
-                if sym not in symbols:
-                    symbols.append(sym)
-                    COIN_RANK[sym] = rank
+                # KuCoin uses "BTC-USDT" format
+                ksym = f"{symbol}-USDT"
+                if ksym not in kucoin_symbols:
+                    kucoin_symbols.append(ksym)
+                    COIN_RANK[ksym] = rank
                     rank += 1
-        print(f"Fetched {len(symbols)} coins (blacklist filtered)")
-        return symbols[:limit]
+        print(f"Fetched {len(kucoin_symbols)} coins (blacklist filtered)")
+        return kucoin_symbols[:limit]
     except Exception as e:
         print(f"CoinGecko API failed: {e}. Using fallback.")
-        fallback = ["BTCUSDT","ETHUSDT","BNBUSDT","SOLUSDT","XRPUSDT",
-                    "ADAUSDT","DOGEUSDT","DOTUSDT","MATICUSDT","LINKUSDT"]
+        fallback = ["BTC-USDT","ETH-USDT","BNB-USDT","SOL-USDT","XRP-USDT",
+                    "ADA-USDT","DOGE-USDT","DOT-USDT","MATIC-USDT","LINK-USDT"]
         COIN_RANK = {sym: i+1 for i, sym in enumerate(fallback)}
         return fallback[:limit]
 
@@ -149,44 +149,66 @@ def update_portfolio(trade_result):
     portfolio['realized_pnl'] += trade_result['pnl']
     save_portfolio(portfolio)
 
-# ========== BINANCE DATA FETCH ==========
-def get_binance_klines(symbol, interval, limit=100, start_time=None, end_time=None):
-    url = "https://api.binance.com/api/v3/klines"
-    params = {"symbol": symbol, "interval": interval, "limit": limit}
+# ========== KUCOIN DATA FETCH ==========
+def get_kucoin_klines(symbol, interval, limit=100, start_time=None, end_time=None):
+    """
+    Fetch OHLCV from KuCoin. Symbol like 'BTC-USDT', interval '1hour','4hour','1day', etc.
+    Returns DataFrame with columns: Open, High, Low, Close, Volume
+    """
+    # KuCoin API expects interval in minutes: '1min','15min','30min','1hour','4hour','8hour','1day', etc.
+    # We'll map common intervals
+    interval_map = {
+        '1h': '1hour',
+        '4h': '4hour',
+        '1d': '1day',
+    }
+    kucoin_interval = interval_map.get(interval, interval)
+    base_url = "https://api.kucoin.com/api/v1/market/candles"
+    params = {
+        "type": kucoin_interval,
+        "symbol": symbol,
+    }
     if start_time:
-        params["startTime"] = int(start_time.timestamp() * 1000)
+        # KuCoin uses seconds, not milliseconds
+        params["startAt"] = int(start_time.timestamp())
     if end_time:
-        params["endTime"] = int(end_time.timestamp() * 1000)
+        params["endAt"] = int(end_time.timestamp())
+
     try:
-        resp = requests.get(url, params=params, timeout=10)
+        resp = requests.get(base_url, params=params, timeout=10)
         data = resp.json()
-        if not isinstance(data, list) or len(data) == 0:
+        if data.get("code") != "200000":
+            print(f"KuCoin error for {symbol}: {data}")
             return pd.DataFrame()
-        df = pd.DataFrame(data, columns=[
-            'open_time','Open','High','Low','Close','Volume',
-            'close_time','quote_vol','trades','taker_buy_base','taker_buy_quote','ignore'
-        ])
-        df['Open'] = df['Open'].astype(float)
-        df['High'] = df['High'].astype(float)
-        df['Low'] = df['Low'].astype(float)
-        df['Close'] = df['Close'].astype(float)
-        df['Volume'] = df['Volume'].astype(float)
-        df['open_time'] = pd.to_datetime(df['open_time'], unit='ms')
+        candles = data["data"]
+        if not candles:
+            return pd.DataFrame()
+        # KuCoin returns: [time, open, close, high, low, volume, turnover]
+        # We need: open, high, low, close, volume
+        rows = []
+        for c in candles:
+            # c[0] is timestamp in seconds (string), convert to datetime
+            ts = datetime.utcfromtimestamp(int(c[0]))
+            row = {
+                'open_time': ts,
+                'Open': float(c[1]),
+                'Close': float(c[2]),
+                'High': float(c[3]),
+                'Low': float(c[4]),
+                'Volume': float(c[5])
+            }
+            rows.append(row)
+        df = pd.DataFrame(rows)
         df.set_index('open_time', inplace=True)
-        return df[['Open','High','Low','Close','Volume']]
+        df = df[['Open','High','Low','Close','Volume']]
+        df.sort_index(inplace=True)
+        # Limit number of candles if needed
+        if len(df) > limit:
+            df = df.tail(limit)
+        return df
     except Exception as e:
-        print(f"Binance klines error for {symbol}: {e}")
+        print(f"KuCoin klines exception for {symbol}: {e}")
         return pd.DataFrame()
-
-def get_btc_klines(interval='4h', days=14):
-    return get_binance_klines("BTCUSDT", interval, limit=100)
-
-# ========== SYMBOL CONVERTER ==========
-def convert_to_binance(sym):
-    sym = sym.replace("-USD", "USDT")
-    if not sym.endswith("USDT"):
-        sym = sym + "USDT"
-    return sym
 
 # ========== TECHNICAL INDICATORS ==========
 def ema(series, period): return series.ewm(span=period, adjust=False).mean()
@@ -232,35 +254,29 @@ def support_resistance_levels(df, lookback=20):
     recent = df.tail(lookback)
     return recent['High'].max(), recent['Low'].min()
 
-# ========== SCORING (with 4h fallback for trend) ==========
+# ========== SCORING (KuCoin data) ==========
 def score_pair(pair):
+    """pair is KuCoin symbol like 'BTC-USDT'"""
     layers = {}
-    # Daily data
-    df_d = get_binance_klines(pair, '1d', limit=90)
-    if df_d.empty or len(df_d) < 50:
-        # If daily data fails, we cannot even compute EMAs; return failure but still attempt 4h fallback later
-        # For consistency, we'll mark the whole pair as failed and exit.
-        return 0, None, None, None, None, {"Daily data": (0,0,"FAIL: insufficient daily candles")}
-
-    # 4h and 1h data
-    df_4h = get_binance_klines(pair, '4h', limit=100)
+    df_d = get_kucoin_klines(pair, '1d', limit=90)
+    if df_d.empty or len(df_d) < 50: return 0, None, None, None, None, {"Daily data": (0,0,"FAIL: insufficient daily candles")}
+    df_4h = get_kucoin_klines(pair, '4h', limit=100)
     if df_4h.empty or len(df_4h) < 50: return 0, None, None, None, None, {"4h data": (0,0,"FAIL: insufficient 4h candles")}
-    df_1h = get_binance_klines(pair, '1h', limit=72)
+    df_1h = get_kucoin_klines(pair, '1h', limit=72)
     if df_1h.empty or len(df_1h) < 10: return 0, None, None, None, None, {"1h data": (0,0,"FAIL: insufficient 1h candles")}
 
     price = df_4h['Close'].iloc[-1]
 
-    # --- Determine trend direction ---
-    # Try daily first
+    # Daily trend
     ema50_d = ema(df_d['Close'], 50)
     ema200_d = ema(df_d['Close'], 200)
     trend_daily = 0
     if price > ema50_d.iloc[-1] and ema50_d.iloc[-1] > ema200_d.iloc[-1]:
-        trend_daily = 1   # bullish daily
+        trend_daily = 1
     elif price < ema50_d.iloc[-1] and ema50_d.iloc[-1] < ema200_d.iloc[-1]:
-        trend_daily = -1  # bearish daily
+        trend_daily = -1
 
-    # Fallback to 4h alignment if daily is unclear
+    # Fallback to 4h
     if trend_daily == 0:
         ema50_4h = ema(df_4h['Close'], 50)
         ema200_4h = ema(df_4h['Close'], 200)
@@ -271,12 +287,10 @@ def score_pair(pair):
             trend_daily = -1
             print(f"{pair}: using 4h bearish fallback")
         else:
-            # Still no clear trend → skip this pair
             return 0, None, None, None, None, {"Daily trend": (0,0,"FAIL: no clear trend (daily or 4h)")}
 
     direction = "LONG" if trend_daily == 1 else "SHORT"
 
-    # 4h indicators
     ema50_4h = ema(df_4h['Close'], 50)
     ema200_4h = ema(df_4h['Close'], 200)
     adx_val, di_plus, di_minus = adx(df_4h)
@@ -285,9 +299,9 @@ def score_pair(pair):
     atr_val = atr(df_4h)
     res, sup = support_resistance_levels(df_4h, 20)
 
-    # 1h indicators
     rsi_1h_val = rsi(df_1h, 14)
-    last_candle = df_1h.iloc[-1]; prev_candle = df_1h.iloc[-2]
+    last_candle = df_1h.iloc[-1]
+    prev_candle = df_1h.iloc[-2]
     candle_range = last_candle['High'] - last_candle['Low']
     bullish_momentum = (last_candle['Close'] - last_candle['Open']) / candle_range if candle_range > 0 else 0
 
@@ -295,8 +309,8 @@ def score_pair(pair):
     vol_avg = df_4h['Volume'].iloc[-6:-1].mean() if len(df_4h) >= 6 else vol_last
     vol_surge = vol_last > vol_avg * 1.2 if vol_avg > 0 else False
 
-    # BTC context
-    btc_df = get_btc_klines('4h', days=14)
+    # BTC context (KuCoin)
+    btc_df = get_kucoin_klines("BTC-USDT", '4h', limit=100)
     market_aligned = False
     if not btc_df.empty and len(btc_df) >= 50:
         btc_ema50 = ema(btc_df['Close'], 50)
@@ -308,7 +322,7 @@ def score_pair(pair):
 
     def bool_score(cond): return 1 if cond else 0
 
-    # Layers (same weights)
+    # Layers
     if direction == "LONG":
         ema_align = price > ema50_4h.iloc[-1] and ema50_4h.iloc[-1] > ema200_4h.iloc[-1]
     else:
@@ -368,7 +382,13 @@ def generate_signal():
         open_df = pd.read_csv(OPEN_TRADES_CSV)
         if not open_df.empty:
             if "symbol" in open_df.columns:
-                open_df["symbol"] = open_df["symbol"].apply(convert_to_binance)
+                # Convert old formats to KuCoin if needed
+                def to_kucoin(s):
+                    s = s.replace("-USD", "-USDT")
+                    if not s.endswith("-USDT"):
+                        s = s + "-USDT"
+                    return s
+                open_df["symbol"] = open_df["symbol"].apply(to_kucoin)
             if "breakeven" in open_df.columns:
                 risky = open_df[open_df["breakeven"] == False]
             else:
@@ -386,7 +406,6 @@ def generate_signal():
             continue
         score, direction, price, atr_val, swing_level, layers = score_pair(pair)
         if direction is None:
-            # check if it was due to data failure or no trend
             if "Daily trend" in layers:
                 skipped_no_trend += 1
             else:
@@ -463,24 +482,34 @@ def get_current_stop(trade):
         elif highest_tp_idx >= 3: return tps[2]
     return stop_orig
 
-# ========== TRADE MANAGEMENT ==========
+# ========== TRADE MANAGEMENT (KuCoin data) ==========
 def check_open_trades():
     try:
         open_df = pd.read_csv(OPEN_TRADES_CSV)
     except: return
     if open_df.empty: return
-    if "symbol" in open_df.columns:
-        open_df["symbol"] = open_df["symbol"].apply(convert_to_binance)
-        save_csv(OPEN_TRADES_CSV, open_df)
+
+    # Convert old symbols to KuCoin format if needed
+    def to_kucoin(s):
+        s = s.replace("-USD", "-USDT")
+        if not s.endswith("-USDT"):
+            s = s + "-USDT"
+        return s
+    open_df["symbol"] = open_df["symbol"].apply(to_kucoin)
+    save_csv(OPEN_TRADES_CSV, open_df)
+
     for col in ["highest_tp","quantity","original_qty","breakeven"]:
         if col not in open_df.columns:
             open_df[col] = -1 if col=="highest_tp" else (False if col=="breakeven" else 0.0)
+
     results = []; still_open = []; alerts = []
     now = datetime.now()
     fractions = [0.30, 0.10, 0.10, 0.10, 0.40]
+
     for idx, trade in open_df.iterrows():
         try:
-            sym = trade["symbol"]; direction = trade["action"]
+            sym = trade["symbol"]
+            direction = trade["action"]
             entry = float(trade["entry"]); stop_orig = float(trade["stop"])
             original_qty = float(trade.get("original_qty", trade.get("quantity",0)))
             remaining_qty = float(trade.get("quantity", original_qty))
@@ -488,14 +517,20 @@ def check_open_trades():
             tps = [float(trade[f"TP{i+1}"]) for i in range(5)]
             try: entry_time = datetime.strptime(trade["timestamp"], "%Y-%m-%d %H:%M:%S")
             except: still_open.append(trade); continue
-            df_1h = get_binance_klines(sym, '1h', limit=500, start_time=entry_time, end_time=now)
+
+            df_1h = get_kucoin_klines(sym, '1h', limit=500, start_time=entry_time, end_time=now)
             if df_1h.empty:
-                print(f"WARNING: No Binance 1h data for {sym} from {entry_time} to {now}.")
-                still_open.append(trade)
-                continue
+                print(f"No KuCoin 1h data for {sym}. Trying 4h...")
+                df_1h = get_kucoin_klines(sym, '4h', limit=200, start_time=entry_time, end_time=now)
+                if df_1h.empty:
+                    print(f"No data at all for {sym}. Trade not checked.")
+                    still_open.append(trade)
+                    continue
+
             highest_tp_idx = int(trade.get("highest_tp", -1))
             current_stop = get_current_stop(trade)
             trade_closed = False
+
             for candle_time, candle in df_1h.iterrows():
                 high = candle['High']; low = candle['Low']
                 new_tp_idx = None
@@ -505,6 +540,7 @@ def check_open_trades():
                 else:
                     for i in range(len(tps)-1,-1,-1):
                         if low <= tps[i] and i > highest_tp_idx: new_tp_idx = i; break
+
                 if new_tp_idx is not None:
                     for i in range(highest_tp_idx+1, new_tp_idx+1):
                         if remaining_qty <= 0: break
@@ -532,6 +568,7 @@ def check_open_trades():
                             if remaining_qty <= 0: trade_closed = True; break
                     if remaining_qty <= 0: break
                     current_stop = get_current_stop(trade)
+
                 if remaining_qty > 0:
                     sl_hit = (low <= current_stop) if direction=="LONG" else (high >= current_stop)
                     if sl_hit:
@@ -550,19 +587,21 @@ def check_open_trades():
                         send_trade_close_chart(trade, desc, exit_price, pnl)
                         break
                 if remaining_qty <= 0: break
+
             if remaining_qty > 0 and not trade_closed:
                 trade["quantity"] = remaining_qty; trade["highest_tp"] = highest_tp_idx
                 still_open.append(trade)
         except Exception as e: print(f"Error processing trade {trade.get('symbol','?')}: {e}")
+
     if results: append_csv(TRADE_RESULTS_CSV, pd.DataFrame(results))
     if still_open:
-        for t in still_open: t["symbol"] = convert_to_binance(t["symbol"])
         save_csv(OPEN_TRADES_CSV, pd.DataFrame(still_open))
         portfolio['open_positions'] = len(still_open)
     else:
         save_csv(OPEN_TRADES_CSV, pd.DataFrame())
         portfolio['open_positions'] = 0
     save_portfolio(portfolio)
+
     risky_count = sum(1 for t in still_open if t.get("breakeven", False) == False)
     be_count = len(still_open) - risky_count
     summary = f"🔍 Open trades status: {risky_count} risky (TP1 not hit yet), {be_count} breakeven (risk-free). Total: {len(still_open)}"
@@ -571,19 +610,21 @@ def check_open_trades():
     if not alerts: print("No trade closures this run.")
 
 def send_trade_close_chart(trade, hit_level, exit_price, pnl):
-    sym = trade["symbol"]; entry = float(trade["entry"]); stop = float(trade["stop"])
-    tps = [float(trade[f"TP{i+1}"]) for i in range(5)]; direction = trade["action"]
+    sym = trade["symbol"]
     try:
         import matplotlib; matplotlib.use('Agg')
         import matplotlib.pyplot as plt; import mplfinance as mpf
         entry_time = datetime.strptime(trade["timestamp"], "%Y-%m-%d %H:%M:%S")
-        df = get_binance_klines(sym, '1h', limit=500, start_time=entry_time, end_time=datetime.now())
+        df = get_kucoin_klines(sym, '1h', limit=500, start_time=entry_time, end_time=datetime.now())
+        if df.empty: df = get_kucoin_klines(sym, '4h', limit=200, start_time=entry_time, end_time=datetime.now())
         if df.empty: return
         mpf_style = mpf.make_mpf_style(base_mpf_style='nightclouds', facecolor='#000000', gridcolor='#2a2e39',
                                        rc={'axes.labelcolor':'white','xtick.color':'white','ytick.color':'white','axes.titlecolor':'white'})
         fig, ax = mpf.plot(df, type='candle', style=mpf_style,
                            title=f"{sym} {direction} – {hit_level} (PnL: {pnl:.2f}$)", ylabel='Price',
                            returnfig=True, figsize=(8,6))
+        entry = float(trade["entry"]); stop = float(trade["stop"])
+        tps = [float(trade[f"TP{i+1}"]) for i in range(5)]
         ax.axhline(y=entry, color='#f1c40f', linestyle='--', linewidth=1.5, label='Entry')
         ax.axhline(y=stop, color='#e74c3c', linestyle='--', linewidth=1.5, label='Stop')
         for i, tp in enumerate(tps):
@@ -599,14 +640,15 @@ def send_trade_close_chart(trade, hit_level, exit_price, pnl):
 
 # ========== COMPACT SIGNAL FORMATTING ==========
 def format_signal(sig):
-    sym = sig["symbol"]; direction = sig["action"]
+    sym = sig["symbol"].replace("-USDT","")
+    direction = sig["action"]
     entry = sig["limit_price"]; stop = sig["stop_loss"]; tps = sig["take_profits"]
     risk = abs(entry - stop); stop_pct = risk / entry * 100
     direction_icon = "🟢 LONG" if direction == "LONG" else "🔴 SHORT"
     tp_str = " / ".join([f"{tp:.2f}" for tp in tps])
-    return f"${sym.replace('USDT','')} – {direction_icon} Setup (4H)\nEntry: {entry:.2f} | Stop: {stop:.2f} (-{stop_pct:.2f}%)\nTPs: {tp_str}"
+    return f"${sym} – {direction_icon} Setup (4H)\nEntry: {entry:.2f} | Stop: {stop:.2f} (-{stop_pct:.2f}%)\nTPs: {tp_str}"
 
-# ========== HOLD MESSAGE (with stats) ==========
+# ========== HOLD MESSAGE ==========
 def format_hold_message(top5, top_layers, skipped_no_trend=0, skipped_data=0):
     if not top5:
         msg = "HOLD – No valid trade setups found."
@@ -617,10 +659,10 @@ def format_hold_message(top5, top_layers, skipped_no_trend=0, skipped_data=0):
         return msg
     lines = [f"HOLD – No high‑conviction crypto setup found.\n📊 **Top Coin Scores** (of {len(top5)})"]
     for idx, (pair, score, direction, _, _, _, _) in enumerate(top5, 1):
-        short = pair.replace("USDT","")
+        short = pair.replace("-USDT","")
         lines.append(f"{idx}. {short} → {direction} ({score:.1f}/13.5)")
     if top_layers:
-        top_pair = top5[0][0].replace("USDT",""); top_score = top5[0][1]; top_dir = top5[0][2]
+        top_pair = top5[0][0].replace("-USDT",""); top_score = top5[0][1]; top_dir = top5[0][2]
         lines.append(f"\n🔎 **Top Coin Layer Breakdown:** {top_pair} ({top_dir}, {top_score:.1f})")
         for name, (earned, max_, status) in top_layers.items():
             if "FAIL" in status: lines.append(f"• {name} ({max_}): ⚠️ {status}")
@@ -636,8 +678,8 @@ def send_trade_chart(signal):
     sym = signal['symbol']
     try:
         import matplotlib; matplotlib.use('Agg'); import matplotlib.pyplot as plt; import mplfinance as mpf
-        df = get_binance_klines(sym, '4h', limit=100)
-        if df.empty or len(df) < 20: raise ValueError(f"Only {len(df)} 4h candles")
+        df = get_kucoin_klines(sym, '4h', limit=100)
+        if df.empty or len(df) < 20: raise ValueError("not enough candles")
         mpf_style = mpf.make_mpf_style(base_mpf_style='nightclouds', facecolor='#000000', gridcolor='#2a2e39',
                                        rc={'axes.labelcolor':'white','xtick.color':'white','ytick.color':'white','axes.titlecolor':'white'})
         ema50 = df['Close'].ewm(span=min(50,len(df)), adjust=False).mean()
@@ -673,7 +715,6 @@ def main():
         check_open_trades()
         try:
             open_df = pd.read_csv(OPEN_TRADES_CSV)
-            open_df["symbol"] = open_df["symbol"].apply(convert_to_binance)
             print(f"Currently {len(open_df)} open trade(s).")
         except: print("No open trades file.")
         if daily_pnl() <= portfolio['daily_loss_limit']:
