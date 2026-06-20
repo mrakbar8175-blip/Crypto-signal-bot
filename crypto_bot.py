@@ -1,13 +1,11 @@
 #!/usr/bin/env python3
 """
-Crypto Swing Bot – Top 50 liquid coins via CoinGecko, 0.5R TP1, 5 TPs (0.5/1/2/3/5R)
+Crypto Swing Bot – Binance data, 0.5R TP1, 5 TPs (0.5/1/2/3/5R)
 Wider stop (2.5x ATR, 1.0‑6.0%) for swing tolerance.
 Compact Discord signals + full alert system.
 Position splitting: 30%/10%/10%/10%/40%. Trailing stop logic.
-Breakeven after TP1, trailing stop after subsequent TPs.
-BLACKLIST for stablecoins & QUQ. HOLD shows scores & layer breakdown.
-BTC market context fetched from CoinGecko (no Yahoo fails).
-1h trade data fallback to 4h if 1h fetch fails.
+BLACKLIST for stablecoins & QUQ.
+All price data from Binance public klines (reliable 1h).
 """
 
 import requests, json, os, traceback, random, math
@@ -41,33 +39,23 @@ def fetch_top_liquid_coins(limit=50):
     try:
         resp = requests.get(url, params=params, timeout=15)
         data = resp.json()
-        yf_symbols = []
+        symbols = []
         COIN_RANK = {}
         rank = 1
         for coin in data:
             symbol = coin.get("symbol", "").upper()
             if symbol and symbol not in BLACKLIST:
-                yf_sym = f"{symbol}-USD"
-                if yf_sym not in yf_symbols:
-                    yf_symbols.append(yf_sym)
-                    COIN_RANK[yf_sym] = rank
+                sym = f"{symbol}USDT"      # Binance pair format
+                if sym not in symbols:
+                    symbols.append(sym)
+                    COIN_RANK[sym] = rank
                     rank += 1
-        print(f"Fetched {len(yf_symbols)} coins (blacklist filtered)")
-        return yf_symbols[:limit]
+        print(f"Fetched {len(symbols)} coins (blacklist filtered)")
+        return symbols[:limit]
     except Exception as e:
         print(f"CoinGecko API failed: {e}. Using fallback.")
-        fallback = [
-            "BTC-USD", "ETH-USD", "BNB-USD", "SOL-USD", "XRP-USD",
-            "ADA-USD", "DOGE-USD", "DOT-USD", "MATIC-USD", "LINK-USD",
-            "UNI-USD", "AVAX-USD", "LTC-USD", "FIL-USD", "TRX-USD",
-            "ATOM-USD", "XLM-USD", "ETC-USD", "BCH-USD", "NEAR-USD",
-            "VET-USD", "ICP-USD", "HBAR-USD", "APT-USD", "ARB-USD",
-            "OP-USD", "GRT-USD", "THETA-USD", "ALGO-USD", "FTM-USD",
-            "EGLD-USD", "IMX-USD", "SAND-USD", "AXS-USD", "MANA-USD",
-            "AAVE-USD", "MKR-USD", "SNX-USD", "CRV-USD", "COMP-USD",
-            "ZEC-USD", "BAT-USD", "ENJ-USD", "CHZ-USD", "HOT-USD",
-            "KSM-USD", "DASH-USD", "CELO-USD", "QTUM-USD", "IOST-USD"
-        ]
+        fallback = ["BTCUSDT","ETHUSDT","BNBUSDT","SOLUSDT","XRPUSDT",
+                    "ADAUSDT","DOGEUSDT","DOTUSDT","MATICUSDT","LINKUSDT"]
         COIN_RANK = {sym: i+1 for i, sym in enumerate(fallback)}
         return fallback[:limit]
 
@@ -160,48 +148,42 @@ def update_portfolio(trade_result):
     portfolio['realized_pnl'] += trade_result['pnl']
     save_portfolio(portfolio)
 
-# ========== DATA FETCH ==========
-# Removed yfinance import completely, using CoinGecko for BTC and yfinance only for coin price data.
-import yfinance as yf  # we still need yfinance for the individual coin data, but we'll handle failures better
-
-def get_data(pair, interval='4h', days=14, start=None, end=None):
-    """Fetch OHLCV from yfinance, returns DataFrame (may be empty)."""
-    ysym = pair
-    if start is None:
-        end = datetime.now()
-        start = end - timedelta(days=days)
-    else:
-        end = end if end else datetime.now()
+# ========== BINANCE DATA FETCH ==========
+def get_binance_klines(symbol, interval, limit=100, start_time=None, end_time=None):
+    """
+    Fetch klines from Binance. Returns DataFrame with OHLCV columns.
+    interval: '1h','4h','1d', etc.
+    """
+    url = "https://api.binance.com/api/v3/klines"
+    params = {"symbol": symbol, "interval": interval, "limit": limit}
+    if start_time:
+        params["startTime"] = int(start_time.timestamp() * 1000)
+    if end_time:
+        params["endTime"] = int(end_time.timestamp() * 1000)
     try:
-        df = yf.download(ysym, start=start, end=end, interval=interval, progress=False)
-        if df.empty:
-            return pd.DataFrame()
-        if isinstance(df.columns, pd.MultiIndex):
-            df.columns = df.columns.get_level_values(0)
-        return df
-    except Exception as e:
-        print(f"YFinance error for {pair}: {e}")
-        return pd.DataFrame()
-
-# ---------- BTC market context from CoinGecko (reliable) ----------
-def get_btc_ohlc_coingecko(days=14):
-    """Fetch BTC/USD 4h OHLC data from CoinGecko. Returns DataFrame with columns: Open, High, Low, Close, or empty DataFrame."""
-    url = f"https://api.coingecko.com/api/v3/coins/bitcoin/ohlc"
-    params = {"vs_currency": "usd", "days": days}
-    try:
-        resp = requests.get(url, params=params, timeout=15)
+        resp = requests.get(url, params=params, timeout=10)
         data = resp.json()
         if not isinstance(data, list) or len(data) == 0:
-            raise ValueError("Empty or invalid response")
-        # data is list of [timestamp, open, high, low, close]
-        df = pd.DataFrame(data, columns=["timestamp", "Open", "High", "Low", "Close"])
-        df["timestamp"] = pd.to_datetime(df["timestamp"], unit='ms')
-        df.set_index("timestamp", inplace=True)
-        # we only need OHLCV for EMA calculation, so volume not required
-        return df[["Open", "High", "Low", "Close"]]
+            return pd.DataFrame()
+        df = pd.DataFrame(data, columns=[
+            'open_time','Open','High','Low','Close','Volume',
+            'close_time','quote_vol','trades','taker_buy_base','taker_buy_quote','ignore'
+        ])
+        df['Open'] = df['Open'].astype(float)
+        df['High'] = df['High'].astype(float)
+        df['Low'] = df['Low'].astype(float)
+        df['Close'] = df['Close'].astype(float)
+        df['Volume'] = df['Volume'].astype(float)
+        df['open_time'] = pd.to_datetime(df['open_time'], unit='ms')
+        df.set_index('open_time', inplace=True)
+        return df[['Open','High','Low','Close','Volume']]
     except Exception as e:
-        print(f"CoinGecko BTC OHLC error: {e}")
+        print(f"Binance klines error for {symbol}: {e}")
         return pd.DataFrame()
+
+def get_btc_klines(interval='4h', days=14):
+    """Fetch BTC/USDT klines for market context."""
+    return get_binance_klines("BTCUSDT", interval, limit=100)  # enough for 14 days 4h
 
 # ========== TECHNICAL INDICATORS ==========
 def ema(series, period): return series.ewm(span=period, adjust=False).mean()
@@ -247,14 +229,14 @@ def support_resistance_levels(df, lookback=20):
     recent = df.tail(lookback)
     return recent['High'].max(), recent['Low'].min()
 
-# ========== SCORING (uses CoinGecko BTC) ==========
+# ========== SCORING (uses Binance data) ==========
 def score_pair(pair):
     layers = {}
-    df_d = get_data(pair, interval='1d', days=90)
+    df_d = get_binance_klines(pair, '1d', limit=90)
     if df_d.empty or len(df_d) < 50: return 0, None, None, None, None, {"Daily data": (0,0,"FAIL: insufficient daily candles")}
-    df_4h = get_data(pair, interval='4h', days=14)
+    df_4h = get_binance_klines(pair, '4h', limit=100)
     if df_4h.empty or len(df_4h) < 50: return 0, None, None, None, None, {"4h data": (0,0,"FAIL: insufficient 4h candles")}
-    df_1h = get_data(pair, interval='1h', days=3)
+    df_1h = get_binance_klines(pair, '1h', limit=72)
     if df_1h.empty or len(df_1h) < 10: return 0, None, None, None, None, {"1h data": (0,0,"FAIL: insufficient 1h candles")}
     price = df_4h['Close'].iloc[-1]
     ema50_d = ema(df_d['Close'], 50); ema200_d = ema(df_d['Close'], 200)
@@ -276,8 +258,8 @@ def score_pair(pair):
     vol_avg = df_4h['Volume'].iloc[-6:-1].mean() if len(df_4h) >= 6 else vol_last
     vol_surge = vol_last > vol_avg * 1.2 if vol_avg > 0 else False
 
-    # ------ BTC context from CoinGecko ------
-    btc_df = get_btc_ohlc_coingecko(days=14)
+    # BTC market context (Binance)
+    btc_df = get_btc_klines('4h', days=14)
     market_aligned = False
     if not btc_df.empty and len(btc_df) >= 50:
         btc_ema50 = ema(btc_df['Close'], 50)
@@ -290,7 +272,7 @@ def score_pair(pair):
     def bool_score(cond): return 1 if cond else 0
     direction = "LONG" if trend_daily == 1 else "SHORT"
 
-    # Layers
+    # Layers (identical to previous)
     if direction == "LONG": ema_align = price > ema50_4h.iloc[-1] and ema50_4h.iloc[-1] > ema200_4h.iloc[-1]
     else: ema_align = price < ema50_4h.iloc[-1] and ema50_4h.iloc[-1] < ema200_4h.iloc[-1]
     layers["EMA Align"] = (bool_score(ema_align) * 1.5, 1.5, "OK")
@@ -424,101 +406,60 @@ def get_current_stop(trade):
         elif highest_tp_idx >= 3: return tps[2]
     return stop_orig
 
-# ========== TRADE MANAGEMENT (with fallback for empty 1h data) ==========
+# ========== TRADE MANAGEMENT (uses Binance 1h data) ==========
 def check_open_trades():
     try:
         open_df = pd.read_csv(OPEN_TRADES_CSV)
-    except:
-        return
-    if open_df.empty:
-        return
-
+    except: return
+    if open_df.empty: return
     for col in ["highest_tp","quantity","original_qty","breakeven"]:
         if col not in open_df.columns:
             open_df[col] = -1 if col=="highest_tp" else (False if col=="breakeven" else 0.0)
-
-    results = []
-    still_open = []
-    alerts = []
+    results = []; still_open = []; alerts = []
     now = datetime.now()
     fractions = [0.30, 0.10, 0.10, 0.10, 0.40]
-
     for idx, trade in open_df.iterrows():
         try:
-            sym = trade["symbol"]
-            direction = trade["action"]
-            entry = float(trade["entry"])
-            stop_orig = float(trade["stop"])
+            sym = trade["symbol"]; direction = trade["action"]
+            entry = float(trade["entry"]); stop_orig = float(trade["stop"])
             original_qty = float(trade.get("original_qty", trade.get("quantity",0)))
             remaining_qty = float(trade.get("quantity", original_qty))
             breakeven = trade.get("breakeven", False)
-
             tps = [float(trade[f"TP{i+1}"]) for i in range(5)]
-
-            try:
-                entry_time = datetime.strptime(trade["timestamp"], "%Y-%m-%d %H:%M:%S")
-            except:
+            try: entry_time = datetime.strptime(trade["timestamp"], "%Y-%m-%d %H:%M:%S")
+            except: still_open.append(trade); continue
+            df_1h = get_binance_klines(sym, '1h', limit=500, start_time=entry_time, end_time=now)
+            if df_1h.empty:
+                print(f"WARNING: No Binance 1h data for {sym} from {entry_time} to {now}. Trade not checked.")
                 still_open.append(trade)
                 continue
-
-            # Attempt 1h data fetch
-            df_1h = get_data(sym, interval='1h', start=entry_time, end=now)
-            if df_1h.empty:
-                print(f"WARNING: No 1h data for {sym} from {entry_time} to {now}. Trying 4h as fallback.")
-                # Fallback to 4h
-                df_1h = get_data(sym, interval='4h', start=entry_time, end=now)
-                if df_1h.empty:
-                    print(f"ERROR: No data at all for {sym}. Trade NOT checked this run.")
-                    still_open.append(trade)
-                    continue
-                else:
-                    print(f"Fallback successful: using 4h data for {sym}.")
-
             highest_tp_idx = int(trade.get("highest_tp", -1))
             current_stop = get_current_stop(trade)
-
             trade_closed = False
             for candle_time, candle in df_1h.iterrows():
-                high = candle['High']
-                low = candle['Low']
-
+                high = candle['High']; low = candle['Low']
                 new_tp_idx = None
                 if direction == "LONG":
-                    for i in range(len(tps)-1, -1, -1):
-                        if high >= tps[i] and i > highest_tp_idx:
-                            new_tp_idx = i
-                            break
+                    for i in range(len(tps)-1,-1,-1):
+                        if high >= tps[i] and i > highest_tp_idx: new_tp_idx = i; break
                 else:
-                    for i in range(len(tps)-1, -1, -1):
-                        if low <= tps[i] and i > highest_tp_idx:
-                            new_tp_idx = i
-                            break
-
+                    for i in range(len(tps)-1,-1,-1):
+                        if low <= tps[i] and i > highest_tp_idx: new_tp_idx = i; break
                 if new_tp_idx is not None:
                     for i in range(highest_tp_idx+1, new_tp_idx+1):
-                        if remaining_qty <= 0:
-                            break
-                        fraction = fractions[i]
-                        exit_qty = original_qty * fraction
-                        if exit_qty > remaining_qty:
-                            exit_qty = remaining_qty
+                        if remaining_qty <= 0: break
+                        fraction = fractions[i]; exit_qty = original_qty * fraction
+                        if exit_qty > remaining_qty: exit_qty = remaining_qty
                         if exit_qty > 0:
                             exit_price = tps[i]
-                            pnl = (exit_price - entry) * exit_qty if direction == "LONG" else (entry - exit_price) * exit_qty
+                            pnl = (exit_price - entry) * exit_qty if direction=="LONG" else (entry - exit_price) * exit_qty
                             partial = trade.to_dict()
-                            partial["hit_level"] = f"TP{i+1}"
-                            partial["close_time"] = now.strftime("%Y-%m-%d %H:%M:%S")
-                            partial["exit_price"] = exit_price
-                            partial["quantity"] = exit_qty
-                            partial["pnl"] = round(pnl,4)
-                            results.append(partial)
-                            update_portfolio({'pnl': pnl})
-                            remaining_qty -= exit_qty
-                            highest_tp_idx = i
-                            trade["highest_tp"] = highest_tp_idx
-                            trade["quantity"] = remaining_qty
-                            if i == 0:
-                                trade["breakeven"] = True
+                            partial["hit_level"] = f"TP{i+1}"; partial["close_time"] = now.strftime("%Y-%m-%d %H:%M:%S")
+                            partial["exit_price"] = exit_price; partial["quantity"] = exit_qty; partial["pnl"] = round(pnl,4)
+                            results.append(partial); update_portfolio({'pnl': pnl})
+                            remaining_qty -= exit_qty; highest_tp_idx = i
+                            trade["highest_tp"] = highest_tp_idx; trade["quantity"] = remaining_qty
+                            if i == 0: trade["breakeven"] = True
                             tp_emoji = "🎯"
                             if i == 0: msg = f"{tp_emoji} **TP1 Hit!** 30% closed. SL moved to Breakeven. 🛡️"
                             elif i == 1: msg = f"{tp_emoji} **TP2 Hit!** 10% closed. SL moved to TP1 (1R locked). 🔒"
@@ -526,55 +467,34 @@ def check_open_trades():
                             elif i == 3: msg = f"{tp_emoji} **TP4 Hit!** 10% closed. SL moved to TP3 (3R locked). 🔒"
                             elif i == 4: msg = f"{tp_emoji} **TP5 Hit!** Final 40% closed – Home run! 🏆💰"
                             alert_line = f"**{sym} {direction}**\n{msg}\nP&L: {pnl:.2f} USDT | Remaining: {remaining_qty:.6f} units"
-                            alerts.append(alert_line)
-                            print("ALERT:", alert_line)
+                            alerts.append(alert_line); print("ALERT:", alert_line)
                             send_discord_message(alert_line)
-                            if remaining_qty <= 0:
-                                trade_closed = True
-                                break
-                    if remaining_qty <= 0:
-                        break
+                            if remaining_qty <= 0: trade_closed = True; break
+                    if remaining_qty <= 0: break
                     current_stop = get_current_stop(trade)
-
                 if remaining_qty > 0:
-                    sl_hit = (low <= current_stop) if direction == "LONG" else (high >= current_stop)
+                    sl_hit = (low <= current_stop) if direction=="LONG" else (high >= current_stop)
                     if sl_hit:
                         exit_price = current_stop
-                        pnl = (exit_price - entry) * remaining_qty if direction == "LONG" else (entry - exit_price) * remaining_qty
+                        pnl = (exit_price - entry) * remaining_qty if direction=="LONG" else (entry - exit_price) * remaining_qty
                         final = trade.to_dict()
-                        if trade.get("breakeven", False):
-                            desc = "BREAKEVEN STOP"
-                            pnl = 0.0
-                        else:
-                            desc = "STOP LOSS" if highest_tp_idx == -1 else f"STOP LOSS after TP{highest_tp_idx+1}"
-                        final["hit_level"] = desc
-                        final["close_time"] = now.strftime("%Y-%m-%d %H:%M:%S")
-                        final["exit_price"] = exit_price
-                        final["quantity"] = remaining_qty
-                        final["pnl"] = round(pnl,4)
-                        results.append(final)
-                        update_portfolio({'pnl': pnl})
-                        remaining_qty = 0
+                        if trade.get("breakeven", False): desc = "BREAKEVEN STOP"; pnl = 0.0
+                        else: desc = "STOP LOSS" if highest_tp_idx==-1 else f"STOP LOSS after TP{highest_tp_idx+1}"
+                        final["hit_level"] = desc; final["close_time"] = now.strftime("%Y-%m-%d %H:%M:%S")
+                        final["exit_price"] = exit_price; final["quantity"] = remaining_qty; final["pnl"] = round(pnl,4)
+                        results.append(final); update_portfolio({'pnl': pnl}); remaining_qty = 0
                         trade_closed = True
                         alert_line = f"**{sym} {direction}**\n{'🔴' if 'STOP' in desc else '🛑'} {desc}\nP&L: {pnl:.2f} USDT"
-                        alerts.append(alert_line)
-                        print("ALERT:", alert_line)
+                        alerts.append(alert_line); print("ALERT:", alert_line)
                         send_discord_message(alert_line)
                         send_trade_close_chart(trade, desc, exit_price, pnl)
                         break
-
-                if remaining_qty <= 0:
-                    break
-
+                if remaining_qty <= 0: break
             if remaining_qty > 0 and not trade_closed:
-                trade["quantity"] = remaining_qty
-                trade["highest_tp"] = highest_tp_idx
+                trade["quantity"] = remaining_qty; trade["highest_tp"] = highest_tp_idx
                 still_open.append(trade)
-        except Exception as e:
-            print(f"Error processing trade {trade.get('symbol','?')}: {e}")
-
-    if results:
-        append_csv(TRADE_RESULTS_CSV, pd.DataFrame(results))
+        except Exception as e: print(f"Error processing trade {trade.get('symbol','?')}: {e}")
+    if results: append_csv(TRADE_RESULTS_CSV, pd.DataFrame(results))
     if still_open:
         save_csv(OPEN_TRADES_CSV, pd.DataFrame(still_open))
         portfolio['open_positions'] = len(still_open)
@@ -582,16 +502,12 @@ def check_open_trades():
         save_csv(OPEN_TRADES_CSV, pd.DataFrame())
         portfolio['open_positions'] = 0
     save_portfolio(portfolio)
-
-    # Summary
     risky_count = sum(1 for t in still_open if t.get("breakeven", False) == False)
     be_count = len(still_open) - risky_count
     summary = f"🔍 Open trades status: {risky_count} risky (TP1 not hit yet), {be_count} breakeven (risk-free). Total: {len(still_open)}"
-    print(summary)
-    send_discord_message(summary)
+    print(summary); send_discord_message(summary)
     print(f"Trade closures processed: {len(results)}. Still open: {len(still_open)}.")
-    if not alerts:
-        print("No trade closures this run.")
+    if not alerts: print("No trade closures this run.")
 
 def send_trade_close_chart(trade, hit_level, exit_price, pnl):
     sym = trade["symbol"]; entry = float(trade["entry"]); stop = float(trade["stop"])
@@ -600,10 +516,7 @@ def send_trade_close_chart(trade, hit_level, exit_price, pnl):
         import matplotlib; matplotlib.use('Agg')
         import matplotlib.pyplot as plt; import mplfinance as mpf
         entry_time = datetime.strptime(trade["timestamp"], "%Y-%m-%d %H:%M:%S")
-        df = get_data(sym, interval='1h', start=entry_time, end=datetime.now())
-        if df.empty:
-            # fallback to 4h for chart
-            df = get_data(sym, interval='4h', start=entry_time, end=datetime.now())
+        df = get_binance_klines(sym, '1h', limit=500, start_time=entry_time, end_time=datetime.now())
         if df.empty: return
         mpf_style = mpf.make_mpf_style(base_mpf_style='nightclouds', facecolor='#000000', gridcolor='#2a2e39',
                                        rc={'axes.labelcolor':'white','xtick.color':'white','ytick.color':'white','axes.titlecolor':'white'})
@@ -625,33 +538,22 @@ def send_trade_close_chart(trade, hit_level, exit_price, pnl):
 
 # ========== COMPACT SIGNAL FORMATTING ==========
 def format_signal(sig):
-    sym = sig["symbol"].replace("-USD", "")
-    direction = sig["action"]
-    entry = sig["limit_price"]
-    stop = sig["stop_loss"]
-    tps = sig["take_profits"]
-    risk = abs(entry - stop)
-    stop_pct = risk / entry * 100
+    sym = sig["symbol"]; direction = sig["action"]
+    entry = sig["limit_price"]; stop = sig["stop_loss"]; tps = sig["take_profits"]
+    risk = abs(entry - stop); stop_pct = risk / entry * 100
     direction_icon = "🟢 LONG" if direction == "LONG" else "🔴 SHORT"
-
     tp_str = " / ".join([f"{tp:.2f}" for tp in tps])
-
-    msg = (
-        f"${sym} – {direction_icon} Setup (4H)\n"
-        f"Entry: {entry:.2f} | Stop: {stop:.2f} (-{stop_pct:.2f}%)\n"
-        f"TPs: {tp_str}"
-    )
-    return msg
+    return f"${sym.replace('USDT','')} – {direction_icon} Setup (4H)\nEntry: {entry:.2f} | Stop: {stop:.2f} (-{stop_pct:.2f}%)\nTPs: {tp_str}"
 
 # ========== HOLD MESSAGE ==========
 def format_hold_message(top5, top_layers):
     if not top5: return "HOLD – No valid trade setups found. Market is fully trendless."
     lines = [f"HOLD – No high‑conviction crypto setup found.\n📊 **Top Coin Scores** (of {len(top5)})"]
     for idx, (pair, score, direction, _, _, _, _) in enumerate(top5, 1):
-        short = pair.replace("-USD", "")
+        short = pair.replace("USDT","")
         lines.append(f"{idx}. {short} → {direction} ({score:.1f}/13.5)")
     if top_layers:
-        top_pair = top5[0][0].replace("-USD", ""); top_score = top5[0][1]; top_dir = top5[0][2]
+        top_pair = top5[0][0].replace("USDT",""); top_score = top5[0][1]; top_dir = top5[0][2]
         lines.append(f"\n🔎 **Top Coin Layer Breakdown:** {top_pair} ({top_dir}, {top_score:.1f})")
         for name, (earned, max_, status) in top_layers.items():
             if "FAIL" in status: lines.append(f"• {name} ({max_}): ⚠️ {status}")
@@ -665,7 +567,7 @@ def send_trade_chart(signal):
     sym = signal['symbol']
     try:
         import matplotlib; matplotlib.use('Agg'); import matplotlib.pyplot as plt; import mplfinance as mpf
-        df = get_data(sym, interval='4h', days=21)
+        df = get_binance_klines(sym, '4h', limit=100)
         if df.empty or len(df) < 20: raise ValueError(f"Only {len(df)} 4h candles")
         mpf_style = mpf.make_mpf_style(base_mpf_style='nightclouds', facecolor='#000000', gridcolor='#2a2e39',
                                        rc={'axes.labelcolor':'white','xtick.color':'white','ytick.color':'white','axes.titlecolor':'white'})
