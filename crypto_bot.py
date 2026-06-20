@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Crypto Swing Bot – KuCoin data with Yahoo fallback, 0.5R TP1, 5 TPs
+Crypto Swing Bot – KuCoin data with Yahoo fallback, 0.4R TP1, 5 TPs (0.4/0.8/1.2/1.6/2.0R)
 Wider stop (2.5x ATR, 1.0‑6.0%) for swing tolerance.
 Compact Discord signals + full alert system.
 Position splitting: 30%/10%/10%/10%/40%. Trailing stop logic.
@@ -164,10 +164,6 @@ def yahoo_to_kucoin(sym_yahoo):
 
 # ========== KUCOIN DATA FETCH ==========
 def get_kucoin_klines(sym_kucoin, interval, limit=100, start_time=None, end_time=None):
-    """
-    Fetch OHLCV from KuCoin. sym_kucoin like 'BTC-USDT'.
-    Returns DataFrame with Open, High, Low, Close, Volume.
-    """
     interval_map = {'1h': '1hour', '4h': '4hour', '1d': '1day'}
     kucoin_interval = interval_map.get(interval, interval)
     base_url = "https://api.kucoin.com/api/v1/market/candles"
@@ -283,18 +279,19 @@ def support_resistance_levels(df, lookback=20):
     recent = df.tail(lookback)
     return recent['High'].max(), recent['Low'].min()
 
-# ========== SCORING ==========
+# ========== SCORING (Yahoo daily/4h, hybrid 1h) ==========
 def score_pair(pair):
     layers = {}
     df_d = get_yahoo_klines(pair, '1d', days=90)
     if df_d.empty or len(df_d) < 50: return 0, None, None, None, None, {"Daily data": (0,0,"FAIL: insufficient daily candles")}
     df_4h = get_yahoo_klines(pair, '4h', days=14)
     if df_4h.empty or len(df_4h) < 50: return 0, None, None, None, None, {"4h data": (0,0,"FAIL: insufficient 4h candles")}
-    df_1h = get_hybrid_klines(pair, '1h', days=3)   # hybrid 1h
+    df_1h = get_hybrid_klines(pair, '1h', days=3)
     if df_1h.empty or len(df_1h) < 10: return 0, None, None, None, None, {"1h data": (0,0,"FAIL: insufficient 1h candles")}
 
     price = df_4h['Close'].iloc[-1]
 
+    # Daily trend
     ema50_d = ema(df_d['Close'], 50)
     ema200_d = ema(df_d['Close'], 200)
     trend_daily = 0
@@ -385,7 +382,7 @@ def ai_confirm_trade(signal_dict):
     prompt = (f"Crypto trade setup:\nPair: {signal_dict['symbol']}\nDirection: {signal_dict['action']}\n"
               f"Entry: {signal_dict['limit_price']:.5f}\nStop: {signal_dict['stop_loss']:.5f}\n"
               f"Score: {signal_dict['score']:.1f}/13.5\n"
-              f"Will this trade likely hit TP1 (0.5x the stop distance) before hitting the stop? Answer PASS or FAIL.")
+              f"Will this trade likely hit TP1 (0.4x the stop distance) before hitting the stop? Answer PASS or FAIL.")
     try:
         resp = requests.post("https://api.groq.com/openai/v1/chat/completions",
             headers={"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"},
@@ -398,7 +395,7 @@ def ai_confirm_trade(signal_dict):
     except: pass
     return True
 
-# ========== SIGNAL GENERATION (max 3 risky trades) ==========
+# ========== SIGNAL GENERATION (max 3 risky trades, new TPs) ==========
 def generate_signal():
     risky_count = 0
     try:
@@ -463,7 +460,8 @@ def generate_signal():
         if swing_level and swing_level < price + stop_distance*1.2:
             stop = max(stop, swing_level + 0.05*(atr_val if atr_val else price*0.01))
     stop = round(stop, 6); risk = abs(price - stop)
-    tp_multipliers = [0.5, 1.0, 2.0, 3.0, 5.0]
+    # New TP multipliers: 0.4, 0.8, 1.2, 1.6, 2.0R
+    tp_multipliers = [0.4, 0.8, 1.2, 1.6, 2.0]
     tps = [round(price + m*risk, 6) if direction=="LONG" else round(price - m*risk, 6) for m in tp_multipliers]
     quantity = round((portfolio['balance']*0.01) / risk, 8)
     signal = {"action": direction, "symbol": pair, "quantity": quantity,
