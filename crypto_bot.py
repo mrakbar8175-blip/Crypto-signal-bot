@@ -5,17 +5,17 @@ Wider stop (2.5x ATR, 1.0‑6.0%) for swing tolerance.
 Compact Discord signals + full alert system.
 Position splitting: 30%/10%/10%/10%/40%. Trailing stop logic.
 BLACKLIST for stablecoins & QUQ.
-All price data from Binance public klines (reliable 1h).
-Automatic conversion of old YFinance symbols to Binance format.
+All price data from Binance public klines.
+Fallback direction from 4h when daily trend is unclear.
 """
 
 import requests, json, os, traceback, random, math
 import pandas as pd
 import numpy as np
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta
 
 # ========== ENVIRONMENT ==========
-DISCORD_WEBHOOK_URL = os.environ.get("DISCORD_WEBHOOK_URL", "")
+DISCORD_WEBHOOK_URL = os.environ["DISCORD_WEBHOOK_URL"]
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
 if not GROQ_API_KEY:
     print("WARNING: GROQ_API_KEY not set – AI filtering disabled.")
@@ -24,11 +24,6 @@ if not GROQ_API_KEY:
 BLACKLIST = {
     "QUQ", "USDT", "USDC", "DAI", "BUSD", "TUSD", "USDP", "FDUSD"
 }
-
-# ========== TIME HELPERS (Strict UTC Engine) ==========
-def get_now():
-    """Returns naive UTC datetime matching Binance server standards."""
-    return datetime.now(timezone.utc).replace(tzinfo=None)
 
 # ========== DYNAMIC COIN LIST (CoinGecko) ==========
 def fetch_top_liquid_coins(limit=50):
@@ -42,12 +37,8 @@ def fetch_top_liquid_coins(limit=50):
         "sparkline": False,
         "price_change_percentage": "24h"
     }
-    headers = {
-        "accept": "application/json",
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
-    }
     try:
-        resp = requests.get(url, params=params, headers=headers, timeout=15)
+        resp = requests.get(url, params=params, timeout=15)
         data = resp.json()
         symbols = []
         COIN_RANK = {}
@@ -55,7 +46,7 @@ def fetch_top_liquid_coins(limit=50):
         for coin in data:
             symbol = coin.get("symbol", "").upper()
             if symbol and symbol not in BLACKLIST:
-                sym = f"{symbol}USDT"      # Binance pair format
+                sym = f"{symbol}USDT"
                 if sym not in symbols:
                     symbols.append(sym)
                     COIN_RANK[sym] = rank
@@ -122,7 +113,7 @@ def initialize_trade_files():
                                  "hit_level","close_time","exit_price","quantity","pnl"])
 
 def log_signal(sig):
-    row = {"timestamp": get_now().strftime("%Y-%m-%d %H:%M:%S"),
+    row = {"timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
            "symbol": sig["symbol"], "action": sig["action"],
            "entry": sig["limit_price"], "stop": sig["stop_loss"],
            "TP1": sig["take_profits"][0], "TP2": sig["take_profits"][1],
@@ -132,7 +123,7 @@ def log_signal(sig):
     append_csv(TRADE_LOG_CSV, pd.DataFrame([row]))
 
 def add_open_trade(sig):
-    row = {"timestamp": get_now().strftime("%Y-%m-%d %H:%M:%S"),
+    row = {"timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
            "symbol": sig["symbol"], "action": sig["action"],
            "entry": sig["limit_price"], "stop": sig["stop_loss"],
            "TP1": sig["take_profits"][0], "TP2": sig["take_profits"][1],
@@ -147,7 +138,7 @@ def daily_pnl():
     try:
         df = pd.read_csv(TRADE_RESULTS_CSV)
         if df.empty: return 0.0
-        today = get_now().strftime("%Y-%m-%d")
+        today = datetime.now().strftime("%Y-%m-%d")
         df['close_time'] = pd.to_datetime(df['close_time'])
         daily = df[df['close_time'].dt.strftime("%Y-%m-%d") == today]
         return daily['pnl'].sum() if not daily.empty else 0.0
@@ -158,93 +149,41 @@ def update_portfolio(trade_result):
     portfolio['realized_pnl'] += trade_result['pnl']
     save_portfolio(portfolio)
 
-# ========== BINANCE DATA FETCH (With Multi-Endpoint & Pagination Pagination) ==========
+# ========== BINANCE DATA FETCH ==========
 def get_binance_klines(symbol, interval, limit=100, start_time=None, end_time=None):
-    """
-    Fetch klines from Binance using redundant public endpoints and auto-pagination.
-    """
-    endpoints = [
-        "https://api.binance.com/api/v3/klines",
-        "https://api1.binance.com/api/v3/klines",
-        "https://api2.binance.com/api/v3/klines",
-        "https://api3.binance.com/api/v3/klines"
-    ]
-    
-    # If a precise historical window is supplied, handle candle chunking sequentially
+    url = "https://api.binance.com/api/v3/klines"
+    params = {"symbol": symbol, "interval": interval, "limit": limit}
     if start_time:
-        current_start = int(start_time.timestamp() * 1000) if isinstance(start_time, datetime) else int(start_time)
-        target_end = int(end_time.timestamp() * 1000) if isinstance(end_time, datetime) else int(get_now().timestamp() * 1000)
-        
-        all_data = []
-        while current_start < target_end:
-            params = {
-                "symbol": symbol,
-                "interval": interval,
-                "startTime": current_start,
-                "endTime": target_end,
-                "limit": 1000
-            }
-            success = False
-            for url in endpoints:
-                try:
-                    resp = requests.get(url, params=params, timeout=10)
-                    if resp.status_code == 200:
-                        data = resp.json()
-                        if isinstance(data, list) and len(data) > 0:
-                            all_data.extend(data)
-                            current_start = data[-1][0] + 1  # Shift past the last candle open timestamp
-                            success = True
-                            break
-                        else:
-                            current_start = target_end
-                            success = True
-                            break
-                except Exception:
-                    continue
-            if not success:
-                break  # Fail-soft exit to prevent runaway infinite retry loop
-                
-        if not all_data:
+        params["startTime"] = int(start_time.timestamp() * 1000)
+    if end_time:
+        params["endTime"] = int(end_time.timestamp() * 1000)
+    try:
+        resp = requests.get(url, params=params, timeout=10)
+        data = resp.json()
+        if not isinstance(data, list) or len(data) == 0:
             return pd.DataFrame()
-        raw_candles = all_data
-    else:
-        # Standard processing for current market context queries
-        raw_candles = None
-        params = {"symbol": symbol, "interval": interval, "limit": limit}
-        for url in endpoints:
-            try:
-                resp = requests.get(url, params=params, timeout=10)
-                if resp.status_code == 200:
-                    raw_candles = resp.json()
-                    if isinstance(raw_candles, list) and len(raw_candles) > 0:
-                        break
-            except Exception:
-                continue
-        if not raw_candles or not isinstance(raw_candles, list):
-            return pd.DataFrame()
-
-    df = pd.DataFrame(raw_candles, columns=[
-        'open_time','Open','High','Low','Close','Volume',
-        'close_time','quote_vol','trades','taker_buy_base','taker_buy_quote','ignore'
-    ])
-    df.drop_duplicates(subset=['open_time'], inplace=True)
-    df['Open'] = df['Open'].astype(float)
-    df['High'] = df['High'].astype(float)
-    df['Low'] = df['Low'].astype(float)
-    df['Close'] = df['Close'].astype(float)
-    df['Volume'] = df['Volume'].astype(float)
-    df['open_time'] = pd.to_datetime(df['open_time'], unit='ms')
-    df.set_index('open_time', inplace=True)
-    return df[['Open','High','Low','Close','Volume']]
+        df = pd.DataFrame(data, columns=[
+            'open_time','Open','High','Low','Close','Volume',
+            'close_time','quote_vol','trades','taker_buy_base','taker_buy_quote','ignore'
+        ])
+        df['Open'] = df['Open'].astype(float)
+        df['High'] = df['High'].astype(float)
+        df['Low'] = df['Low'].astype(float)
+        df['Close'] = df['Close'].astype(float)
+        df['Volume'] = df['Volume'].astype(float)
+        df['open_time'] = pd.to_datetime(df['open_time'], unit='ms')
+        df.set_index('open_time', inplace=True)
+        return df[['Open','High','Low','Close','Volume']]
+    except Exception as e:
+        print(f"Binance klines error for {symbol}: {e}")
+        return pd.DataFrame()
 
 def get_btc_klines(interval='4h', days=14):
-    """Fetch BTC/USDT klines for market context."""
     return get_binance_klines("BTCUSDT", interval, limit=100)
 
-# ========== SYMBOL CONVERTER (for old open trades) ==========
+# ========== SYMBOL CONVERTER ==========
 def convert_to_binance(sym):
-    """Convert old YFinance format like 'XLM-USD' to Binance 'XLMUSDT'."""
-    sym = str(sym).replace("-USD", "USDT")
+    sym = sym.replace("-USD", "USDT")
     if not sym.endswith("USDT"):
         sym = sym + "USDT"
     return sym
@@ -293,36 +232,70 @@ def support_resistance_levels(df, lookback=20):
     recent = df.tail(lookback)
     return recent['High'].max(), recent['Low'].min()
 
-# ========== SCORING (uses Binance data) ==========
+# ========== SCORING (with 4h fallback for trend) ==========
 def score_pair(pair):
     layers = {}
+    # Daily data
     df_d = get_binance_klines(pair, '1d', limit=90)
-    if df_d.empty or len(df_d) < 50: return 0, None, None, None, None, {"Daily data": (0,0,"FAIL: insufficient daily candles")}
+    if df_d.empty or len(df_d) < 50:
+        # If daily data fails, we cannot even compute EMAs; return failure but still attempt 4h fallback later
+        # For consistency, we'll mark the whole pair as failed and exit.
+        return 0, None, None, None, None, {"Daily data": (0,0,"FAIL: insufficient daily candles")}
+
+    # 4h and 1h data
     df_4h = get_binance_klines(pair, '4h', limit=100)
     if df_4h.empty or len(df_4h) < 50: return 0, None, None, None, None, {"4h data": (0,0,"FAIL: insufficient 4h candles")}
     df_1h = get_binance_klines(pair, '1h', limit=72)
     if df_1h.empty or len(df_1h) < 10: return 0, None, None, None, None, {"1h data": (0,0,"FAIL: insufficient 1h candles")}
+
     price = df_4h['Close'].iloc[-1]
-    ema50_d = ema(df_d['Close'], 50); ema200_d = ema(df_d['Close'], 200)
+
+    # --- Determine trend direction ---
+    # Try daily first
+    ema50_d = ema(df_d['Close'], 50)
+    ema200_d = ema(df_d['Close'], 200)
     trend_daily = 0
-    if price > ema50_d.iloc[-1] and ema50_d.iloc[-1] > ema200_d.iloc[-1]: trend_daily = 1
-    elif price < ema50_d.iloc[-1] and ema50_d.iloc[-1] < ema200_d.iloc[-1]: trend_daily = -1
-    if trend_daily == 0: return 0, None, None, None, None, {"Daily trend": (0,0,"FAIL: no clear daily trend")}
-    ema50_4h = ema(df_4h['Close'], 50); ema200_4h = ema(df_4h['Close'], 200)
+    if price > ema50_d.iloc[-1] and ema50_d.iloc[-1] > ema200_d.iloc[-1]:
+        trend_daily = 1   # bullish daily
+    elif price < ema50_d.iloc[-1] and ema50_d.iloc[-1] < ema200_d.iloc[-1]:
+        trend_daily = -1  # bearish daily
+
+    # Fallback to 4h alignment if daily is unclear
+    if trend_daily == 0:
+        ema50_4h = ema(df_4h['Close'], 50)
+        ema200_4h = ema(df_4h['Close'], 200)
+        if price > ema50_4h.iloc[-1] and ema50_4h.iloc[-1] > ema200_4h.iloc[-1]:
+            trend_daily = 1
+            print(f"{pair}: using 4h bullish fallback")
+        elif price < ema50_4h.iloc[-1] and ema50_4h.iloc[-1] < ema200_4h.iloc[-1]:
+            trend_daily = -1
+            print(f"{pair}: using 4h bearish fallback")
+        else:
+            # Still no clear trend → skip this pair
+            return 0, None, None, None, None, {"Daily trend": (0,0,"FAIL: no clear trend (daily or 4h)")}
+
+    direction = "LONG" if trend_daily == 1 else "SHORT"
+
+    # 4h indicators
+    ema50_4h = ema(df_4h['Close'], 50)
+    ema200_4h = ema(df_4h['Close'], 200)
     adx_val, di_plus, di_minus = adx(df_4h)
     rsi_val = rsi(df_4h)
     macd_line, macd_signal, macd_hist, macd_hist_prev = macd(df_4h)
     atr_val = atr(df_4h)
     res, sup = support_resistance_levels(df_4h, 20)
+
+    # 1h indicators
     rsi_1h_val = rsi(df_1h, 14)
     last_candle = df_1h.iloc[-1]; prev_candle = df_1h.iloc[-2]
     candle_range = last_candle['High'] - last_candle['Low']
     bullish_momentum = (last_candle['Close'] - last_candle['Open']) / candle_range if candle_range > 0 else 0
+
     vol_last = df_4h['Volume'].iloc[-1]
     vol_avg = df_4h['Volume'].iloc[-6:-1].mean() if len(df_4h) >= 6 else vol_last
     vol_surge = vol_last > vol_avg * 1.2 if vol_avg > 0 else False
 
-    # BTC market context (Binance)
+    # BTC context
     btc_df = get_btc_klines('4h', days=14)
     market_aligned = False
     if not btc_df.empty and len(btc_df) >= 50:
@@ -334,11 +307,12 @@ def score_pair(pair):
         layers["Market"] = (0, 0.5, "FAIL: BTC data unavailable")
 
     def bool_score(cond): return 1 if cond else 0
-    direction = "LONG" if trend_daily == 1 else "SHORT"
 
-    # Layers
-    if direction == "LONG": ema_align = price > ema50_4h.iloc[-1] and ema50_4h.iloc[-1] > ema200_4h.iloc[-1]
-    else: ema_align = price < ema50_4h.iloc[-1] and ema50_4h.iloc[-1] < ema200_4h.iloc[-1]
+    # Layers (same weights)
+    if direction == "LONG":
+        ema_align = price > ema50_4h.iloc[-1] and ema50_4h.iloc[-1] > ema200_4h.iloc[-1]
+    else:
+        ema_align = price < ema50_4h.iloc[-1] and ema50_4h.iloc[-1] < ema200_4h.iloc[-1]
     layers["EMA Align"] = (bool_score(ema_align) * 1.5, 1.5, "OK")
     adx_trending = adx_val > 20
     adx_dir = (di_plus > di_minus) if direction == "LONG" else (di_minus > di_plus)
@@ -396,23 +370,40 @@ def generate_signal():
             if "symbol" in open_df.columns:
                 open_df["symbol"] = open_df["symbol"].apply(convert_to_binance)
             if "breakeven" in open_df.columns:
-                risky = open_df[open_df["breakeven"].astype(str).str.upper() != "TRUE"]
+                risky = open_df[open_df["breakeven"] == False]
             else:
                 risky = open_df
             open_symbols_risky = set(risky["symbol"].values)
     except: pass
-    all_scored = []; top_overall = None
+
+    all_scored = []
+    top_overall = None
+    skipped_no_trend = 0
+    skipped_data = 0
+
     for pair in CRYPTO_PAIRS:
-        if pair in open_symbols_risky: continue
+        if pair in open_symbols_risky:
+            continue
         score, direction, price, atr_val, swing_level, layers = score_pair(pair)
-        if direction is None: continue
+        if direction is None:
+            # check if it was due to data failure or no trend
+            if "Daily trend" in layers:
+                skipped_no_trend += 1
+            else:
+                skipped_data += 1
+            continue
         all_scored.append((pair, score, direction, price, atr_val, swing_level, layers))
         if top_overall is None or score > top_overall[1]:
             top_overall = (pair, score, direction, price, atr_val, swing_level, layers)
+
+    print(f"Scored pairs: {len(all_scored)} | No trend: {skipped_no_trend} | Data fail: {skipped_data}")
+
     top5 = sorted(all_scored, key=lambda x: x[1], reverse=True)[:5]
     top_layers = top_overall[6] if top_overall else {}
     candidates = [item for item in all_scored if item[1] >= 6.0]
-    if not candidates: return None, top5, top_layers
+    if not candidates:
+        return None, top5, top_layers, skipped_no_trend, skipped_data
+
     candidates.sort(key=lambda x: x[1], reverse=True)
     pair, score, direction, price, atr_val, swing_level, layers = candidates[0]
     rank = COIN_RANK.get(pair, 99)
@@ -438,20 +429,18 @@ def generate_signal():
               "score": score, "atr": atr_val}
     if not ai_confirm_trade(signal):
         print(f"AI rejected {pair} {direction} (score {score:.1f})")
-        return None, top5, top_layers
+        return None, top5, top_layers, skipped_no_trend, skipped_data
     signal["ai_approved"] = True
-    return signal, top5, top_layers
+    return signal, top5, top_layers, skipped_no_trend, skipped_data
 
 # ========== DISCORD HELPERS ==========
 def send_discord_message(text):
-    if not DISCORD_WEBHOOK_URL: return
     try:
         requests.post(DISCORD_WEBHOOK_URL, json={"content": text[:2000]}, timeout=10)
     except Exception as e: print("Discord text error:", e)
 
 def send_discord_image(image_path, caption=""):
-    if not DISCORD_WEBHOOK_URL or not os.path.exists(image_path):
-        return
+    if not os.path.exists(image_path): return
     try:
         with open(image_path, 'rb') as img:
             files = {'file': img}
@@ -465,7 +454,7 @@ def get_current_stop(trade):
     entry = float(trade["entry"]); stop_orig = float(trade["stop"])
     tps = [float(trade[f"TP{i+1}"]) for i in range(5)]
     highest_tp_idx = int(trade.get("highest_tp", -1))
-    breakeven = str(trade.get("breakeven", "False")).upper() == "TRUE"
+    breakeven = trade.get("breakeven", False)
     if not breakeven and highest_tp_idx == -1: return stop_orig
     if highest_tp_idx >= 0:
         if highest_tp_idx == 0: return entry
@@ -474,40 +463,34 @@ def get_current_stop(trade):
         elif highest_tp_idx >= 3: return tps[2]
     return stop_orig
 
-# ========== TRADE MANAGEMENT (with dynamic pagination catch-up) ==========
+# ========== TRADE MANAGEMENT ==========
 def check_open_trades():
     try:
         open_df = pd.read_csv(OPEN_TRADES_CSV)
     except: return
     if open_df.empty: return
-
     if "symbol" in open_df.columns:
         open_df["symbol"] = open_df["symbol"].apply(convert_to_binance)
         save_csv(OPEN_TRADES_CSV, open_df)
-
     for col in ["highest_tp","quantity","original_qty","breakeven"]:
         if col not in open_df.columns:
             open_df[col] = -1 if col=="highest_tp" else (False if col=="breakeven" else 0.0)
-
     results = []; still_open = []; alerts = []
-    now = get_now()
+    now = datetime.now()
     fractions = [0.30, 0.10, 0.10, 0.10, 0.40]
-
     for idx, trade in open_df.iterrows():
         try:
-            sym = trade["symbol"]
-            direction = trade["action"]
-            entry = float(trade["entry"])
+            sym = trade["symbol"]; direction = trade["action"]
+            entry = float(trade["entry"]); stop_orig = float(trade["stop"])
             original_qty = float(trade.get("original_qty", trade.get("quantity",0)))
             remaining_qty = float(trade.get("quantity", original_qty))
+            breakeven = trade.get("breakeven", False)
             tps = [float(trade[f"TP{i+1}"]) for i in range(5)]
             try: entry_time = datetime.strptime(trade["timestamp"], "%Y-%m-%d %H:%M:%S")
             except: still_open.append(trade); continue
-            
-            # This handles multi-week histories seamlessly via the update pagination loop
-            df_1h = get_binance_klines(sym, '1h', start_time=entry_time, end_time=now)
+            df_1h = get_binance_klines(sym, '1h', limit=500, start_time=entry_time, end_time=now)
             if df_1h.empty:
-                print(f"WARNING: No Binance 1h data for {sym} from {entry_time} to {now}. Trade not checked.")
+                print(f"WARNING: No Binance 1h data for {sym} from {entry_time} to {now}.")
                 still_open.append(trade)
                 continue
             highest_tp_idx = int(trade.get("highest_tp", -1))
@@ -555,8 +538,7 @@ def check_open_trades():
                         exit_price = current_stop
                         pnl = (exit_price - entry) * remaining_qty if direction=="LONG" else (entry - exit_price) * remaining_qty
                         final = trade.to_dict()
-                        is_be_stop = str(trade.get("breakeven", "False")).upper() == "TRUE"
-                        if is_be_stop and highest_tp_idx >= 0: desc = "BREAKEVEN STOP"; pnl = 0.0
+                        if trade.get("breakeven", False): desc = "BREAKEVEN STOP"; pnl = 0.0
                         else: desc = "STOP LOSS" if highest_tp_idx==-1 else f"STOP LOSS after TP{highest_tp_idx+1}"
                         final["hit_level"] = desc; final["close_time"] = now.strftime("%Y-%m-%d %H:%M:%S")
                         final["exit_price"] = exit_price; final["quantity"] = remaining_qty; final["pnl"] = round(pnl,4)
@@ -572,19 +554,16 @@ def check_open_trades():
                 trade["quantity"] = remaining_qty; trade["highest_tp"] = highest_tp_idx
                 still_open.append(trade)
         except Exception as e: print(f"Error processing trade {trade.get('symbol','?')}: {e}")
-
     if results: append_csv(TRADE_RESULTS_CSV, pd.DataFrame(results))
     if still_open:
-        for t in still_open:
-            t["symbol"] = convert_to_binance(t["symbol"])
+        for t in still_open: t["symbol"] = convert_to_binance(t["symbol"])
         save_csv(OPEN_TRADES_CSV, pd.DataFrame(still_open))
         portfolio['open_positions'] = len(still_open)
     else:
         save_csv(OPEN_TRADES_CSV, pd.DataFrame())
         portfolio['open_positions'] = 0
     save_portfolio(portfolio)
-
-    risky_count = sum(1 for t in still_open if str(t.get("breakeven", "False")).upper() != "TRUE")
+    risky_count = sum(1 for t in still_open if t.get("breakeven", False) == False)
     be_count = len(still_open) - risky_count
     summary = f"🔍 Open trades status: {risky_count} risky (TP1 not hit yet), {be_count} breakeven (risk-free). Total: {len(still_open)}"
     print(summary); send_discord_message(summary)
@@ -598,7 +577,7 @@ def send_trade_close_chart(trade, hit_level, exit_price, pnl):
         import matplotlib; matplotlib.use('Agg')
         import matplotlib.pyplot as plt; import mplfinance as mpf
         entry_time = datetime.strptime(trade["timestamp"], "%Y-%m-%d %H:%M:%S")
-        df = get_binance_klines(sym, '1h', start_time=entry_time, end_time=get_now())
+        df = get_binance_klines(sym, '1h', limit=500, start_time=entry_time, end_time=datetime.now())
         if df.empty: return
         mpf_style = mpf.make_mpf_style(base_mpf_style='nightclouds', facecolor='#000000', gridcolor='#2a2e39',
                                        rc={'axes.labelcolor':'white','xtick.color':'white','ytick.color':'white','axes.titlecolor':'white'})
@@ -611,7 +590,7 @@ def send_trade_close_chart(trade, hit_level, exit_price, pnl):
             ax.axhline(y=tp, color='#2ecc71', linestyle='--', linewidth=1, alpha=0.6, label=f'TP{i+1}' if i==0 else None)
         ax.axhline(y=exit_price, color='#e67e22', linewidth=2, label=f'Exit ({hit_level})')
         ax.legend(loc='upper left', facecolor='#000000', edgecolor='white', labelcolor='white')
-        chart_path = f"{sym}_close_{get_now().strftime('%Y%m%d_%H%M%S')}.png"
+        chart_path = f"{sym}_close_{datetime.now().strftime('%Y%m%d_%H%M%S')}.png"
         fig.savefig(chart_path, dpi=100, bbox_inches='tight', facecolor='black')
         plt.close(fig)
         send_discord_image(chart_path, caption=f"{sym} {direction} – {hit_level}")
@@ -627,9 +606,15 @@ def format_signal(sig):
     tp_str = " / ".join([f"{tp:.2f}" for tp in tps])
     return f"${sym.replace('USDT','')} – {direction_icon} Setup (4H)\nEntry: {entry:.2f} | Stop: {stop:.2f} (-{stop_pct:.2f}%)\nTPs: {tp_str}"
 
-# ========== HOLD MESSAGE ==========
-def format_hold_message(top5, top_layers):
-    if not top5: return "HOLD – No valid trade setups found. Market is fully trendless."
+# ========== HOLD MESSAGE (with stats) ==========
+def format_hold_message(top5, top_layers, skipped_no_trend=0, skipped_data=0):
+    if not top5:
+        msg = "HOLD – No valid trade setups found."
+        if skipped_no_trend > 0 or skipped_data > 0:
+            msg += f"\n({skipped_no_trend} coins lacked clear trend, {skipped_data} failed data)"
+        else:
+            msg += "\n(Market is fully trendless.)"
+        return msg
     lines = [f"HOLD – No high‑conviction crypto setup found.\n📊 **Top Coin Scores** (of {len(top5)})"]
     for idx, (pair, score, direction, _, _, _, _) in enumerate(top5, 1):
         short = pair.replace("USDT","")
@@ -641,6 +626,8 @@ def format_hold_message(top5, top_layers):
             if "FAIL" in status: lines.append(f"• {name} ({max_}): ⚠️ {status}")
             else: lines.append(f"• {name} ({max_}): {'✅' if earned > 0 else '❌'}")
     else: lines.append("\nNo layer data available.")
+    if skipped_no_trend > 0 or skipped_data > 0:
+        lines.append(f"\n({skipped_no_trend} coins skipped – no clear trend, {skipped_data} skipped – data failure)")
     lines.append("\n💬 Are you stalking any setups? Drop your watchlist below! 👇")
     return "\n".join(lines)
 
@@ -686,20 +673,19 @@ def main():
         check_open_trades()
         try:
             open_df = pd.read_csv(OPEN_TRADES_CSV)
-            if not open_df.empty:
-                open_df["symbol"] = open_df["symbol"].apply(convert_to_binance)
+            open_df["symbol"] = open_df["symbol"].apply(convert_to_binance)
             print(f"Currently {len(open_df)} open trade(s).")
         except: print("No open trades file.")
         if daily_pnl() <= portfolio['daily_loss_limit']:
             send_discord_message("Daily loss limit reached. No new trades today.")
             return
-        sig, top5, top_layers = generate_signal()
+        sig, top5, top_layers, skipped_no_trend, skipped_data = generate_signal()
         if sig:
             log_signal(sig); add_open_trade(sig)
             portfolio['open_positions'] += 1; save_portfolio(portfolio)
             send_trade_chart(sig)
         else:
-            send_discord_message(format_hold_message(top5, top_layers))
+            send_discord_message(format_hold_message(top5, top_layers, skipped_no_trend, skipped_data))
     except Exception as e:
         err = f"Bot crashed: {traceback.format_exc()[:500]}"
         print(err); send_discord_message(err)
