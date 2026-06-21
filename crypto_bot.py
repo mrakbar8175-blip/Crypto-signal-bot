@@ -4,7 +4,7 @@ Crypto Swing Bot – 4H timeframe, KuCoin+Yahoo hybrid, 0.4/0.8/1.2/1.6/2.0R TPs
 Wider stop (2.5x ATR, 1.0‑6.0% bounds). Compact signals with smart precision.
 Position splitting 30/10/10/10/40, trailing stop, max 5 risky trades.
 Daily loss limit: -100 USDT.
-Cumulative performance report every 10 fully closed trades.
+Cumulative performance report every 10 fully closed trades (trade‑level stats).
 """
 
 import requests, json, os, traceback, random, math
@@ -88,7 +88,7 @@ portfolio = load_portfolio()
 TRADE_LOG_CSV = "crypto_trade_log.csv"
 OPEN_TRADES_CSV = "crypto_open_trades.csv"
 TRADE_RESULTS_CSV = "crypto_trade_results.csv"
-PERF_COUNTER_FILE = "perf_counter.txt"          # tracks last reported milestone
+PERF_COUNTER_FILE = "perf_counter.txt"
 
 def init_csv(f, cols):
     if not os.path.exists(f): pd.DataFrame(columns=cols).to_csv(f, index=False)
@@ -326,7 +326,7 @@ def score_pair(pair):
 
     def bool_score(cond): return 1 if cond else 0
 
-    # Layers (same weights as before)
+    # Layers
     if direction == "LONG":
         ema_align = price > ema50_4h.iloc[-1] and ema50_4h.iloc[-1] > ema200_4h.iloc[-1]
     else:
@@ -393,7 +393,7 @@ def generate_signal():
             risky_count = len(risky)
     except: pass
 
-    if risky_count >= 5:   # <-- changed to 5
+    if risky_count >= 5:
         print(f"Max 5 risky trades limit reached ({risky_count}). No new signals.")
         return None, [], {}, 0, 0, risky_count
 
@@ -594,7 +594,7 @@ def check_open_trades():
         portfolio['open_positions'] = 0
     save_portfolio(portfolio)
 
-    # Performance report check (cumulative)
+    # Performance report (trade‑level)
     check_and_send_perf_report()
 
     risky_count = sum(1 for t in still_open if t.get("breakeven", False) == False)
@@ -604,22 +604,35 @@ def check_open_trades():
     print(f"Trade closures processed: {len(results)}. Still open: {len(still_open)}.")
     if not alerts: print("No trade closures this run.")
 
-def check_and_send_perf_report():
-    """If total closed trades reached a new multiple of 10, send a performance report."""
+# ---------- TRADE‑LEVEL PERFORMANCE REPORT ----------
+def get_completed_trades():
+    """Group TRADE_RESULTS_CSV by (timestamp, symbol) to form completed trades.
+    Returns a DataFrame with columns: total_pnl, is_win (bool), etc."""
     try:
         df = pd.read_csv(TRADE_RESULTS_CSV)
     except:
-        return
+        return pd.DataFrame()
     if df.empty:
+        return pd.DataFrame()
+
+    # Group by the original trade timestamp and symbol
+    trade_groups = df.groupby(['timestamp', 'symbol'])
+    trades = []
+    for (ts, sym), group in trade_groups:
+        total_pnl = group['pnl'].sum()
+        trades.append({'timestamp': ts, 'symbol': sym, 'total_pnl': total_pnl,
+                       'action': group['action'].iloc[0]})
+    trade_df = pd.DataFrame(trades)
+    trade_df['is_win'] = trade_df['total_pnl'] > 0
+    trade_df['is_loss'] = trade_df['total_pnl'] < 0
+    trade_df['is_breakeven'] = trade_df['total_pnl'] == 0
+    return trade_df
+
+def check_and_send_perf_report():
+    trade_df = get_completed_trades()
+    if trade_df.empty:
         return
-    # Each row in TRADE_RESULTS_CSV is one partial close (TP1, TP2, etc.)
-    # But for trade-level stats, we need to group by the original trade timestamp (or unique ID).
-    # We don't have a trade ID, but we can approximate by considering that a full trade is fully closed when the sum of quantities per (symbol, entry_time) equals original quantity.
-    # However, the simplest cumulative metric people care about is based on the individual closed chunks (since PnL is additive). We'll just use the raw rows as trade "events" for simplicity.
-    # To get a proper trade-level winrate, we'd need to reconstruct entire trades, but for a quick snapshot, using per-chunk stats is okay.
-    # We'll compute stats on all rows in TRADE_RESULTS_CSV.
-    total_closed = len(df)
-    # Read the last reported milestone
+    total_trades = len(trade_df)
     last_reported = 0
     if os.path.exists(PERF_COUNTER_FILE):
         try:
@@ -627,91 +640,90 @@ def check_and_send_perf_report():
                 last_reported = int(f.read().strip())
         except:
             pass
-    current_milestone = (total_closed // 10) * 10
-    if current_milestone > last_reported:
-        # Generate report
-        total_pnl = df['pnl'].sum()
-        wins = df[df['pnl'] > 0]
-        losses = df[df['pnl'] < 0]
-        breakevens = df[df['pnl'] == 0]
-        total_wins = len(wins)
-        total_losses = len(losses)
-        total_trades = total_wins + total_losses + len(breakevens)
-        winrate = (total_wins / max(total_wins+total_losses, 1)) * 100
+    current_milestone = (total_trades // 10) * 10
+    if current_milestone <= last_reported:
+        return
 
-        profit_factor = wins['pnl'].sum() / abs(losses['pnl'].sum()) if abs(losses['pnl'].sum()) > 0 else float('inf')
+    wins = trade_df[trade_df['is_win']]
+    losses = trade_df[trade_df['is_loss']]
+    total_wins = len(wins)
+    total_losses = len(losses)
+    winrate = (total_wins / max(total_wins + total_losses, 1)) * 100
 
-        # Streak calculation on the most recent rows
-        streaks = []
-        current_streak = 0
-        for pnl in df['pnl']:
-            if pnl > 0:
-                if current_streak > 0:
-                    current_streak += 1
-                else:
-                    if current_streak < 0:
-                        streaks.append(('loss', -current_streak))
-                    current_streak = 1
-            elif pnl < 0:
-                if current_streak < 0:
-                    current_streak -= 1
-                else:
-                    if current_streak > 0:
-                        streaks.append(('win', current_streak))
-                    current_streak = -1
+    total_pnl = trade_df['total_pnl'].sum()
+    profit_factor = wins['total_pnl'].sum() / abs(losses['total_pnl'].sum()) if total_losses > 0 else float('inf')
+
+    # Current streak (last trades)
+    streak = 0
+    streak_type = None
+    for _, row in trade_df.iterrows():
+        if row['is_win']:
+            if streak_type == 'win':
+                streak += 1
             else:
-                # breakeven resets streak? keep as separate
-                if current_streak != 0:
-                    streaks.append(('win' if current_streak > 0 else 'loss', abs(current_streak)))
-                    current_streak = 0
-        if current_streak != 0:
-            streaks.append(('win' if current_streak > 0 else 'loss', abs(current_streak)))
-
-        # Current streak (last non-zero)
-        current_win_streak = 0
-        current_loss_streak = 0
-        for pnl in reversed(df['pnl'].values):
-            if pnl > 0:
-                if current_loss_streak == 0:
-                    current_win_streak += 1
+                if streak_type is not None:
+                    # streak ended, but we want current streak of last type
+                    streak = 1 if row['is_win'] else -1
                 else:
-                    break
-            elif pnl < 0:
-                if current_win_streak == 0:
-                    current_loss_streak -= 1
+                    streak = 1
+                streak_type = 'win'
+        elif row['is_loss']:
+            if streak_type == 'loss':
+                streak -= 1
+            else:
+                if streak_type is not None:
+                    streak = -1
                 else:
-                    break
+                    streak = -1
+                streak_type = 'loss'
+        else:
+            # breakeven breaks the streak? keep as is but don't change type? We'll reset type but keep number? We'll treat BE as end of streak.
+            streak = 0
+            streak_type = None
+    # The streak is based on the last row of trade_df, which is the most recent trade.
+    # Better to calculate last streak from the most recent trade:
+    current_win_streak = 0
+    current_loss_streak = 0
+    for _, row in trade_df.iloc[::-1].iterrows():
+        if row['is_win']:
+            if current_loss_streak == 0:
+                current_win_streak += 1
             else:
                 break
+        elif row['is_loss']:
+            if current_win_streak == 0:
+                current_loss_streak += 1
+            else:
+                break
+        else:
+            break  # breakeven ends streak
 
-        # Best/worst individual chunk
-        best_trade = df.loc[df['pnl'].idxmax()]
-        worst_trade = df.loc[df['pnl'].idxmin()]
+    best_trade = trade_df.loc[trade_df['total_pnl'].idxmax()]
+    worst_trade = trade_df.loc[trade_df['total_pnl'].idxmin()]
 
-        report = (
-            "📊 **Performance Report** – All Time ({} closed chunks)\n\n"
-            "**Total P&L:** {:.2f} USDT\n"
-            "**Winrate:** {:.1f}% ({}W / {}L)\n"
-            "**Profit Factor:** {:.2f}\n"
-            "**Current Win Streak:** {} 🔥\n"
-            "**Current Loss Streak:** {} 😞\n"
-            "**Best Chunk:** {} {} {:.2f} USDT\n"
-            "**Worst Chunk:** {} {} {:.2f} USDT\n"
-        ).format(
-            total_closed,
-            total_pnl,
-            winrate, total_wins, total_losses,
-            profit_factor,
-            current_win_streak,
-            abs(current_loss_streak),
-            best_trade['symbol'], best_trade['action'], best_trade['pnl'],
-            worst_trade['symbol'], worst_trade['action'], worst_trade['pnl']
-        )
-        send_discord_message(report)
+    report = (
+        "📊 **Performance Report** – All Time ({} closed trades)\n\n"
+        "**Total P&L:** {:.2f} USDT\n"
+        "**Winrate:** {:.1f}% ({}W / {}L)\n"
+        "**Profit Factor:** {:.2f}\n"
+        "**Current Win Streak:** {} 🔥\n"
+        "**Current Loss Streak:** {} 😞\n"
+        "**Best Trade:** {} {} {:.2f} USDT\n"
+        "**Worst Trade:** {} {} {:.2f} USDT\n"
+    ).format(
+        total_trades,
+        total_pnl,
+        winrate, total_wins, total_losses,
+        profit_factor,
+        current_win_streak,
+        current_loss_streak,
+        best_trade['symbol'], best_trade['action'], best_trade['total_pnl'],
+        worst_trade['symbol'], worst_trade['action'], worst_trade['total_pnl']
+    )
+    send_discord_message(report)
 
-        # Update milestone file
-        with open(PERF_COUNTER_FILE, 'w') as f:
-            f.write(str(current_milestone))
+    with open(PERF_COUNTER_FILE, 'w') as f:
+        f.write(str(current_milestone))
 
 def send_trade_close_chart(trade, hit_level, exit_price, pnl):
     sym = trade["symbol"]
