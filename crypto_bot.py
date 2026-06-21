@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-Crypto Swing Bot – KuCoin + Yahoo hybrid, 0.4/0.8/1.2/1.6/2.0R TPs
-Wider stop (2.5x ATR, 1.0‑6.0%). Compact signals with smart precision.
+Crypto Swing Bot – 1H timeframe, KuCoin+Yahoo hybrid, 0.4/0.8/1.2/1.6/2.0R TPs
+Wider stop (2.5x ATR from 1H, 1.0‑6.0% bounds). Compact signals.
 Position splitting 30/10/10/10/40, trailing stop, max 10 risky trades.
 Daily loss limit: -100 USDT.
 """
@@ -71,7 +71,7 @@ def load_portfolio():
                 "balance": data.get("balance", 1000.0),
                 "realized_pnl": data.get("realized_pnl", 0.0),
                 "open_positions": data.get("open_positions", 0),
-                "daily_loss_limit": data.get("daily_loss_limit", -100)   # default -100
+                "daily_loss_limit": data.get("daily_loss_limit", -100)
             }
         except: pass
     return {"balance": 1000.0, "realized_pnl": 0.0, "open_positions": 0, "daily_loss_limit": -100}
@@ -83,7 +83,7 @@ def save_portfolio(p):
 
 portfolio = load_portfolio()
 
-# ========== CSV LOGGING (unchanged) ==========
+# ========== CSV LOGGING ==========
 TRADE_LOG_CSV = "crypto_trade_log.csv"
 OPEN_TRADES_CSV = "crypto_open_trades.csv"
 TRADE_RESULTS_CSV = "crypto_trade_results.csv"
@@ -258,59 +258,78 @@ def support_resistance_levels(df, lookback=20):
     recent = df.tail(lookback)
     return recent['High'].max(), recent['Low'].min()
 
-# ========== SCORING (unchanged) ==========
+# ========== SCORING (1H timeframe now, daily trend context) ==========
 def score_pair(pair):
     layers = {}
+    # Daily data for trend context
     df_d = get_yahoo_klines(pair, '1d', days=90)
     if df_d.empty or len(df_d) < 50: return 0, None, None, None, None, {"Daily data": (0,0,"FAIL: insufficient daily candles")}
-    df_4h = get_yahoo_klines(pair, '4h', days=14)
-    if df_4h.empty or len(df_4h) < 50: return 0, None, None, None, None, {"4h data": (0,0,"FAIL: insufficient 4h candles")}
-    df_1h = get_hybrid_klines(pair, '1h', days=3)
-    if df_1h.empty or len(df_1h) < 10: return 0, None, None, None, None, {"1h data": (0,0,"FAIL: insufficient 1h candles")}
-    price = df_4h['Close'].iloc[-1]
+    # 1H data for all indicators and entry/stop
+    df_1h = get_hybrid_klines(pair, '1h', days=14)   # 14 days of 1h
+    if df_1h.empty or len(df_1h) < 50: return 0, None, None, None, None, {"1h data": (0,0,"FAIL: insufficient 1h candles")}
+    price = df_1h['Close'].iloc[-1]
 
-    ema50_d = ema(df_d['Close'], 50); ema200_d = ema(df_d['Close'], 200)
+    # Daily trend direction
+    ema50_d = ema(df_d['Close'], 50)
+    ema200_d = ema(df_d['Close'], 200)
     trend_daily = 0
-    if price > ema50_d.iloc[-1] and ema50_d.iloc[-1] > ema200_d.iloc[-1]: trend_daily = 1
-    elif price < ema50_d.iloc[-1] and ema50_d.iloc[-1] < ema200_d.iloc[-1]: trend_daily = -1
+    if price > ema50_d.iloc[-1] and ema50_d.iloc[-1] > ema200_d.iloc[-1]:
+        trend_daily = 1
+    elif price < ema50_d.iloc[-1] and ema50_d.iloc[-1] < ema200_d.iloc[-1]:
+        trend_daily = -1
 
+    # 4H fallback if daily unclear
     if trend_daily == 0:
-        ema50_4h = ema(df_4h['Close'], 50); ema200_4h = ema(df_4h['Close'], 200)
-        if price > ema50_4h.iloc[-1] and ema50_4h.iloc[-1] > ema200_4h.iloc[-1]: trend_daily = 1
-        elif price < ema50_4h.iloc[-1] and ema50_4h.iloc[-1] < ema200_4h.iloc[-1]: trend_daily = -1
-        else: return 0, None, None, None, None, {"Daily trend": (0,0,"FAIL: no clear trend")}
+        df_4h = get_yahoo_klines(pair, '4h', days=14)
+        if not df_4h.empty and len(df_4h) >= 50:
+            ema50_4h = ema(df_4h['Close'], 50)
+            ema200_4h = ema(df_4h['Close'], 200)
+            if price > ema50_4h.iloc[-1] and ema50_4h.iloc[-1] > ema200_4h.iloc[-1]:
+                trend_daily = 1
+            elif price < ema50_4h.iloc[-1] and ema50_4h.iloc[-1] < ema200_4h.iloc[-1]:
+                trend_daily = -1
+        if trend_daily == 0:
+            return 0, None, None, None, None, {"Daily trend": (0,0,"FAIL: no clear trend (daily or 4h)")}
 
     direction = "LONG" if trend_daily == 1 else "SHORT"
 
-    ema50_4h = ema(df_4h['Close'], 50); ema200_4h = ema(df_4h['Close'], 200)
-    adx_val, di_plus, di_minus = adx(df_4h)
-    rsi_val = rsi(df_4h)
-    macd_line, macd_signal, macd_hist, macd_hist_prev = macd(df_4h)
-    atr_val = atr(df_4h)
-    res, sup = support_resistance_levels(df_4h, 20)
+    # 1H indicators
+    ema50_1h = ema(df_1h['Close'], 50)
+    ema200_1h = ema(df_1h['Close'], 200)
+    adx_val, di_plus, di_minus = adx(df_1h)
+    rsi_val = rsi(df_1h)
+    macd_line, macd_signal, macd_hist, macd_hist_prev = macd(df_1h)
+    atr_val = atr(df_1h)
+    res, sup = support_resistance_levels(df_1h, 20)
 
-    rsi_1h_val = rsi(df_1h, 14)
-    last_candle = df_1h.iloc[-1]; prev_candle = df_1h.iloc[-2]
+    rsi_1h_val = rsi_val   # same, but we can still call it RSI 1h
+    last_candle = df_1h.iloc[-1]
+    prev_candle = df_1h.iloc[-2]
     candle_range = last_candle['High'] - last_candle['Low']
     bullish_momentum = (last_candle['Close'] - last_candle['Open']) / candle_range if candle_range > 0 else 0
 
-    vol_last = df_4h['Volume'].iloc[-1]
-    vol_avg = df_4h['Volume'].iloc[-6:-1].mean() if len(df_4h) >= 6 else vol_last
+    vol_last = df_1h['Volume'].iloc[-1]
+    vol_avg = df_1h['Volume'].iloc[-6:-1].mean() if len(df_1h) >= 6 else vol_last
     vol_surge = vol_last > vol_avg * 1.2 if vol_avg > 0 else False
 
-    btc_df = get_hybrid_klines("BTC-USD", '4h', days=14)
+    # BTC context (1H)
+    btc_df = get_hybrid_klines("BTC-USD", '1h', days=14)
     market_aligned = False
     if not btc_df.empty and len(btc_df) >= 50:
         btc_ema50 = ema(btc_df['Close'], 50)
         btc_trend_up = btc_df['Close'].iloc[-1] > btc_ema50.iloc[-1]
         if trend_daily == 1 and btc_trend_up: market_aligned = True
         elif trend_daily == -1 and not btc_trend_up: market_aligned = True
-    else: layers["Market"] = (0, 0.5, "FAIL: BTC data unavailable")
+    else:
+        layers["Market"] = (0, 0.5, "FAIL: BTC data unavailable")
 
     def bool_score(cond): return 1 if cond else 0
 
-    if direction == "LONG": ema_align = price > ema50_4h.iloc[-1] and ema50_4h.iloc[-1] > ema200_4h.iloc[-1]
-    else: ema_align = price < ema50_4h.iloc[-1] and ema50_4h.iloc[-1] < ema200_4h.iloc[-1]
+    # Layers (same weights, but on 1H data)
+    if direction == "LONG":
+        ema_align = price > ema50_1h.iloc[-1] and ema50_1h.iloc[-1] > ema200_1h.iloc[-1]
+    else:
+        ema_align = price < ema50_1h.iloc[-1] and ema50_1h.iloc[-1] < ema200_1h.iloc[-1]
     layers["EMA Align"] = (bool_score(ema_align) * 1.5, 1.5, "OK")
     adx_trending = adx_val > 20
     adx_dir = (di_plus > di_minus) if direction == "LONG" else (di_minus > di_plus)
@@ -328,6 +347,7 @@ def score_pair(pair):
     if "Market" not in layers: layers["Market"] = (bool_score(market_aligned)*0.5, 0.5, "OK")
     candle_ok = (bullish_momentum > 0.5) if direction=="LONG" else (bullish_momentum < -0.5)
     layers["Candle Mom"] = (bool_score(candle_ok)*2.0, 2.0, "OK")
+    # We already computed RSI, so RSI 1h is same
     if rsi_1h_val is not None:
         rsi_1h_ok = (rsi_1h_val < 63) if direction=="LONG" else (rsi_1h_val > 37)
         layers["RSI 1h"] = (bool_score(rsi_1h_ok)*1.5, 1.5, "OK")
@@ -373,7 +393,7 @@ def generate_signal():
             risky_count = len(risky)
     except: pass
 
-    if risky_count >= 10:   # <-- changed to 10
+    if risky_count >= 10:
         print(f"Max 10 risky trades limit reached ({risky_count}). No new signals.")
         return None, [], {}, 0, 0, risky_count
 
@@ -464,7 +484,7 @@ def get_current_stop(trade):
         elif highest_tp_idx >= 3: return tps[2]
     return stop_orig
 
-# ========== TRADE MANAGEMENT ==========
+# ========== TRADE MANAGEMENT (unchanged) ==========
 def check_open_trades():
     try:
         open_df = pd.read_csv(OPEN_TRADES_CSV)
@@ -620,7 +640,7 @@ def fmt_price(price, reference_price=None):
     else:
         return f"{price:.2f}"
 
-# ========== COMPACT SIGNAL FORMATTING ==========
+# ========== COMPACT SIGNAL FORMATTING (1H) ==========
 def format_signal(sig):
     sym = sig["symbol"].replace("-USD","")
     direction = sig["action"]
@@ -640,7 +660,7 @@ def format_signal(sig):
         if failed:
             fail_warning = f" ⚠️ Data: {', '.join(failed)}"
 
-    return (f"${sym} – {direction_icon} Setup (4H) | Score: {score:.1f}/13.5\n"
+    return (f"${sym} – {direction_icon} Setup (1H) | Score: {score:.1f}/13.5\n"
             f"Entry: {entry_str} | Stop: {stop_str} (-{stop_pct:.2f}%)\n"
             f"TPs: {tp_str}{fail_warning}")
 
@@ -671,12 +691,12 @@ def format_hold_message(top5, top_layers, skipped_no_trend=0, skipped_data=0, ri
     lines.append("\n💬 Are you stalking any setups? Drop your watchlist below! 👇")
     return "\n".join(lines)
 
-# ========== CHART ON SIGNAL ==========
+# ========== CHART ON SIGNAL (1H) ==========
 def send_trade_chart(signal):
     sym = signal['symbol']
     try:
         import matplotlib; matplotlib.use('Agg'); import matplotlib.pyplot as plt; import mplfinance as mpf
-        df = get_hybrid_klines(sym, '4h', days=21)
+        df = get_hybrid_klines(sym, '1h', days=7)   # 7 days of 1h candles for context
         if df.empty or len(df) < 20: raise ValueError("not enough candles")
         mpf_style = mpf.make_mpf_style(base_mpf_style='nightclouds', facecolor='#000000', gridcolor='#2a2e39',
                                        rc={'axes.labelcolor':'white','xtick.color':'white','ytick.color':'white','axes.titlecolor':'white'})
@@ -686,7 +706,7 @@ def send_trade_chart(signal):
             typical = (df['High'] + df['Low'] + df['Close']) / 3
             vwap = (typical * df['Volume']).cumsum() / df['Volume'].cumsum()
             addplots.append(mpf.make_addplot(vwap, color='#3498db', width=1, linestyle='--', label='VWAP'))
-        fig, axes = mpf.plot(df, type='candle', style=mpf_style, title=f"{sym} 4h", ylabel='Price', addplot=addplots, returnfig=True, figsize=(8,6))
+        fig, axes = mpf.plot(df, type='candle', style=mpf_style, title=f"{sym} 1h", ylabel='Price', addplot=addplots, returnfig=True, figsize=(8,6))
         ax = axes[0]
         entry = signal.get('limit_price'); stop = signal.get('stop_loss'); tps = signal.get('take_profits')
         if entry:
@@ -699,7 +719,7 @@ def send_trade_chart(signal):
         chart_path = f"{sym}_chart.png"
         fig.savefig(chart_path, dpi=100, bbox_inches='tight', facecolor='black')
         plt.close(fig)
-        send_discord_image(chart_path, caption=f"{sym} – {signal['action']} Setup (4H)")
+        send_discord_image(chart_path, caption=f"{sym} – {signal['action']} Setup (1H)")
         os.remove(chart_path)
         send_discord_message(format_signal(signal))
     except Exception as e:
@@ -715,7 +735,7 @@ def main():
             open_df = pd.read_csv(OPEN_TRADES_CSV)
             print(f"Currently {len(open_df)} open trade(s).")
         except: print("No open trades file.")
-        if daily_pnl() <= portfolio['daily_loss_limit']:   # now -100
+        if daily_pnl() <= portfolio['daily_loss_limit']:
             send_discord_message("Daily loss limit reached. No new trades today.")
             return
         sig, top5, top_layers, skipped_no_trend, skipped_data, risky_count = generate_signal()
