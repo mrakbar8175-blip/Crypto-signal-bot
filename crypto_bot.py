@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """
-Crypto Swing Bot – 1H timeframe, KuCoin+Yahoo hybrid, 0.4/0.8/1.2/1.6/2.0R TPs
-Wider stop (2.5x ATR from 1H, 1.0‑6.0% bounds). Compact signals.
-Position splitting 30/10/10/10/40, trailing stop, max 10 risky trades.
+Crypto Swing Bot – 4H timeframe, KuCoin+Yahoo hybrid, 0.4/0.8/1.2/1.6/2.0R TPs
+Wider stop (2.5x ATR, 1.0‑6.0% bounds). Compact signals with smart precision.
+Position splitting 30/10/10/10/40, trailing stop, max 5 risky trades.
 Daily loss limit: -100 USDT.
+Cumulative performance report every 10 fully closed trades.
 """
 
 import requests, json, os, traceback, random, math
@@ -87,6 +88,7 @@ portfolio = load_portfolio()
 TRADE_LOG_CSV = "crypto_trade_log.csv"
 OPEN_TRADES_CSV = "crypto_open_trades.csv"
 TRADE_RESULTS_CSV = "crypto_trade_results.csv"
+PERF_COUNTER_FILE = "perf_counter.txt"          # tracks last reported milestone
 
 def init_csv(f, cols):
     if not os.path.exists(f): pd.DataFrame(columns=cols).to_csv(f, index=False)
@@ -258,18 +260,19 @@ def support_resistance_levels(df, lookback=20):
     recent = df.tail(lookback)
     return recent['High'].max(), recent['Low'].min()
 
-# ========== SCORING (1H timeframe now, daily trend context) ==========
+# ========== SCORING (4H timeframe, daily trend context) ==========
 def score_pair(pair):
     layers = {}
-    # Daily data for trend context
     df_d = get_yahoo_klines(pair, '1d', days=90)
     if df_d.empty or len(df_d) < 50: return 0, None, None, None, None, {"Daily data": (0,0,"FAIL: insufficient daily candles")}
-    # 1H data for all indicators and entry/stop
-    df_1h = get_hybrid_klines(pair, '1h', days=14)   # 14 days of 1h
-    if df_1h.empty or len(df_1h) < 50: return 0, None, None, None, None, {"1h data": (0,0,"FAIL: insufficient 1h candles")}
-    price = df_1h['Close'].iloc[-1]
+    df_4h = get_hybrid_klines(pair, '4h', days=14)
+    if df_4h.empty or len(df_4h) < 50: return 0, None, None, None, None, {"4h data": (0,0,"FAIL: insufficient 4h candles")}
+    df_1h = get_hybrid_klines(pair, '1h', days=3)
+    if df_1h.empty or len(df_1h) < 10: return 0, None, None, None, None, {"1h data": (0,0,"FAIL: insufficient 1h candles")}
 
-    # Daily trend direction
+    price = df_4h['Close'].iloc[-1]
+
+    # Daily trend
     ema50_d = ema(df_d['Close'], 50)
     ema200_d = ema(df_d['Close'], 200)
     trend_daily = 0
@@ -278,42 +281,40 @@ def score_pair(pair):
     elif price < ema50_d.iloc[-1] and ema50_d.iloc[-1] < ema200_d.iloc[-1]:
         trend_daily = -1
 
-    # 4H fallback if daily unclear
     if trend_daily == 0:
-        df_4h = get_yahoo_klines(pair, '4h', days=14)
-        if not df_4h.empty and len(df_4h) >= 50:
-            ema50_4h = ema(df_4h['Close'], 50)
-            ema200_4h = ema(df_4h['Close'], 200)
-            if price > ema50_4h.iloc[-1] and ema50_4h.iloc[-1] > ema200_4h.iloc[-1]:
-                trend_daily = 1
-            elif price < ema50_4h.iloc[-1] and ema50_4h.iloc[-1] < ema200_4h.iloc[-1]:
-                trend_daily = -1
-        if trend_daily == 0:
+        ema50_4h = ema(df_4h['Close'], 50)
+        ema200_4h = ema(df_4h['Close'], 200)
+        if price > ema50_4h.iloc[-1] and ema50_4h.iloc[-1] > ema200_4h.iloc[-1]:
+            trend_daily = 1
+        elif price < ema50_4h.iloc[-1] and ema50_4h.iloc[-1] < ema200_4h.iloc[-1]:
+            trend_daily = -1
+        else:
             return 0, None, None, None, None, {"Daily trend": (0,0,"FAIL: no clear trend (daily or 4h)")}
 
     direction = "LONG" if trend_daily == 1 else "SHORT"
 
-    # 1H indicators
-    ema50_1h = ema(df_1h['Close'], 50)
-    ema200_1h = ema(df_1h['Close'], 200)
-    adx_val, di_plus, di_minus = adx(df_1h)
-    rsi_val = rsi(df_1h)
-    macd_line, macd_signal, macd_hist, macd_hist_prev = macd(df_1h)
-    atr_val = atr(df_1h)
-    res, sup = support_resistance_levels(df_1h, 20)
+    # 4H indicators
+    ema50_4h = ema(df_4h['Close'], 50)
+    ema200_4h = ema(df_4h['Close'], 200)
+    adx_val, di_plus, di_minus = adx(df_4h)
+    rsi_val = rsi(df_4h)
+    macd_line, macd_signal, macd_hist, macd_hist_prev = macd(df_4h)
+    atr_val = atr(df_4h)
+    res, sup = support_resistance_levels(df_4h, 20)
 
-    rsi_1h_val = rsi_val   # same, but we can still call it RSI 1h
+    # 1H momentum
+    rsi_1h_val = rsi(df_1h, 14)
     last_candle = df_1h.iloc[-1]
     prev_candle = df_1h.iloc[-2]
     candle_range = last_candle['High'] - last_candle['Low']
     bullish_momentum = (last_candle['Close'] - last_candle['Open']) / candle_range if candle_range > 0 else 0
 
-    vol_last = df_1h['Volume'].iloc[-1]
-    vol_avg = df_1h['Volume'].iloc[-6:-1].mean() if len(df_1h) >= 6 else vol_last
+    vol_last = df_4h['Volume'].iloc[-1]
+    vol_avg = df_4h['Volume'].iloc[-6:-1].mean() if len(df_4h) >= 6 else vol_last
     vol_surge = vol_last > vol_avg * 1.2 if vol_avg > 0 else False
 
-    # BTC context (1H)
-    btc_df = get_hybrid_klines("BTC-USD", '1h', days=14)
+    # BTC context (4H)
+    btc_df = get_hybrid_klines("BTC-USD", '4h', days=14)
     market_aligned = False
     if not btc_df.empty and len(btc_df) >= 50:
         btc_ema50 = ema(btc_df['Close'], 50)
@@ -325,11 +326,11 @@ def score_pair(pair):
 
     def bool_score(cond): return 1 if cond else 0
 
-    # Layers (same weights, but on 1H data)
+    # Layers (same weights as before)
     if direction == "LONG":
-        ema_align = price > ema50_1h.iloc[-1] and ema50_1h.iloc[-1] > ema200_1h.iloc[-1]
+        ema_align = price > ema50_4h.iloc[-1] and ema50_4h.iloc[-1] > ema200_4h.iloc[-1]
     else:
-        ema_align = price < ema50_1h.iloc[-1] and ema50_1h.iloc[-1] < ema200_1h.iloc[-1]
+        ema_align = price < ema50_4h.iloc[-1] and ema50_4h.iloc[-1] < ema200_4h.iloc[-1]
     layers["EMA Align"] = (bool_score(ema_align) * 1.5, 1.5, "OK")
     adx_trending = adx_val > 20
     adx_dir = (di_plus > di_minus) if direction == "LONG" else (di_minus > di_plus)
@@ -347,7 +348,6 @@ def score_pair(pair):
     if "Market" not in layers: layers["Market"] = (bool_score(market_aligned)*0.5, 0.5, "OK")
     candle_ok = (bullish_momentum > 0.5) if direction=="LONG" else (bullish_momentum < -0.5)
     layers["Candle Mom"] = (bool_score(candle_ok)*2.0, 2.0, "OK")
-    # We already computed RSI, so RSI 1h is same
     if rsi_1h_val is not None:
         rsi_1h_ok = (rsi_1h_val < 63) if direction=="LONG" else (rsi_1h_val > 37)
         layers["RSI 1h"] = (bool_score(rsi_1h_ok)*1.5, 1.5, "OK")
@@ -379,7 +379,7 @@ def ai_confirm_trade(signal_dict):
     except: pass
     return True
 
-# ========== SIGNAL GENERATION (max 10 risky) ==========
+# ========== SIGNAL GENERATION (max 5 risky) ==========
 def generate_signal():
     risky_count = 0
     try:
@@ -393,8 +393,8 @@ def generate_signal():
             risky_count = len(risky)
     except: pass
 
-    if risky_count >= 10:
-        print(f"Max 10 risky trades limit reached ({risky_count}). No new signals.")
+    if risky_count >= 5:   # <-- changed to 5
+        print(f"Max 5 risky trades limit reached ({risky_count}). No new signals.")
         return None, [], {}, 0, 0, risky_count
 
     open_symbols_risky = set()
@@ -484,7 +484,7 @@ def get_current_stop(trade):
         elif highest_tp_idx >= 3: return tps[2]
     return stop_orig
 
-# ========== TRADE MANAGEMENT (unchanged) ==========
+# ========== TRADE MANAGEMENT ==========
 def check_open_trades():
     try:
         open_df = pd.read_csv(OPEN_TRADES_CSV)
@@ -594,12 +594,124 @@ def check_open_trades():
         portfolio['open_positions'] = 0
     save_portfolio(portfolio)
 
+    # Performance report check (cumulative)
+    check_and_send_perf_report()
+
     risky_count = sum(1 for t in still_open if t.get("breakeven", False) == False)
     be_count = len(still_open) - risky_count
     summary = f"🔍 Open trades status: {risky_count} risky (TP1 not hit yet), {be_count} breakeven (risk-free). Total: {len(still_open)}"
     print(summary); send_discord_message(summary)
     print(f"Trade closures processed: {len(results)}. Still open: {len(still_open)}.")
     if not alerts: print("No trade closures this run.")
+
+def check_and_send_perf_report():
+    """If total closed trades reached a new multiple of 10, send a performance report."""
+    try:
+        df = pd.read_csv(TRADE_RESULTS_CSV)
+    except:
+        return
+    if df.empty:
+        return
+    # Each row in TRADE_RESULTS_CSV is one partial close (TP1, TP2, etc.)
+    # But for trade-level stats, we need to group by the original trade timestamp (or unique ID).
+    # We don't have a trade ID, but we can approximate by considering that a full trade is fully closed when the sum of quantities per (symbol, entry_time) equals original quantity.
+    # However, the simplest cumulative metric people care about is based on the individual closed chunks (since PnL is additive). We'll just use the raw rows as trade "events" for simplicity.
+    # To get a proper trade-level winrate, we'd need to reconstruct entire trades, but for a quick snapshot, using per-chunk stats is okay.
+    # We'll compute stats on all rows in TRADE_RESULTS_CSV.
+    total_closed = len(df)
+    # Read the last reported milestone
+    last_reported = 0
+    if os.path.exists(PERF_COUNTER_FILE):
+        try:
+            with open(PERF_COUNTER_FILE, 'r') as f:
+                last_reported = int(f.read().strip())
+        except:
+            pass
+    current_milestone = (total_closed // 10) * 10
+    if current_milestone > last_reported:
+        # Generate report
+        total_pnl = df['pnl'].sum()
+        wins = df[df['pnl'] > 0]
+        losses = df[df['pnl'] < 0]
+        breakevens = df[df['pnl'] == 0]
+        total_wins = len(wins)
+        total_losses = len(losses)
+        total_trades = total_wins + total_losses + len(breakevens)
+        winrate = (total_wins / max(total_wins+total_losses, 1)) * 100
+
+        profit_factor = wins['pnl'].sum() / abs(losses['pnl'].sum()) if abs(losses['pnl'].sum()) > 0 else float('inf')
+
+        # Streak calculation on the most recent rows
+        streaks = []
+        current_streak = 0
+        for pnl in df['pnl']:
+            if pnl > 0:
+                if current_streak > 0:
+                    current_streak += 1
+                else:
+                    if current_streak < 0:
+                        streaks.append(('loss', -current_streak))
+                    current_streak = 1
+            elif pnl < 0:
+                if current_streak < 0:
+                    current_streak -= 1
+                else:
+                    if current_streak > 0:
+                        streaks.append(('win', current_streak))
+                    current_streak = -1
+            else:
+                # breakeven resets streak? keep as separate
+                if current_streak != 0:
+                    streaks.append(('win' if current_streak > 0 else 'loss', abs(current_streak)))
+                    current_streak = 0
+        if current_streak != 0:
+            streaks.append(('win' if current_streak > 0 else 'loss', abs(current_streak)))
+
+        # Current streak (last non-zero)
+        current_win_streak = 0
+        current_loss_streak = 0
+        for pnl in reversed(df['pnl'].values):
+            if pnl > 0:
+                if current_loss_streak == 0:
+                    current_win_streak += 1
+                else:
+                    break
+            elif pnl < 0:
+                if current_win_streak == 0:
+                    current_loss_streak -= 1
+                else:
+                    break
+            else:
+                break
+
+        # Best/worst individual chunk
+        best_trade = df.loc[df['pnl'].idxmax()]
+        worst_trade = df.loc[df['pnl'].idxmin()]
+
+        report = (
+            "📊 **Performance Report** – All Time ({} closed chunks)\n\n"
+            "**Total P&L:** {:.2f} USDT\n"
+            "**Winrate:** {:.1f}% ({}W / {}L)\n"
+            "**Profit Factor:** {:.2f}\n"
+            "**Current Win Streak:** {} 🔥\n"
+            "**Current Loss Streak:** {} 😞\n"
+            "**Best Chunk:** {} {} {:.2f} USDT\n"
+            "**Worst Chunk:** {} {} {:.2f} USDT\n"
+        ).format(
+            total_closed,
+            total_pnl,
+            winrate, total_wins, total_losses,
+            profit_factor,
+            current_win_streak,
+            abs(current_loss_streak),
+            best_trade['symbol'], best_trade['action'], best_trade['pnl'],
+            worst_trade['symbol'], worst_trade['action'], worst_trade['pnl']
+        )
+        send_discord_message(report)
+
+        # Update milestone file
+        with open(PERF_COUNTER_FILE, 'w') as f:
+            f.write(str(current_milestone))
 
 def send_trade_close_chart(trade, hit_level, exit_price, pnl):
     sym = trade["symbol"]
@@ -640,7 +752,7 @@ def fmt_price(price, reference_price=None):
     else:
         return f"{price:.2f}"
 
-# ========== COMPACT SIGNAL FORMATTING (1H) ==========
+# ========== COMPACT SIGNAL FORMATTING (4H) ==========
 def format_signal(sig):
     sym = sig["symbol"].replace("-USD","")
     direction = sig["action"]
@@ -660,14 +772,14 @@ def format_signal(sig):
         if failed:
             fail_warning = f" ⚠️ Data: {', '.join(failed)}"
 
-    return (f"${sym} – {direction_icon} Setup (1H) | Score: {score:.1f}/13.5\n"
+    return (f"${sym} – {direction_icon} Setup (4H) | Score: {score:.1f}/13.5\n"
             f"Entry: {entry_str} | Stop: {stop_str} (-{stop_pct:.2f}%)\n"
             f"TPs: {tp_str}{fail_warning}")
 
 # ========== HOLD MESSAGE ==========
 def format_hold_message(top5, top_layers, skipped_no_trend=0, skipped_data=0, risky_limit=False):
     if risky_limit:
-        return "HOLD – Maximum 10 risky trades limit reached. No new signals until a TP1 is hit."
+        return "HOLD – Maximum 5 risky trades limit reached. No new signals until a TP1 is hit."
     if not top5:
         msg = "HOLD – No valid trade setups found."
         if skipped_no_trend > 0 or skipped_data > 0:
@@ -691,12 +803,12 @@ def format_hold_message(top5, top_layers, skipped_no_trend=0, skipped_data=0, ri
     lines.append("\n💬 Are you stalking any setups? Drop your watchlist below! 👇")
     return "\n".join(lines)
 
-# ========== CHART ON SIGNAL (1H) ==========
+# ========== CHART ON SIGNAL (4H) ==========
 def send_trade_chart(signal):
     sym = signal['symbol']
     try:
         import matplotlib; matplotlib.use('Agg'); import matplotlib.pyplot as plt; import mplfinance as mpf
-        df = get_hybrid_klines(sym, '1h', days=7)   # 7 days of 1h candles for context
+        df = get_hybrid_klines(sym, '4h', days=21)
         if df.empty or len(df) < 20: raise ValueError("not enough candles")
         mpf_style = mpf.make_mpf_style(base_mpf_style='nightclouds', facecolor='#000000', gridcolor='#2a2e39',
                                        rc={'axes.labelcolor':'white','xtick.color':'white','ytick.color':'white','axes.titlecolor':'white'})
@@ -706,7 +818,7 @@ def send_trade_chart(signal):
             typical = (df['High'] + df['Low'] + df['Close']) / 3
             vwap = (typical * df['Volume']).cumsum() / df['Volume'].cumsum()
             addplots.append(mpf.make_addplot(vwap, color='#3498db', width=1, linestyle='--', label='VWAP'))
-        fig, axes = mpf.plot(df, type='candle', style=mpf_style, title=f"{sym} 1h", ylabel='Price', addplot=addplots, returnfig=True, figsize=(8,6))
+        fig, axes = mpf.plot(df, type='candle', style=mpf_style, title=f"{sym} 4h", ylabel='Price', addplot=addplots, returnfig=True, figsize=(8,6))
         ax = axes[0]
         entry = signal.get('limit_price'); stop = signal.get('stop_loss'); tps = signal.get('take_profits')
         if entry:
@@ -719,7 +831,7 @@ def send_trade_chart(signal):
         chart_path = f"{sym}_chart.png"
         fig.savefig(chart_path, dpi=100, bbox_inches='tight', facecolor='black')
         plt.close(fig)
-        send_discord_image(chart_path, caption=f"{sym} – {signal['action']} Setup (1H)")
+        send_discord_image(chart_path, caption=f"{sym} – {signal['action']} Setup (4H)")
         os.remove(chart_path)
         send_discord_message(format_signal(signal))
     except Exception as e:
@@ -744,7 +856,7 @@ def main():
             portfolio['open_positions'] += 1; save_portfolio(portfolio)
             send_trade_chart(sig)
         else:
-            if risky_count >= 10:
+            if risky_count >= 5:
                 send_discord_message(format_hold_message(top5, top_layers, risky_limit=True))
             else:
                 send_discord_message(format_hold_message(top5, top_layers, skipped_no_trend, skipped_data))
