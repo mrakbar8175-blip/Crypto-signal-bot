@@ -2,7 +2,8 @@
 """
 Crypto Swing Bot – KuCoin + Yahoo hybrid, 0.4/0.8/1.2/1.6/2.0R TPs
 Wider stop (2.5x ATR, 1.0‑6.0%). Compact signals with smart precision.
-Position splitting 30/10/10/10/40, trailing stop, max 3 risky trades.
+Position splitting 30/10/10/10/40, trailing stop, max 10 risky trades.
+Daily loss limit: -100 USDT.
 """
 
 import requests, json, os, traceback, random, math
@@ -70,10 +71,10 @@ def load_portfolio():
                 "balance": data.get("balance", 1000.0),
                 "realized_pnl": data.get("realized_pnl", 0.0),
                 "open_positions": data.get("open_positions", 0),
-                "daily_loss_limit": data.get("daily_loss_limit", -20)
+                "daily_loss_limit": data.get("daily_loss_limit", -100)   # default -100
             }
         except: pass
-    return {"balance": 1000.0, "realized_pnl": 0.0, "open_positions": 0, "daily_loss_limit": -20}
+    return {"balance": 1000.0, "realized_pnl": 0.0, "open_positions": 0, "daily_loss_limit": -100}
 
 def save_portfolio(p):
     try:
@@ -82,7 +83,7 @@ def save_portfolio(p):
 
 portfolio = load_portfolio()
 
-# ========== CSV LOGGING ==========
+# ========== CSV LOGGING (unchanged) ==========
 TRADE_LOG_CSV = "crypto_trade_log.csv"
 OPEN_TRADES_CSV = "crypto_open_trades.csv"
 TRADE_RESULTS_CSV = "crypto_trade_results.csv"
@@ -358,7 +359,7 @@ def ai_confirm_trade(signal_dict):
     except: pass
     return True
 
-# ========== SIGNAL GENERATION ==========
+# ========== SIGNAL GENERATION (max 10 risky) ==========
 def generate_signal():
     risky_count = 0
     try:
@@ -372,8 +373,8 @@ def generate_signal():
             risky_count = len(risky)
     except: pass
 
-    if risky_count >= 3:
-        print(f"Max 3 risky trades limit reached ({risky_count}). No new signals.")
+    if risky_count >= 10:   # <-- changed to 10
+        print(f"Max 10 risky trades limit reached ({risky_count}). No new signals.")
         return None, [], {}, 0, 0, risky_count
 
     open_symbols_risky = set()
@@ -610,7 +611,6 @@ def send_trade_close_chart(trade, hit_level, exit_price, pnl):
 
 # ========== SMART PRICE FORMATTER ==========
 def fmt_price(price, reference_price=None):
-    """Choose decimal places based on price magnitude."""
     if reference_price is None:
         reference_price = abs(price)
     if reference_price < 1:
@@ -620,7 +620,7 @@ def fmt_price(price, reference_price=None):
     else:
         return f"{price:.2f}"
 
-# ========== COMPACT SIGNAL FORMATTING (with smart precision) ==========
+# ========== COMPACT SIGNAL FORMATTING ==========
 def format_signal(sig):
     sym = sig["symbol"].replace("-USD","")
     direction = sig["action"]
@@ -647,7 +647,7 @@ def format_signal(sig):
 # ========== HOLD MESSAGE ==========
 def format_hold_message(top5, top_layers, skipped_no_trend=0, skipped_data=0, risky_limit=False):
     if risky_limit:
-        return "HOLD – Maximum 3 risky trades limit reached. No new signals until a TP1 is hit."
+        return "HOLD – Maximum 10 risky trades limit reached. No new signals until a TP1 is hit."
     if not top5:
         msg = "HOLD – No valid trade setups found."
         if skipped_no_trend > 0 or skipped_data > 0:
@@ -715,7 +715,7 @@ def main():
             open_df = pd.read_csv(OPEN_TRADES_CSV)
             print(f"Currently {len(open_df)} open trade(s).")
         except: print("No open trades file.")
-        if daily_pnl() <= portfolio['daily_loss_limit']:
+        if daily_pnl() <= portfolio['daily_loss_limit']:   # now -100
             send_discord_message("Daily loss limit reached. No new trades today.")
             return
         sig, top5, top_layers, skipped_no_trend, skipped_data, risky_count = generate_signal()
@@ -724,7 +724,7 @@ def main():
             portfolio['open_positions'] += 1; save_portfolio(portfolio)
             send_trade_chart(sig)
         else:
-            if risky_count >= 3:
+            if risky_count >= 10:
                 send_discord_message(format_hold_message(top5, top_layers, risky_limit=True))
             else:
                 send_discord_message(format_hold_message(top5, top_layers, skipped_no_trend, skipped_data))
