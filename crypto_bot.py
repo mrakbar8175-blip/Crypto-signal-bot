@@ -5,6 +5,7 @@ Wider stop (2.5x ATR, 1.0‑6.0% bounds). Compact signals with smart precision.
 Position splitting 30/10/10/10/40, trailing stop, max 5 risky trades.
 Daily loss limit: -100 USDT.
 Cumulative performance report every 10 fully closed trades (trade‑level stats).
+BLACKLIST includes LEO and WBT.
 """
 
 import requests, json, os, traceback, random, math
@@ -21,7 +22,8 @@ if not GROQ_API_KEY:
 
 # ========== BLACKLIST ==========
 BLACKLIST = {
-    "QUQ", "USDT", "USDC", "DAI", "BUSD", "TUSD", "USDP", "FDUSD"
+    "QUQ", "USDT", "USDC", "DAI", "BUSD", "TUSD", "USDP", "FDUSD",
+    "LEO", "WBT"                     # <-- permanently removed
 }
 
 # ========== DYNAMIC COIN LIST (CoinGecko → Yahoo symbols) ==========
@@ -606,16 +608,13 @@ def check_open_trades():
 
 # ---------- TRADE‑LEVEL PERFORMANCE REPORT ----------
 def get_completed_trades():
-    """Group TRADE_RESULTS_CSV by (timestamp, symbol) to form completed trades.
-    Returns a DataFrame with columns: total_pnl, is_win (bool), etc."""
+    """Group TRADE_RESULTS_CSV by (timestamp, symbol) to form completed trades."""
     try:
         df = pd.read_csv(TRADE_RESULTS_CSV)
     except:
         return pd.DataFrame()
     if df.empty:
         return pd.DataFrame()
-
-    # Group by the original trade timestamp and symbol
     trade_groups = df.groupby(['timestamp', 'symbol'])
     trades = []
     for (ts, sym), group in trade_groups:
@@ -653,35 +652,6 @@ def check_and_send_perf_report():
     total_pnl = trade_df['total_pnl'].sum()
     profit_factor = wins['total_pnl'].sum() / abs(losses['total_pnl'].sum()) if total_losses > 0 else float('inf')
 
-    # Current streak (last trades)
-    streak = 0
-    streak_type = None
-    for _, row in trade_df.iterrows():
-        if row['is_win']:
-            if streak_type == 'win':
-                streak += 1
-            else:
-                if streak_type is not None:
-                    # streak ended, but we want current streak of last type
-                    streak = 1 if row['is_win'] else -1
-                else:
-                    streak = 1
-                streak_type = 'win'
-        elif row['is_loss']:
-            if streak_type == 'loss':
-                streak -= 1
-            else:
-                if streak_type is not None:
-                    streak = -1
-                else:
-                    streak = -1
-                streak_type = 'loss'
-        else:
-            # breakeven breaks the streak? keep as is but don't change type? We'll reset type but keep number? We'll treat BE as end of streak.
-            streak = 0
-            streak_type = None
-    # The streak is based on the last row of trade_df, which is the most recent trade.
-    # Better to calculate last streak from the most recent trade:
     current_win_streak = 0
     current_loss_streak = 0
     for _, row in trade_df.iloc[::-1].iterrows():
@@ -696,7 +666,7 @@ def check_and_send_perf_report():
             else:
                 break
         else:
-            break  # breakeven ends streak
+            break
 
     best_trade = trade_df.loc[trade_df['total_pnl'].idxmax()]
     worst_trade = trade_df.loc[trade_df['total_pnl'].idxmin()]
