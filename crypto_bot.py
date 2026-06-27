@@ -4,8 +4,9 @@ Crypto Swing Bot – 4H timeframe, KuCoin+Yahoo hybrid, 0.4/0.8/1.2/1.6/2.0R TPs
 Wider stop (2.5x ATR, 1.0‑6.0% bounds). Compact signals with smart precision.
 Position splitting 30/10/10/10/40, trailing stop, max 5 risky trades.
 Daily loss limit: -100 USDT.
-Cumulative performance report every 10 fully closed trades (trade‑level stats).
-BLACKLIST includes LEO and WBT.
+Performance report every 10 fully closed trades (trade‑level stats).
+BLACKLIST includes LEO, WBT, QUQ, stablecoins.
+LIQUID MOMENTUM UNIVERSE: top 100 market‑cap coins filtered to the 20 most trending (14‑day ROC).
 """
 
 import requests, json, os, traceback, random, math
@@ -23,11 +24,16 @@ if not GROQ_API_KEY:
 # ========== BLACKLIST ==========
 BLACKLIST = {
     "QUQ", "USDT", "USDC", "DAI", "BUSD", "TUSD", "USDP", "FDUSD",
-    "LEO", "WBT"                     # <-- permanently removed
+    "LEO", "WBT"
 }
 
-# ========== DYNAMIC COIN LIST (CoinGecko → Yahoo symbols) ==========
-def fetch_top_liquid_coins(limit=50):
+# ========== DYNAMIC COIN LIST (Liquid Momentum) ==========
+def fetch_top_liquid_momentum_coins(limit=100, momentum_top=20):
+    """
+    Fetch top *limit* coins by market cap, then keep only the *momentum_top*
+    coins with the highest absolute 14‑day price change.
+    Returns a list of Yahoo‑style symbols (e.g. 'BTC‑USD').
+    """
     global COIN_RANK
     url = "https://api.coingecko.com/api/v3/coins/markets"
     params = {
@@ -36,33 +42,49 @@ def fetch_top_liquid_coins(limit=50):
         "per_page": limit,
         "page": 1,
         "sparkline": False,
-        "price_change_percentage": "24h"
+        "price_change_percentage": "14d"          # we get 14‑day ROC for free
     }
     try:
         resp = requests.get(url, params=params, timeout=15)
         data = resp.json()
+        # Build list of (symbol, momentum_abs)
+        candidates = []
+        for coin in data:
+            symbol = coin.get("symbol", "").upper()
+            if not symbol or symbol in BLACKLIST:
+                continue
+            # 14‑day price change percentage (can be None for very new coins)
+            roc_14 = coin.get("price_change_percentage_14d_in_currency")
+            if roc_14 is None:
+                momentum = 0.0
+            else:
+                momentum = abs(roc_14)
+            candidates.append((symbol, momentum))
+        # Sort by momentum descending, take top N
+        candidates.sort(key=lambda x: x[1], reverse=True)
+        top_symbols = [sym for sym, _ in candidates[:momentum_top]]
+
+        # Build Yahoo symbols and update COIN_RANK
         yahoo_symbols = []
         COIN_RANK = {}
         rank = 1
-        for coin in data:
-            symbol = coin.get("symbol", "").upper()
-            if symbol and symbol not in BLACKLIST:
-                ys = f"{symbol}-USD"
-                if ys not in yahoo_symbols:
-                    yahoo_symbols.append(ys)
-                    COIN_RANK[ys] = rank
-                    rank += 1
-        print(f"Fetched {len(yahoo_symbols)} coins (blacklist filtered)")
-        return yahoo_symbols[:limit]
+        for sym in top_symbols:
+            ys = f"{sym}-USD"
+            if ys not in yahoo_symbols:
+                yahoo_symbols.append(ys)
+                COIN_RANK[ys] = rank
+                rank += 1
+        print(f"Liquid Momentum Universe: {len(yahoo_symbols)} coins selected")
+        return yahoo_symbols
     except Exception as e:
-        print(f"CoinGecko API failed: {e}. Using fallback.")
+        print(f"CoinGecko API failed: {e}. Using fallback list.")
         fallback = ["BTC-USD","ETH-USD","BNB-USD","SOL-USD","XRP-USD",
                     "ADA-USD","DOGE-USD","DOT-USD","MATIC-USD","LINK-USD"]
         COIN_RANK = {sym: i+1 for i, sym in enumerate(fallback)}
-        return fallback[:limit]
+        return fallback
 
 COIN_RANK = {}
-CRYPTO_PAIRS = fetch_top_liquid_coins(50)
+CRYPTO_PAIRS = fetch_top_liquid_momentum_coins(limit=100, momentum_top=20)
 
 # ========== PORTFOLIO ==========
 PORTFOLIO_FILE = "crypto_portfolio.json"
@@ -262,7 +284,7 @@ def support_resistance_levels(df, lookback=20):
     recent = df.tail(lookback)
     return recent['High'].max(), recent['Low'].min()
 
-# ========== SCORING (4H timeframe, daily trend context) ==========
+# ========== SCORING (4H timeframe, daily trend context) – unchanged ==========
 def score_pair(pair):
     layers = {}
     df_d = get_yahoo_klines(pair, '1d', days=90)
@@ -608,19 +630,15 @@ def check_open_trades():
 
 # ---------- TRADE‑LEVEL PERFORMANCE REPORT ----------
 def get_completed_trades():
-    """Group TRADE_RESULTS_CSV by (timestamp, symbol) to form completed trades."""
     try:
         df = pd.read_csv(TRADE_RESULTS_CSV)
-    except:
-        return pd.DataFrame()
-    if df.empty:
-        return pd.DataFrame()
+    except: return pd.DataFrame()
+    if df.empty: return pd.DataFrame()
     trade_groups = df.groupby(['timestamp', 'symbol'])
     trades = []
     for (ts, sym), group in trade_groups:
         total_pnl = group['pnl'].sum()
-        trades.append({'timestamp': ts, 'symbol': sym, 'total_pnl': total_pnl,
-                       'action': group['action'].iloc[0]})
+        trades.append({'timestamp': ts, 'symbol': sym, 'total_pnl': total_pnl, 'action': group['action'].iloc[0]})
     trade_df = pd.DataFrame(trades)
     trade_df['is_win'] = trade_df['total_pnl'] > 0
     trade_df['is_loss'] = trade_df['total_pnl'] < 0
@@ -629,71 +647,48 @@ def get_completed_trades():
 
 def check_and_send_perf_report():
     trade_df = get_completed_trades()
-    if trade_df.empty:
-        return
+    if trade_df.empty: return
     total_trades = len(trade_df)
     last_reported = 0
     if os.path.exists(PERF_COUNTER_FILE):
         try:
-            with open(PERF_COUNTER_FILE, 'r') as f:
-                last_reported = int(f.read().strip())
-        except:
-            pass
+            with open(PERF_COUNTER_FILE, 'r') as f: last_reported = int(f.read().strip())
+        except: pass
     current_milestone = (total_trades // 10) * 10
-    if current_milestone <= last_reported:
-        return
+    if current_milestone <= last_reported: return
 
     wins = trade_df[trade_df['is_win']]
     losses = trade_df[trade_df['is_loss']]
-    total_wins = len(wins)
-    total_losses = len(losses)
-    winrate = (total_wins / max(total_wins + total_losses, 1)) * 100
-
+    total_wins = len(wins); total_losses = len(losses)
+    winrate = (total_wins / max(total_wins+total_losses, 1)) * 100
     total_pnl = trade_df['total_pnl'].sum()
     profit_factor = wins['total_pnl'].sum() / abs(losses['total_pnl'].sum()) if total_losses > 0 else float('inf')
 
-    current_win_streak = 0
-    current_loss_streak = 0
+    current_win_streak = 0; current_loss_streak = 0
     for _, row in trade_df.iloc[::-1].iterrows():
         if row['is_win']:
-            if current_loss_streak == 0:
-                current_win_streak += 1
-            else:
-                break
+            if current_loss_streak == 0: current_win_streak += 1
+            else: break
         elif row['is_loss']:
-            if current_win_streak == 0:
-                current_loss_streak += 1
-            else:
-                break
-        else:
-            break
+            if current_win_streak == 0: current_loss_streak += 1
+            else: break
+        else: break
 
-    best_trade = trade_df.loc[trade_df['total_pnl'].idxmax()]
-    worst_trade = trade_df.loc[trade_df['total_pnl'].idxmin()]
+    best = trade_df.loc[trade_df['total_pnl'].idxmax()]
+    worst = trade_df.loc[trade_df['total_pnl'].idxmin()]
 
     report = (
-        "📊 **Performance Report** – All Time ({} closed trades)\n\n"
-        "**Total P&L:** {:.2f} USDT\n"
-        "**Winrate:** {:.1f}% ({}W / {}L)\n"
-        "**Profit Factor:** {:.2f}\n"
-        "**Current Win Streak:** {} 🔥\n"
-        "**Current Loss Streak:** {} 😞\n"
-        "**Best Trade:** {} {} {:.2f} USDT\n"
-        "**Worst Trade:** {} {} {:.2f} USDT\n"
-    ).format(
-        total_trades,
-        total_pnl,
-        winrate, total_wins, total_losses,
-        profit_factor,
-        current_win_streak,
-        current_loss_streak,
-        best_trade['symbol'], best_trade['action'], best_trade['total_pnl'],
-        worst_trade['symbol'], worst_trade['action'], worst_trade['total_pnl']
+        f"📊 **Performance Report** – All Time ({total_trades} closed trades)\n\n"
+        f"**Total P&L:** {total_pnl:.2f} USDT\n"
+        f"**Winrate:** {winrate:.1f}% ({total_wins}W / {total_losses}L)\n"
+        f"**Profit Factor:** {profit_factor:.2f}\n"
+        f"**Current Win Streak:** {current_win_streak} 🔥\n"
+        f"**Current Loss Streak:** {current_loss_streak} 😞\n"
+        f"**Best Trade:** {best['symbol']} {best['action']} {best['total_pnl']:.2f} USDT\n"
+        f"**Worst Trade:** {worst['symbol']} {worst['action']} {worst['total_pnl']:.2f} USDT\n"
     )
     send_discord_message(report)
-
-    with open(PERF_COUNTER_FILE, 'w') as f:
-        f.write(str(current_milestone))
+    with open(PERF_COUNTER_FILE, 'w') as f: f.write(str(current_milestone))
 
 def send_trade_close_chart(trade, hit_level, exit_price, pnl):
     sym = trade["symbol"]
@@ -725,14 +720,10 @@ def send_trade_close_chart(trade, hit_level, exit_price, pnl):
 
 # ========== SMART PRICE FORMATTER ==========
 def fmt_price(price, reference_price=None):
-    if reference_price is None:
-        reference_price = abs(price)
-    if reference_price < 1:
-        return f"{price:.5f}"
-    elif reference_price < 1000:
-        return f"{price:.4f}"
-    else:
-        return f"{price:.2f}"
+    if reference_price is None: reference_price = abs(price)
+    if reference_price < 1: return f"{price:.5f}"
+    elif reference_price < 1000: return f"{price:.4f}"
+    else: return f"{price:.2f}"
 
 # ========== COMPACT SIGNAL FORMATTING (4H) ==========
 def format_signal(sig):
@@ -766,8 +757,7 @@ def format_hold_message(top5, top_layers, skipped_no_trend=0, skipped_data=0, ri
         msg = "HOLD – No valid trade setups found."
         if skipped_no_trend > 0 or skipped_data > 0:
             msg += f"\n({skipped_no_trend} coins lacked clear trend, {skipped_data} failed data)"
-        else:
-            msg += "\n(Market is fully trendless.)"
+        else: msg += "\n(Market is fully trendless.)"
         return msg
     lines = [f"HOLD – No high‑conviction crypto setup found.\n📊 **Top Coin Scores** (of {len(top5)})"]
     for idx, (pair, score, direction, _, _, _, _) in enumerate(top5, 1):
