@@ -6,7 +6,7 @@ Position splitting 30/10/10/10/40, trailing stop, max 5 risky trades.
 Daily loss limit: -100 USDT.
 Performance report every 10 fully closed trades (trade‑level stats).
 BLACKLIST includes LEO, WBT, QUQ, stablecoins.
-LIQUID MOMENTUM UNIVERSE: top 100 market‑cap coins filtered to the 20 most trending (14‑day ROC).
+UNIVERSE: Top‑50 by market cap (no momentum filter).
 """
 
 import requests, json, os, traceback, random, math
@@ -27,13 +27,8 @@ BLACKLIST = {
     "LEO", "WBT"
 }
 
-# ========== DYNAMIC COIN LIST (Liquid Momentum) ==========
-def fetch_top_liquid_momentum_coins(limit=100, momentum_top=20):
-    """
-    Fetch top *limit* coins by market cap, then keep only the *momentum_top*
-    coins with the highest absolute 14‑day price change.
-    Returns a list of Yahoo‑style symbols (e.g. 'BTC‑USD').
-    """
+# ========== DYNAMIC COIN LIST (Classic Top‑50 by Market Cap) ==========
+def fetch_top_liquid_coins(limit=50):
     global COIN_RANK
     url = "https://api.coingecko.com/api/v3/coins/markets"
     params = {
@@ -42,49 +37,33 @@ def fetch_top_liquid_momentum_coins(limit=100, momentum_top=20):
         "per_page": limit,
         "page": 1,
         "sparkline": False,
-        "price_change_percentage": "14d"          # we get 14‑day ROC for free
+        "price_change_percentage": "24h"
     }
     try:
         resp = requests.get(url, params=params, timeout=15)
         data = resp.json()
-        # Build list of (symbol, momentum_abs)
-        candidates = []
-        for coin in data:
-            symbol = coin.get("symbol", "").upper()
-            if not symbol or symbol in BLACKLIST:
-                continue
-            # 14‑day price change percentage (can be None for very new coins)
-            roc_14 = coin.get("price_change_percentage_14d_in_currency")
-            if roc_14 is None:
-                momentum = 0.0
-            else:
-                momentum = abs(roc_14)
-            candidates.append((symbol, momentum))
-        # Sort by momentum descending, take top N
-        candidates.sort(key=lambda x: x[1], reverse=True)
-        top_symbols = [sym for sym, _ in candidates[:momentum_top]]
-
-        # Build Yahoo symbols and update COIN_RANK
         yahoo_symbols = []
         COIN_RANK = {}
         rank = 1
-        for sym in top_symbols:
-            ys = f"{sym}-USD"
-            if ys not in yahoo_symbols:
-                yahoo_symbols.append(ys)
-                COIN_RANK[ys] = rank
-                rank += 1
-        print(f"Liquid Momentum Universe: {len(yahoo_symbols)} coins selected")
-        return yahoo_symbols
+        for coin in data:
+            symbol = coin.get("symbol", "").upper()
+            if symbol and symbol not in BLACKLIST:
+                ys = f"{symbol}-USD"
+                if ys not in yahoo_symbols:
+                    yahoo_symbols.append(ys)
+                    COIN_RANK[ys] = rank
+                    rank += 1
+        print(f"Fetched {len(yahoo_symbols)} coins (blacklist filtered)")
+        return yahoo_symbols[:limit]
     except Exception as e:
-        print(f"CoinGecko API failed: {e}. Using fallback list.")
+        print(f"CoinGecko API failed: {e}. Using fallback.")
         fallback = ["BTC-USD","ETH-USD","BNB-USD","SOL-USD","XRP-USD",
                     "ADA-USD","DOGE-USD","DOT-USD","MATIC-USD","LINK-USD"]
         COIN_RANK = {sym: i+1 for i, sym in enumerate(fallback)}
-        return fallback
+        return fallback[:limit]
 
 COIN_RANK = {}
-CRYPTO_PAIRS = fetch_top_liquid_momentum_coins(limit=100, momentum_top=20)
+CRYPTO_PAIRS = fetch_top_liquid_coins(50)    # 50 coins, no momentum filter
 
 # ========== PORTFOLIO ==========
 PORTFOLIO_FILE = "crypto_portfolio.json"
@@ -284,7 +263,7 @@ def support_resistance_levels(df, lookback=20):
     recent = df.tail(lookback)
     return recent['High'].max(), recent['Low'].min()
 
-# ========== SCORING (4H timeframe, daily trend context) – unchanged ==========
+# ========== SCORING (original 11 layers, max 13.5) ==========
 def score_pair(pair):
     layers = {}
     df_d = get_yahoo_klines(pair, '1d', days=90)
@@ -297,39 +276,28 @@ def score_pair(pair):
     price = df_4h['Close'].iloc[-1]
 
     # Daily trend
-    ema50_d = ema(df_d['Close'], 50)
-    ema200_d = ema(df_d['Close'], 200)
+    ema50_d = ema(df_d['Close'], 50); ema200_d = ema(df_d['Close'], 200)
     trend_daily = 0
-    if price > ema50_d.iloc[-1] and ema50_d.iloc[-1] > ema200_d.iloc[-1]:
-        trend_daily = 1
-    elif price < ema50_d.iloc[-1] and ema50_d.iloc[-1] < ema200_d.iloc[-1]:
-        trend_daily = -1
+    if price > ema50_d.iloc[-1] and ema50_d.iloc[-1] > ema200_d.iloc[-1]: trend_daily = 1
+    elif price < ema50_d.iloc[-1] and ema50_d.iloc[-1] < ema200_d.iloc[-1]: trend_daily = -1
 
     if trend_daily == 0:
-        ema50_4h = ema(df_4h['Close'], 50)
-        ema200_4h = ema(df_4h['Close'], 200)
-        if price > ema50_4h.iloc[-1] and ema50_4h.iloc[-1] > ema200_4h.iloc[-1]:
-            trend_daily = 1
-        elif price < ema50_4h.iloc[-1] and ema50_4h.iloc[-1] < ema200_4h.iloc[-1]:
-            trend_daily = -1
-        else:
-            return 0, None, None, None, None, {"Daily trend": (0,0,"FAIL: no clear trend (daily or 4h)")}
+        ema50_4h = ema(df_4h['Close'], 50); ema200_4h = ema(df_4h['Close'], 200)
+        if price > ema50_4h.iloc[-1] and ema50_4h.iloc[-1] > ema200_4h.iloc[-1]: trend_daily = 1
+        elif price < ema50_4h.iloc[-1] and ema50_4h.iloc[-1] < ema200_4h.iloc[-1]: trend_daily = -1
+        else: return 0, None, None, None, None, {"Daily trend": (0,0,"FAIL: no clear trend")}
 
     direction = "LONG" if trend_daily == 1 else "SHORT"
 
-    # 4H indicators
-    ema50_4h = ema(df_4h['Close'], 50)
-    ema200_4h = ema(df_4h['Close'], 200)
+    ema50_4h = ema(df_4h['Close'], 50); ema200_4h = ema(df_4h['Close'], 200)
     adx_val, di_plus, di_minus = adx(df_4h)
     rsi_val = rsi(df_4h)
     macd_line, macd_signal, macd_hist, macd_hist_prev = macd(df_4h)
     atr_val = atr(df_4h)
     res, sup = support_resistance_levels(df_4h, 20)
 
-    # 1H momentum
     rsi_1h_val = rsi(df_1h, 14)
-    last_candle = df_1h.iloc[-1]
-    prev_candle = df_1h.iloc[-2]
+    last_candle = df_1h.iloc[-1]; prev_candle = df_1h.iloc[-2]
     candle_range = last_candle['High'] - last_candle['Low']
     bullish_momentum = (last_candle['Close'] - last_candle['Open']) / candle_range if candle_range > 0 else 0
 
@@ -337,7 +305,7 @@ def score_pair(pair):
     vol_avg = df_4h['Volume'].iloc[-6:-1].mean() if len(df_4h) >= 6 else vol_last
     vol_surge = vol_last > vol_avg * 1.2 if vol_avg > 0 else False
 
-    # BTC context (4H)
+    # BTC context
     btc_df = get_hybrid_klines("BTC-USD", '4h', days=14)
     market_aligned = False
     if not btc_df.empty and len(btc_df) >= 50:
@@ -345,16 +313,13 @@ def score_pair(pair):
         btc_trend_up = btc_df['Close'].iloc[-1] > btc_ema50.iloc[-1]
         if trend_daily == 1 and btc_trend_up: market_aligned = True
         elif trend_daily == -1 and not btc_trend_up: market_aligned = True
-    else:
-        layers["Market"] = (0, 0.5, "FAIL: BTC data unavailable")
+    else: layers["Market"] = (0, 0.5, "FAIL: BTC data unavailable")
 
     def bool_score(cond): return 1 if cond else 0
 
-    # Layers
-    if direction == "LONG":
-        ema_align = price > ema50_4h.iloc[-1] and ema50_4h.iloc[-1] > ema200_4h.iloc[-1]
-    else:
-        ema_align = price < ema50_4h.iloc[-1] and ema50_4h.iloc[-1] < ema200_4h.iloc[-1]
+    # 11 layers
+    if direction == "LONG": ema_align = price > ema50_4h.iloc[-1] and ema50_4h.iloc[-1] > ema200_4h.iloc[-1]
+    else: ema_align = price < ema50_4h.iloc[-1] and ema50_4h.iloc[-1] < ema200_4h.iloc[-1]
     layers["EMA Align"] = (bool_score(ema_align) * 1.5, 1.5, "OK")
     adx_trending = adx_val > 20
     adx_dir = (di_plus > di_minus) if direction == "LONG" else (di_minus > di_plus)
@@ -405,22 +370,6 @@ def ai_confirm_trade(signal_dict):
 
 # ========== SIGNAL GENERATION (max 5 risky) ==========
 def generate_signal():
-    risky_count = 0
-    try:
-        open_df = pd.read_csv(OPEN_TRADES_CSV)
-        if not open_df.empty:
-            if "symbol" in open_df.columns:
-                open_df["symbol"] = open_df["symbol"].apply(to_yahoo)
-                save_csv(OPEN_TRADES_CSV, open_df)
-            if "breakeven" in open_df.columns: risky = open_df[open_df["breakeven"] == False]
-            else: risky = open_df
-            risky_count = len(risky)
-    except: pass
-
-    if risky_count >= 5:
-        print(f"Max 5 risky trades limit reached ({risky_count}). No new signals.")
-        return None, [], {}, 0, 0, risky_count
-
     open_symbols_risky = set()
     try:
         open_df = pd.read_csv(OPEN_TRADES_CSV)
@@ -430,6 +379,10 @@ def generate_signal():
             else: risky = open_df
             open_symbols_risky = set(risky["symbol"].values)
     except: pass
+
+    if len(open_symbols_risky) >= 5:
+        print(f"Max 5 risky trades limit reached. No new signals.")
+        return None, [], {}, 0, 0, 5
 
     all_scored = []; top_overall = None; skipped_no_trend = 0; skipped_data = 0
     for pair in CRYPTO_PAIRS:
@@ -447,8 +400,7 @@ def generate_signal():
     top5 = sorted(all_scored, key=lambda x: x[1], reverse=True)[:5]
     top_layers = top_overall[6] if top_overall else {}
     candidates = [item for item in all_scored if item[1] >= 6.0]
-    if not candidates:
-        return None, top5, top_layers, skipped_no_trend, skipped_data, risky_count
+    if not candidates: return None, top5, top_layers, skipped_no_trend, skipped_data, len(open_symbols_risky)
 
     candidates.sort(key=lambda x: x[1], reverse=True)
     pair, score, direction, price, atr_val, swing_level, layers = candidates[0]
@@ -474,9 +426,9 @@ def generate_signal():
               "score": score, "atr": atr_val, "layers": layers}
     if not ai_confirm_trade(signal):
         print(f"AI rejected {pair} {direction} (score {score:.1f})")
-        return None, top5, top_layers, skipped_no_trend, skipped_data, risky_count
+        return None, top5, top_layers, skipped_no_trend, skipped_data, len(open_symbols_risky)
     signal["ai_approved"] = True
-    return signal, top5, top_layers, skipped_no_trend, skipped_data, risky_count
+    return signal, top5, top_layers, skipped_no_trend, skipped_data, len(open_symbols_risky)
 
 # ========== DISCORD HELPERS ==========
 def send_discord_message(text):
@@ -725,7 +677,7 @@ def fmt_price(price, reference_price=None):
     elif reference_price < 1000: return f"{price:.4f}"
     else: return f"{price:.2f}"
 
-# ========== COMPACT SIGNAL FORMATTING (4H) ==========
+# ========== COMPACT SIGNAL FORMATTING ==========
 def format_signal(sig):
     sym = sig["symbol"].replace("-USD","")
     direction = sig["action"]
@@ -775,7 +727,7 @@ def format_hold_message(top5, top_layers, skipped_no_trend=0, skipped_data=0, ri
     lines.append("\n💬 Are you stalking any setups? Drop your watchlist below! 👇")
     return "\n".join(lines)
 
-# ========== CHART ON SIGNAL (4H) ==========
+# ========== CHART ON SIGNAL ==========
 def send_trade_chart(signal):
     sym = signal['symbol']
     try:
