@@ -6,7 +6,7 @@ Position splitting 30/10/10/10/40, trailing stop, max 5 risky trades.
 Daily loss limit: -100 USDT.
 Performance report every 10 fully closed trades (trade‑level stats).
 BLACKLIST includes LEO, WBT, QUQ, stablecoins.
-UNIVERSE: Top‑50 by market cap (no momentum filter).
+DUAL SIDEWAYS FILTER: EMA stack (9>20>50>200 or 9<20<50<200) + ADX > 25
 """
 
 import requests, json, os, traceback, random, math
@@ -63,7 +63,7 @@ def fetch_top_liquid_coins(limit=50):
         return fallback[:limit]
 
 COIN_RANK = {}
-CRYPTO_PAIRS = fetch_top_liquid_coins(50)    # 50 coins, no momentum filter
+CRYPTO_PAIRS = fetch_top_liquid_coins(50)
 
 # ========== PORTFOLIO ==========
 PORTFOLIO_FILE = "crypto_portfolio.json"
@@ -263,7 +263,7 @@ def support_resistance_levels(df, lookback=20):
     recent = df.tail(lookback)
     return recent['High'].max(), recent['Low'].min()
 
-# ========== SCORING (original 11 layers, max 13.5) ==========
+# ========== SCORING (EMA Stack + ADX > 25) ==========
 def score_pair(pair):
     layers = {}
     df_d = get_yahoo_klines(pair, '1d', days=90)
@@ -275,22 +275,47 @@ def score_pair(pair):
 
     price = df_4h['Close'].iloc[-1]
 
-    # Daily trend
+    # ---- FILTER 1: EMA Stack Alignment ----
+    ema9 = ema(df_4h['Close'], 9).iloc[-1]
+    ema20 = ema(df_4h['Close'], 20).iloc[-1]
+    ema50 = ema(df_4h['Close'], 50).iloc[-1]
+    ema200 = ema(df_4h['Close'], 200).iloc[-1]
+
+    bullish_stack = (ema9 > ema20) and (ema20 > ema50) and (ema50 > ema200)
+    bearish_stack = (ema9 < ema20) and (ema20 < ema50) and (ema50 < ema200)
+
+    if not bullish_stack and not bearish_stack:
+        return 0, None, None, None, None, {"EMA Stack": (0,0,"FAIL: EMAs not aligned")}
+
+    # ---- FILTER 2: ADX > 25 ----
+    adx_val, di_plus, di_minus = adx(df_4h)
+    if adx_val is None or adx_val <= 25:
+        return 0, None, None, None, None, {"ADX Filter": (0,0,f"FAIL: ADX too low ({adx_val:.1f})")}
+
+    # Daily trend direction (use EMA stack to set if needed)
     ema50_d = ema(df_d['Close'], 50); ema200_d = ema(df_d['Close'], 200)
     trend_daily = 0
     if price > ema50_d.iloc[-1] and ema50_d.iloc[-1] > ema200_d.iloc[-1]: trend_daily = 1
     elif price < ema50_d.iloc[-1] and ema50_d.iloc[-1] < ema200_d.iloc[-1]: trend_daily = -1
 
     if trend_daily == 0:
-        ema50_4h = ema(df_4h['Close'], 50); ema200_4h = ema(df_4h['Close'], 200)
-        if price > ema50_4h.iloc[-1] and ema50_4h.iloc[-1] > ema200_4h.iloc[-1]: trend_daily = 1
-        elif price < ema50_4h.iloc[-1] and ema50_4h.iloc[-1] < ema200_4h.iloc[-1]: trend_daily = -1
+        if bullish_stack: trend_daily = 1
+        elif bearish_stack: trend_daily = -1
         else: return 0, None, None, None, None, {"Daily trend": (0,0,"FAIL: no clear trend")}
 
     direction = "LONG" if trend_daily == 1 else "SHORT"
 
-    ema50_4h = ema(df_4h['Close'], 50); ema200_4h = ema(df_4h['Close'], 200)
-    adx_val, di_plus, di_minus = adx(df_4h)
+    # ---- BTC alignment ----
+    btc_df = get_hybrid_klines("BTC-USD", '4h', days=14)
+    market_aligned = False
+    if not btc_df.empty and len(btc_df) >= 50:
+        btc_ema50 = ema(btc_df['Close'], 50)
+        btc_trend_up = btc_df['Close'].iloc[-1] > btc_ema50.iloc[-1]
+        if trend_daily == 1 and btc_trend_up: market_aligned = True
+        elif trend_daily == -1 and not btc_trend_up: market_aligned = True
+    else: layers["Market"] = (0, 0.5, "FAIL: BTC data unavailable")
+
+    # ---- Remaining indicators ----
     rsi_val = rsi(df_4h)
     macd_line, macd_signal, macd_hist, macd_hist_prev = macd(df_4h)
     atr_val = atr(df_4h)
@@ -305,21 +330,11 @@ def score_pair(pair):
     vol_avg = df_4h['Volume'].iloc[-6:-1].mean() if len(df_4h) >= 6 else vol_last
     vol_surge = vol_last > vol_avg * 1.2 if vol_avg > 0 else False
 
-    # BTC context
-    btc_df = get_hybrid_klines("BTC-USD", '4h', days=14)
-    market_aligned = False
-    if not btc_df.empty and len(btc_df) >= 50:
-        btc_ema50 = ema(btc_df['Close'], 50)
-        btc_trend_up = btc_df['Close'].iloc[-1] > btc_ema50.iloc[-1]
-        if trend_daily == 1 and btc_trend_up: market_aligned = True
-        elif trend_daily == -1 and not btc_trend_up: market_aligned = True
-    else: layers["Market"] = (0, 0.5, "FAIL: BTC data unavailable")
-
     def bool_score(cond): return 1 if cond else 0
 
-    # 11 layers
-    if direction == "LONG": ema_align = price > ema50_4h.iloc[-1] and ema50_4h.iloc[-1] > ema200_4h.iloc[-1]
-    else: ema_align = price < ema50_4h.iloc[-1] and ema50_4h.iloc[-1] < ema200_4h.iloc[-1]
+    # 11 layers (identical weights)
+    if direction == "LONG": ema_align = price > ema50 and ema50 > ema200
+    else: ema_align = price < ema50 and ema50 < ema200
     layers["EMA Align"] = (bool_score(ema_align) * 1.5, 1.5, "OK")
     adx_trending = adx_val > 20
     adx_dir = (di_plus > di_minus) if direction == "LONG" else (di_minus > di_plus)
@@ -370,6 +385,22 @@ def ai_confirm_trade(signal_dict):
 
 # ========== SIGNAL GENERATION (max 5 risky) ==========
 def generate_signal():
+    risky_count = 0
+    try:
+        open_df = pd.read_csv(OPEN_TRADES_CSV)
+        if not open_df.empty:
+            if "symbol" in open_df.columns:
+                open_df["symbol"] = open_df["symbol"].apply(to_yahoo)
+                save_csv(OPEN_TRADES_CSV, open_df)
+            if "breakeven" in open_df.columns: risky = open_df[open_df["breakeven"] == False]
+            else: risky = open_df
+            risky_count = len(risky)
+    except: pass
+
+    if risky_count >= 5:
+        print(f"Max 5 risky trades limit reached ({risky_count}). No new signals.")
+        return None, [], {}, 0, 0, risky_count
+
     open_symbols_risky = set()
     try:
         open_df = pd.read_csv(OPEN_TRADES_CSV)
@@ -379,10 +410,6 @@ def generate_signal():
             else: risky = open_df
             open_symbols_risky = set(risky["symbol"].values)
     except: pass
-
-    if len(open_symbols_risky) >= 5:
-        print(f"Max 5 risky trades limit reached. No new signals.")
-        return None, [], {}, 0, 0, 5
 
     all_scored = []; top_overall = None; skipped_no_trend = 0; skipped_data = 0
     for pair in CRYPTO_PAIRS:
@@ -400,7 +427,8 @@ def generate_signal():
     top5 = sorted(all_scored, key=lambda x: x[1], reverse=True)[:5]
     top_layers = top_overall[6] if top_overall else {}
     candidates = [item for item in all_scored if item[1] >= 6.0]
-    if not candidates: return None, top5, top_layers, skipped_no_trend, skipped_data, len(open_symbols_risky)
+    if not candidates:
+        return None, top5, top_layers, skipped_no_trend, skipped_data, risky_count
 
     candidates.sort(key=lambda x: x[1], reverse=True)
     pair, score, direction, price, atr_val, swing_level, layers = candidates[0]
@@ -426,9 +454,9 @@ def generate_signal():
               "score": score, "atr": atr_val, "layers": layers}
     if not ai_confirm_trade(signal):
         print(f"AI rejected {pair} {direction} (score {score:.1f})")
-        return None, top5, top_layers, skipped_no_trend, skipped_data, len(open_symbols_risky)
+        return None, top5, top_layers, skipped_no_trend, skipped_data, risky_count
     signal["ai_approved"] = True
-    return signal, top5, top_layers, skipped_no_trend, skipped_data, len(open_symbols_risky)
+    return signal, top5, top_layers, skipped_no_trend, skipped_data, risky_count
 
 # ========== DISCORD HELPERS ==========
 def send_discord_message(text):
