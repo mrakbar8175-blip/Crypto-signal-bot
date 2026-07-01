@@ -6,7 +6,11 @@ Position splitting 30/10/10/10/40, trailing stop, max 5 risky trades.
 Daily loss limit: -100 USDT.
 Performance report every 10 fully closed trades (trade‑level stats).
 BLACKLIST includes LEO, WBT, QUQ, stablecoins.
-DUAL SIDEWAYS FILTER: EMA stack (9>20>50>200 or 9<20<50<200) + ADX > 25
+TRIPLE SIDEWAYS FILTER + CANDLE DIRECTION:
+  - EMA stack (9>20>50>200 or 9<20<50<200)
+  - ADX > 25
+  - Volume > 20‑avg
+  - Last candle direction matches trade direction
 """
 
 import requests, json, os, traceback, random, math
@@ -263,7 +267,7 @@ def support_resistance_levels(df, lookback=20):
     recent = df.tail(lookback)
     return recent['High'].max(), recent['Low'].min()
 
-# ========== SCORING (EMA Stack + ADX > 25) ==========
+# ========== SCORING (EMA Stack + ADX >25 + Volume + Candle Direction) ==========
 def score_pair(pair):
     layers = {}
     df_d = get_yahoo_klines(pair, '1d', days=90)
@@ -292,7 +296,13 @@ def score_pair(pair):
     if adx_val is None or adx_val <= 25:
         return 0, None, None, None, None, {"ADX Filter": (0,0,f"FAIL: ADX too low ({adx_val:.1f})")}
 
-    # Daily trend direction (use EMA stack to set if needed)
+    # ---- FILTER 3: Volume > 20-period average ----
+    vol_last = df_4h['Volume'].iloc[-1]
+    vol_avg = df_4h['Volume'].iloc[-21:-1].mean() if len(df_4h) >= 21 else vol_last
+    if vol_avg > 0 and vol_last < vol_avg:
+        return 0, None, None, None, None, {"Volume Filter": (0,0,"FAIL: volume below average")}
+
+    # Determine trend direction
     ema50_d = ema(df_d['Close'], 50); ema200_d = ema(df_d['Close'], 200)
     trend_daily = 0
     if price > ema50_d.iloc[-1] and ema50_d.iloc[-1] > ema200_d.iloc[-1]: trend_daily = 1
@@ -305,7 +315,20 @@ def score_pair(pair):
 
     direction = "LONG" if trend_daily == 1 else "SHORT"
 
-    # ---- BTC alignment ----
+    # ---- FILTER 4: Candle direction matches trade direction ----
+    last_candle = df_4h.iloc[-1]
+    if direction == "LONG" and last_candle['Close'] <= last_candle['Open']:
+        return 0, None, None, None, None, {"Candle Direction": (0,0,"FAIL: bearish candle for long setup")}
+    if direction == "SHORT" and last_candle['Close'] >= last_candle['Open']:
+        return 0, None, None, None, None, {"Candle Direction": (0,0,"FAIL: bullish candle for short setup")}
+
+    # ---- Remaining indicators for scoring ----
+    rsi_val = rsi(df_4h)
+    macd_line, macd_signal, macd_hist, macd_hist_prev = macd(df_4h)
+    atr_val = atr(df_4h)
+    res, sup = support_resistance_levels(df_4h, 20)
+
+    # BTC context
     btc_df = get_hybrid_klines("BTC-USD", '4h', days=14)
     market_aligned = False
     if not btc_df.empty and len(btc_df) >= 50:
@@ -315,20 +338,11 @@ def score_pair(pair):
         elif trend_daily == -1 and not btc_trend_up: market_aligned = True
     else: layers["Market"] = (0, 0.5, "FAIL: BTC data unavailable")
 
-    # ---- Remaining indicators ----
-    rsi_val = rsi(df_4h)
-    macd_line, macd_signal, macd_hist, macd_hist_prev = macd(df_4h)
-    atr_val = atr(df_4h)
-    res, sup = support_resistance_levels(df_4h, 20)
-
-    rsi_1h_val = rsi(df_1h, 14)
-    last_candle = df_1h.iloc[-1]; prev_candle = df_1h.iloc[-2]
-    candle_range = last_candle['High'] - last_candle['Low']
-    bullish_momentum = (last_candle['Close'] - last_candle['Open']) / candle_range if candle_range > 0 else 0
-
-    vol_last = df_4h['Volume'].iloc[-1]
-    vol_avg = df_4h['Volume'].iloc[-6:-1].mean() if len(df_4h) >= 6 else vol_last
-    vol_surge = vol_last > vol_avg * 1.2 if vol_avg > 0 else False
+    # 1H momentum (still used in scoring)
+    df_1h_last = df_1h.iloc[-1]
+    df_1h_prev = df_1h.iloc[-2]
+    candle_range_1h = df_1h_last['High'] - df_1h_last['Low']
+    bullish_momentum = (df_1h_last['Close'] - df_1h_last['Open']) / candle_range_1h if candle_range_1h > 0 else 0
 
     def bool_score(cond): return 1 if cond else 0
 
@@ -348,18 +362,19 @@ def score_pair(pair):
         else: sr_score = bool_score((res-price) < atr_val*0.5)
         layers["S/R"] = (sr_score*1.0, 1.0, "OK")
     else: layers["S/R"] = (0, 1.0, "FAIL: ATR missing")
-    layers["Volume"] = (bool_score(vol_surge)*0.5, 0.5, "OK")
+    layers["Volume"] = (bool_score(True) * 0.5, 0.5, "OK")  # already filtered
     if "Market" not in layers: layers["Market"] = (bool_score(market_aligned)*0.5, 0.5, "OK")
     candle_ok = (bullish_momentum > 0.5) if direction=="LONG" else (bullish_momentum < -0.5)
     layers["Candle Mom"] = (bool_score(candle_ok)*2.0, 2.0, "OK")
+    rsi_1h_val = rsi(df_1h, 14)
     if rsi_1h_val is not None:
         rsi_1h_ok = (rsi_1h_val < 63) if direction=="LONG" else (rsi_1h_val > 37)
         layers["RSI 1h"] = (bool_score(rsi_1h_ok)*1.5, 1.5, "OK")
     else: layers["RSI 1h"] = (0, 1.5, "FAIL: RSI 1h NaN")
     if atr_val and price>0: layers["ATR"] = (bool_score(atr_val > price*0.005)*1.0, 1.0, "OK")
     else: layers["ATR"] = (0, 1.0, "FAIL: ATR missing")
-    if direction=="LONG": micro_ok = last_candle['Close'] > last_candle['Open'] and prev_candle['Close'] > prev_candle['Open']
-    else: micro_ok = last_candle['Close'] < last_candle['Open'] and prev_candle['Close'] < prev_candle['Open']
+    if direction=="LONG": micro_ok = df_1h_last['Close'] > df_1h_last['Open'] and df_1h_prev['Close'] > df_1h_prev['Open']
+    else: micro_ok = df_1h_last['Close'] < df_1h_last['Open'] and df_1h_prev['Close'] < df_1h_prev['Open']
     layers["Micro Trend"] = (bool_score(micro_ok)*2.0, 2.0, "OK")
     total = sum(score for score,_,_ in layers.values() if isinstance(score,(int,float)))
     return total, direction, price, atr_val, (sup if direction=="LONG" else res), layers
