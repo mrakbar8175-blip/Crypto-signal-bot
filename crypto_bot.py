@@ -11,6 +11,7 @@ TRIPLE SIDEWAYS FILTER + CANDLE DIRECTION:
   - ADX > 25
   - Volume > 20‑avg
   - Last candle direction matches trade direction
+UNIVERSE: Top‑100 by market cap (no momentum filter).
 """
 
 import requests, json, os, traceback, random, math
@@ -31,8 +32,8 @@ BLACKLIST = {
     "LEO", "WBT"
 }
 
-# ========== DYNAMIC COIN LIST (Classic Top‑50 by Market Cap) ==========
-def fetch_top_liquid_coins(limit=50):
+# ========== DYNAMIC COIN LIST (Classic Top‑100 by Market Cap) ==========
+def fetch_top_liquid_coins(limit=100):          # <-- increased from 50 to 100
     global COIN_RANK
     url = "https://api.coingecko.com/api/v3/coins/markets"
     params = {
@@ -67,7 +68,7 @@ def fetch_top_liquid_coins(limit=50):
         return fallback[:limit]
 
 COIN_RANK = {}
-CRYPTO_PAIRS = fetch_top_liquid_coins(50)
+CRYPTO_PAIRS = fetch_top_liquid_coins(100)      # 100 coins
 
 # ========== PORTFOLIO ==========
 PORTFOLIO_FILE = "crypto_portfolio.json"
