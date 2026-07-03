@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """
-Triple‑Filter Backtester – 4H, KuCoin, 1:1 RR, ONE BEST TRADE AT A TIME
+Triple‑Filter Backtester – 4H, KuCoin, 1:10 RR, 9‑EMA TRAILING STOP
 Uses: EMA stack, ADX > 25, volume > avg, candle direction.
-Only the highest-scored coin enters. No new trade until current closes.
+Exit: 10R TP or candle closes beyond 9‑EMA against trade.
+One trade at a time, highest‑scored coin.
 Usage: python backtest_triple_filter.py
 """
 
@@ -17,11 +18,10 @@ from datetime import datetime, timedelta
 # ============================================================
 BACKTEST_START = "2025-01-01"
 INITIAL_BALANCE = 1000.0
-RISK_PER_TRADE = 0.01          # 1% risk per trade
-MAX_RISKY_TRADES = 1           # <-- only one trade at a time
+RISK_PER_TRADE = 0.01          # 1% of balance risked per trade
+MAX_RISKY_TRADES = 1           # one trade at a time
 DATA_FOLDER = "kucoin_data_backtest"
 
-# Top‑50 coins (expand as you like)
 CRYPTO_PAIRS = [
     "BTC-USDT","ETH-USDT","BNB-USDT","SOL-USDT","XRP-USDT",
     "ADA-USDT","DOGE-USDT","DOT-USDT","MATIC-USDT","LINK-USDT",
@@ -229,7 +229,7 @@ def get_data_for_pair(ccxt_symbol, interval):
     return df
 
 # ============================================================
-# BACKTEST ENGINE (1:1 RR, one trade at a time)
+# BACKTEST ENGINE (1:10 RR, 9‑EMA trailing stop, one trade at a time)
 # ============================================================
 def run_backtest():
     print("Loading data...")
@@ -256,15 +256,15 @@ def run_backtest():
     timeline = btc_4h.index[(btc_4h.index >= start) & (btc_4h.index <= end)]
 
     balance = INITIAL_BALANCE
-    open_trades = []   # will hold at most one trade
+    open_trades = []
     trade_log = []
     equity = []
 
-    print(f"Running 1:1 RR backtest (ONE TRADE AT A TIME) from {BACKTEST_START} to {end.date()}...")
+    print(f"Running 1:10 RR + 9‑EMA trailing stop from {BACKTEST_START} to {end.date()}...")
     print(f"Timeline: {len(timeline)} 4H candles")
 
     for current_time in timeline:
-        # 1. Check open trades
+        # 1. Check open trades (trailing 9‑EMA + TP)
         closed_indices = []
         for idx, trade in enumerate(open_trades):
             sym = trade['symbol']
@@ -274,37 +274,54 @@ def run_backtest():
             if current_time not in df_4h_sym.index:
                 continue
             bar = df_4h_sym.loc[current_time]
-            high, low = bar['High'], bar['Low']
-            entry, stop, tp = trade['entry'], trade['stop'], trade['tp']
+            # Get the 9‑EMA at this bar (using data up to and including this bar)
+            # We'll compute rolling EMA on the fly (slightly inefficient but okay for backtest)
+            closes = df_4h_sym['Close'].loc[:current_time]
+            ema9_series = ema(closes, 9)
+            ema9_val = ema9_series.iloc[-1]
+
+            high, low, close = bar['High'], bar['Low'], bar['Close']
+            entry, tp = trade['entry'], trade['tp']
             direction = trade['direction']
             qty = trade['quantity']
 
+            # Check TP first
             hit_tp = False
-            hit_sl = False
-            exit_price = None
-
             if direction == "LONG":
                 if high >= tp:
                     hit_tp = True
                     exit_price = tp
-                elif low <= stop:
-                    hit_sl = True
-                    exit_price = stop
             else:
                 if low <= tp:
                     hit_tp = True
                     exit_price = tp
-                elif high >= stop:
-                    hit_sl = True
-                    exit_price = stop
 
-            if hit_tp or hit_sl:
+            if hit_tp:
                 pnl = (exit_price - entry) * qty if direction == "LONG" else (entry - exit_price) * qty
                 trade_log.append({
                     'timestamp': current_time, 'symbol': sym, 'action': direction,
-                    'hit_level': "TP" if hit_tp else "SL",
-                    'exit_price': exit_price, 'quantity': qty,
-                    'pnl': round(pnl, 4)
+                    'hit_level': "TP", 'exit_price': exit_price,
+                    'quantity': qty, 'pnl': round(pnl, 4)
+                })
+                balance += pnl
+                closed_indices.append(idx)
+                continue
+
+            # 9‑EMA trailing stop: exit if close crosses against trade
+            exit_ema = False
+            if direction == "LONG" and close < ema9_val:
+                exit_ema = True
+                exit_price = close
+            elif direction == "SHORT" and close > ema9_val:
+                exit_ema = True
+                exit_price = close
+
+            if exit_ema:
+                pnl = (exit_price - entry) * qty if direction == "LONG" else (entry - exit_price) * qty
+                trade_log.append({
+                    'timestamp': current_time, 'symbol': sym, 'action': direction,
+                    'hit_level': "EMA EXIT", 'exit_price': exit_price,
+                    'quantity': qty, 'pnl': round(pnl, 4)
                 })
                 balance += pnl
                 closed_indices.append(idx)
@@ -312,7 +329,7 @@ def run_backtest():
         for idx in sorted(closed_indices, reverse=True):
             open_trades.pop(idx)
 
-        # 2. Generate new signal ONLY if no open trade
+        # 2. Generate new signal if no open trade
         if len(open_trades) == 0:
             candidates = []
             for sym, sym_data in data.items():
@@ -327,31 +344,34 @@ def run_backtest():
                 if direction is None or score < 6.0:
                     continue
 
-                # Compute stop (same as live)
-                min_stop_pct = 0.02; max_stop_pct = 0.06
-                raw_stop = (atr_val * 2.5) if (atr_val is not None and not math.isnan(atr_val)) else price * 0.02
-                stop_distance = np.clip(raw_stop, price*min_stop_pct, price*max_stop_pct)
+                # Use 9‑EMA at entry as initial stop to define risk
+                closes = df_4h['Close'].loc[:current_time]
+                ema9_series = ema(closes, 9)
+                ema9_entry = ema9_series.iloc[-1]
+
                 if direction == "LONG":
-                    stop = price - stop_distance
-                    if swing_level and swing_level > price - stop_distance*1.2:
-                        stop = min(stop, swing_level - 0.05*(atr_val if atr_val else price*0.01))
+                    stop = ema9_entry   # stop at 9‑EMA (trailing will follow later)
+                    # Add a small buffer to avoid immediate exit? Not needed, we exit only if close crosses.
+                    risk = price - stop if price > stop else 0.01 * price   # minimum risk
                 else:
-                    stop = price + stop_distance
-                    if swing_level and swing_level < price + stop_distance*1.2:
-                        stop = max(stop, swing_level + 0.05*(atr_val if atr_val else price*0.01))
-                risk = abs(price - stop)
+                    stop = ema9_entry
+                    risk = stop - price if stop > price else 0.01 * price
+
                 if risk <= 0:
                     continue
-                # 1:1 target
-                if direction == "LONG":
-                    tp = price + risk
-                else:
-                    tp = price - risk
+
+                # Position size based on risk
                 qty = round((balance * RISK_PER_TRADE) / risk, 8)
+
+                # 10R target
+                if direction == "LONG":
+                    tp = price + 10 * risk
+                else:
+                    tp = price - 10 * risk
+
                 candidates.append({
                     'symbol': sym, 'direction': direction, 'entry': price,
-                    'stop': stop, 'tp': tp, 'quantity': qty,
-                    'score': score
+                    'stop': stop, 'tp': tp, 'quantity': qty, 'score': score
                 })
             if candidates:
                 best = max(candidates, key=lambda x: x['score'])
@@ -359,7 +379,7 @@ def run_backtest():
 
         equity.append((current_time, balance))
 
-    # Close any remaining trades at last price
+    # Close remaining trades at last price
     for trade in open_trades:
         sym = trade['symbol']
         if sym in data:
@@ -395,7 +415,6 @@ def run_backtest():
     profit_factor = wins['total_pnl'].sum() / abs(losses['total_pnl'].sum()) if len(losses) > 0 else float('inf')
     final_balance = INITIAL_BALANCE + total_pnl
 
-    # Drawdown
     eq_df = pd.DataFrame(equity, columns=['time', 'balance'])
     eq_df['peak'] = eq_df['balance'].cummax()
     eq_df['dd'] = (eq_df['peak'] - eq_df['balance']) / eq_df['peak']
@@ -403,7 +422,7 @@ def run_backtest():
 
     summary = (
         f"\n{'='*50}\n"
-        f"BACKTEST RESULTS (Triple Filter, 1:1 RR, ONE TRADE AT A TIME)\n"
+        f"BACKTEST RESULTS (Triple Filter, 1:10 RR, 9‑EMA Trailing Stop)\n"
         f"{'='*50}\n"
         f"Period: {BACKTEST_START} → {datetime.now().strftime('%Y-%m-%d')}\n"
         f"Initial Balance: ${INITIAL_BALANCE:.2f}\n"
