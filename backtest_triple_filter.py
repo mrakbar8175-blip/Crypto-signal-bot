@@ -19,7 +19,7 @@ from datetime import datetime, timedelta
 # ============================================================
 BACKTEST_START = "2025-01-01"
 INITIAL_BALANCE = 20.0          # $20 starting capital
-RISK_PER_TRADE = 0.10           # 10% risk per trade
+RISK_PER_TRADE = 0.025         # 2.5% risk
 MAX_RISKY_TRADES = 1            # one trade at a time
 DATA_FOLDER = "kucoin_data_backtest"
 
