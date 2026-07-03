@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """
-Triple‑Filter Backtester – 4H, KuCoin, 1:10 RR, 9‑EMA TRAILING STOP
-Uses: EMA stack, ADX > 25, volume > avg, candle direction.
-Exit: 10R TP or candle closes beyond 9‑EMA against trade.
+Triple‑Filter Backtester – 4H, KuCoin, 1:10 RR, FIXED CANDLE STOP + 9‑EMA CLOSE EXIT
+Entry: triple filter + 11‑layer scoring.
+Exit: 10R TP (risk = distance to previous candle's low/high), or that fixed stop hit,
+      or candle closes beyond 9‑EMA against trade.
 One trade at a time, highest‑scored coin.
 Usage: python backtest_triple_filter.py
 """
@@ -17,9 +18,9 @@ from datetime import datetime, timedelta
 # CONFIGURATION
 # ============================================================
 BACKTEST_START = "2025-01-01"
-INITIAL_BALANCE = 1000.0
-RISK_PER_TRADE = 0.01          # 1% of balance risked per trade
-MAX_RISKY_TRADES = 1           # one trade at a time
+INITIAL_BALANCE = 1000.0          # $1000 account
+RISK_PER_TRADE = 0.01             # 1% risk per trade
+MAX_RISKY_TRADES = 1              # one trade at a time
 DATA_FOLDER = "kucoin_data_backtest"
 
 CRYPTO_PAIRS = [
@@ -82,7 +83,7 @@ def support_resistance_levels(df, lookback=20):
     return recent['High'].max(), recent['Low'].min()
 
 # ============================================================
-# SCORING (Triple Filter + 11 layers)
+# SCORING (Triple Filter + 11 layers) – exactly as live bot
 # ============================================================
 def score_pair(df_4h, df_1h, df_d, btc_df_4h=None):
     layers = {}
@@ -139,7 +140,7 @@ def score_pair(df_4h, df_1h, df_d, btc_df_4h=None):
     atr_val = atr(df_4h)
     res, sup = support_resistance_levels(df_4h, 20)
 
-    # BTC context (optional)
+    # BTC context
     market_aligned = False
     if btc_df_4h is not None and len(btc_df_4h) >= 50:
         btc_ema50 = ema(btc_df_4h['Close'], 50)
@@ -156,7 +157,7 @@ def score_pair(df_4h, df_1h, df_d, btc_df_4h=None):
 
     def bool_score(cond): return 1 if cond else 0
 
-    # 11 layers
+    # 11 layers (identical weights)
     if direction == "LONG": ema_align = price > ema50 and ema50 > ema200
     else: ema_align = price < ema50 and ema50 < ema200
     layers["EMA Align"] = (bool_score(ema_align) * 1.5, 1.5, "OK")
@@ -229,7 +230,7 @@ def get_data_for_pair(ccxt_symbol, interval):
     return df
 
 # ============================================================
-# BACKTEST ENGINE (1:10 RR, 9‑EMA trailing stop, one trade at a time)
+# BACKTEST ENGINE (Candle Stop + 9‑EMA close exit, 1:10 TP)
 # ============================================================
 def run_backtest():
     print("Loading data...")
@@ -260,11 +261,11 @@ def run_backtest():
     trade_log = []
     equity = []
 
-    print(f"Running 1:10 RR + 9‑EMA trailing stop from {BACKTEST_START} to {end.date()}...")
+    print(f"Running Candle Stop + 9‑EMA Close Exit, 1:10 RR from {BACKTEST_START} to {end.date()}...")
     print(f"Timeline: {len(timeline)} 4H candles")
 
     for current_time in timeline:
-        # 1. Check open trades (trailing 9‑EMA + TP)
+        # 1. Check open trades
         closed_indices = []
         for idx, trade in enumerate(open_trades):
             sym = trade['symbol']
@@ -274,53 +275,49 @@ def run_backtest():
             if current_time not in df_4h_sym.index:
                 continue
             bar = df_4h_sym.loc[current_time]
-            # Get the 9‑EMA at this bar (using data up to and including this bar)
-            # We'll compute rolling EMA on the fly (slightly inefficient but okay for backtest)
+
+            # Compute 9‑EMA for close condition
             closes = df_4h_sym['Close'].loc[:current_time]
             ema9_series = ema(closes, 9)
             ema9_val = ema9_series.iloc[-1]
 
             high, low, close = bar['High'], bar['Low'], bar['Close']
-            entry, tp = trade['entry'], trade['tp']
+            entry, tp, candle_stop = trade['entry'], trade['tp'], trade['candle_stop']
             direction = trade['direction']
             qty = trade['quantity']
 
-            # Check TP first
-            hit_tp = False
+            exit_reason = None
+            exit_price = None
+
+            # 1) TP hit (intra‑bar)
             if direction == "LONG":
                 if high >= tp:
-                    hit_tp = True
-                    exit_price = tp
+                    exit_reason = "TP"; exit_price = tp
             else:
                 if low <= tp:
-                    hit_tp = True
-                    exit_price = tp
+                    exit_reason = "TP"; exit_price = tp
 
-            if hit_tp:
+            # 2) Fixed candle stop hit (intra‑bar)
+            if exit_reason is None:
+                if direction == "LONG":
+                    if low <= candle_stop:
+                        exit_reason = "CANDLE SL"; exit_price = candle_stop
+                else:
+                    if high >= candle_stop:
+                        exit_reason = "CANDLE SL"; exit_price = candle_stop
+
+            # 3) 9‑EMA close condition (after bar)
+            if exit_reason is None:
+                if direction == "LONG" and close < ema9_val:
+                    exit_reason = "EMA EXIT"; exit_price = close
+                elif direction == "SHORT" and close > ema9_val:
+                    exit_reason = "EMA EXIT"; exit_price = close
+
+            if exit_reason is not None:
                 pnl = (exit_price - entry) * qty if direction == "LONG" else (entry - exit_price) * qty
                 trade_log.append({
                     'timestamp': current_time, 'symbol': sym, 'action': direction,
-                    'hit_level': "TP", 'exit_price': exit_price,
-                    'quantity': qty, 'pnl': round(pnl, 4)
-                })
-                balance += pnl
-                closed_indices.append(idx)
-                continue
-
-            # 9‑EMA trailing stop: exit if close crosses against trade
-            exit_ema = False
-            if direction == "LONG" and close < ema9_val:
-                exit_ema = True
-                exit_price = close
-            elif direction == "SHORT" and close > ema9_val:
-                exit_ema = True
-                exit_price = close
-
-            if exit_ema:
-                pnl = (exit_price - entry) * qty if direction == "LONG" else (entry - exit_price) * qty
-                trade_log.append({
-                    'timestamp': current_time, 'symbol': sym, 'action': direction,
-                    'hit_level': "EMA EXIT", 'exit_price': exit_price,
+                    'hit_level': exit_reason, 'exit_price': exit_price,
                     'quantity': qty, 'pnl': round(pnl, 4)
                 })
                 balance += pnl
@@ -344,34 +341,36 @@ def run_backtest():
                 if direction is None or score < 6.0:
                     continue
 
-                # Use 9‑EMA at entry as initial stop to define risk
-                closes = df_4h['Close'].loc[:current_time]
-                ema9_series = ema(closes, 9)
-                ema9_entry = ema9_series.iloc[-1]
-
+                # Fixed stop = previous candle's low (long) or high (short)
+                prev_candle = df_4h.iloc[-2]   # previous candle (the one before entry)
                 if direction == "LONG":
-                    stop = ema9_entry   # stop at 9‑EMA (trailing will follow later)
-                    # Add a small buffer to avoid immediate exit? Not needed, we exit only if close crosses.
-                    risk = price - stop if price > stop else 0.01 * price   # minimum risk
+                    candle_stop = prev_candle['Low']
+                    # Ensure stop is below entry; if not, skip trade
+                    if candle_stop >= price:
+                        continue
                 else:
-                    stop = ema9_entry
-                    risk = stop - price if stop > price else 0.01 * price
+                    candle_stop = prev_candle['High']
+                    if candle_stop <= price:
+                        continue
 
-                if risk <= 0:
+                # Minimum stop distance (0.2% of price) to avoid absurdly tiny risk
+                min_risk = 0.002 * price
+                if abs(price - candle_stop) < min_risk:
                     continue
 
-                # Position size based on risk
-                qty = round((balance * RISK_PER_TRADE) / risk, 8)
+                risk = abs(price - candle_stop)
 
-                # 10R target
+                # 10R target based on this risk
                 if direction == "LONG":
                     tp = price + 10 * risk
                 else:
                     tp = price - 10 * risk
 
+                qty = round((balance * RISK_PER_TRADE) / risk, 8)
+
                 candidates.append({
                     'symbol': sym, 'direction': direction, 'entry': price,
-                    'stop': stop, 'tp': tp, 'quantity': qty, 'score': score
+                    'candle_stop': candle_stop, 'tp': tp, 'quantity': qty, 'score': score
                 })
             if candidates:
                 best = max(candidates, key=lambda x: x['score'])
@@ -384,9 +383,7 @@ def run_backtest():
         sym = trade['symbol']
         if sym in data:
             last_price = data[sym]['4h']['Close'].iloc[-1]
-            entry = trade['entry']
-            qty = trade['quantity']
-            direction = trade['direction']
+            entry = trade['entry']; qty = trade['quantity']; direction = trade['direction']
             pnl = (last_price - entry) * qty if direction == "LONG" else (entry - last_price) * qty
             trade_log.append({
                 'timestamp': data[sym]['4h'].index[-1], 'symbol': sym, 'action': direction,
@@ -407,8 +404,7 @@ def run_backtest():
         full_trades.append({'entry_time': ts, 'symbol': sym, 'total_pnl': total_pnl, 'action': grp['action'].iloc[0]})
     full_df = pd.DataFrame(full_trades).sort_values('entry_time')
     full_df['is_win'] = full_df['total_pnl'] > 0
-    wins = full_df[full_df['is_win']]
-    losses = full_df[~full_df['is_win']]
+    wins = full_df[full_df['is_win']]; losses = full_df[~full_df['is_win']]
     total_trades = len(full_df)
     total_pnl = full_df['total_pnl'].sum()
     winrate = len(wins) / max(total_trades, 1) * 100
@@ -422,7 +418,7 @@ def run_backtest():
 
     summary = (
         f"\n{'='*50}\n"
-        f"BACKTEST RESULTS (Triple Filter, 1:10 RR, 9‑EMA Trailing Stop)\n"
+        f"BACKTEST RESULTS (Candle Stop + 9‑EMA Close Exit, 1:10 RR)\n"
         f"{'='*50}\n"
         f"Period: {BACKTEST_START} → {datetime.now().strftime('%Y-%m-%d')}\n"
         f"Initial Balance: ${INITIAL_BALANCE:.2f}\n"
