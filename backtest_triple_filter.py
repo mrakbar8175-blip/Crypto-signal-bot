@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-Triple‑Filter Backtester – 4H, KuCoin, 1:10 RR, ATR INITIAL STOP + 9‑EMA TRAILING
-Uses: EMA stack, ADX > 25, volume > avg, candle direction.
-Initial stop = ATR*2.5 (clamped 2‑6%). Then trailed by 9‑EMA.
+Triple‑Filter Backtester – 4H, KuCoin, 1:10 RR, FIXED ATR STOP + 9‑EMA TRAILING EXIT
+Entry: triple filter + scoring.
+Exit: 10R TP, or candle closes beyond 9‑EMA against trade, or hard ATR stop hit.
 One trade at a time, highest‑scored coin.
 Usage: python backtest_triple_filter.py
 """
@@ -36,7 +36,7 @@ CRYPTO_PAIRS = [
 ]
 
 # ============================================================
-# TECHNICAL INDICATORS
+# TECHNICAL INDICATORS (same as live bot)
 # ============================================================
 def ema(series, period):
     return series.ewm(span=period, adjust=False).mean()
@@ -133,7 +133,7 @@ def score_pair(df_4h, df_1h, df_d, btc_df_4h=None):
     if direction == "SHORT" and last_candle['Close'] >= last_candle['Open']:
         return 0, None, None, None, None, {}
 
-    # ---- Remaining indicators for scoring ----
+    # ---- Remaining indicators ----
     rsi_val = rsi(df_4h)
     macd_line, macd_signal, macd_hist, macd_hist_prev = macd(df_4h)
     atr_val = atr(df_4h)
@@ -172,7 +172,7 @@ def score_pair(df_4h, df_1h, df_d, btc_df_4h=None):
         else: sr_score = bool_score((res-price) < atr_val*0.5)
         layers["S/R"] = (sr_score*1.0, 1.0, "OK")
     else: layers["S/R"] = (0, 1.0, "FAIL")
-    layers["Volume"] = (bool_score(True) * 0.5, 0.5, "OK")  # already filtered
+    layers["Volume"] = (bool_score(True) * 0.5, 0.5, "OK")
     if "Market" not in layers: layers["Market"] = (bool_score(market_aligned)*0.5, 0.5, "OK")
     candle_ok = (bullish_momentum > 0.5) if direction=="LONG" else (bullish_momentum < -0.5)
     layers["Candle Mom"] = (bool_score(candle_ok)*2.0, 2.0, "OK")
@@ -190,7 +190,7 @@ def score_pair(df_4h, df_1h, df_d, btc_df_4h=None):
     return total, direction, price, atr_val, (sup if direction=="LONG" else res), layers
 
 # ============================================================
-# DATA FETCHING (unchanged)
+# DATA FETCHING
 # ============================================================
 def fetch_kucoin_klines(symbol, timeframe, start_date, end_date):
     exchange = ccxt.kucoin({'enableRateLimit': True})
@@ -229,7 +229,7 @@ def get_data_for_pair(ccxt_symbol, interval):
     return df
 
 # ============================================================
-# BACKTEST ENGINE (ATR stop + 9‑EMA trailing, 1:10 TP)
+# BACKTEST ENGINE (Fixed hard stop + 9‑EMA close exit, 1:10 TP)
 # ============================================================
 def run_backtest():
     print("Loading data...")
@@ -260,11 +260,11 @@ def run_backtest():
     trade_log = []
     equity = []
 
-    print(f"Running ATR + 9‑EMA trailing, 1:10 RR from {BACKTEST_START} to {end.date()}...")
+    print(f"Running Fixed ATR Stop + 9‑EMA close exit, 1:10 RR from {BACKTEST_START} to {end.date()}...")
     print(f"Timeline: {len(timeline)} 4H candles")
 
     for current_time in timeline:
-        # 1. Check open trades (TP or trailing stop)
+        # 1. Check open trades
         closed_indices = []
         for idx, trade in enumerate(open_trades):
             sym = trade['symbol']
@@ -275,62 +275,54 @@ def run_backtest():
                 continue
             bar = df_4h_sym.loc[current_time]
 
-            # Compute current 9‑EMA
+            # Compute 9‑EMA for close condition
             closes = df_4h_sym['Close'].loc[:current_time]
             ema9_series = ema(closes, 9)
             ema9_val = ema9_series.iloc[-1]
 
-            high, low = bar['High'], bar['Low']
-            entry, tp = trade['entry'], trade['tp']
+            high, low, close = bar['High'], bar['Low'], bar['Close']
+            entry, tp, hard_stop = trade['entry'], trade['tp'], trade['hard_stop']
             direction = trade['direction']
             qty = trade['quantity']
-            current_stop = trade['stop']  # latest stop level
 
-            # Update trailing stop with 9‑EMA
-            if direction == "LONG":
-                current_stop = max(current_stop, ema9_val)
-            else:
-                current_stop = min(current_stop, ema9_val)
-            trade['stop'] = current_stop   # store back
+            exit_reason = None
+            exit_price = None
 
-            # Check TP first
-            hit_tp = False
+            # 1) TP hit (intra‑bar)
             if direction == "LONG":
                 if high >= tp:
-                    hit_tp = True
+                    exit_reason = "TP"
                     exit_price = tp
             else:
                 if low <= tp:
-                    hit_tp = True
+                    exit_reason = "TP"
                     exit_price = tp
 
-            if hit_tp:
+            # 2) Hard stop hit (intra‑bar)
+            if exit_reason is None:
+                if direction == "LONG":
+                    if low <= hard_stop:
+                        exit_reason = "HARD SL"
+                        exit_price = hard_stop
+                else:
+                    if high >= hard_stop:
+                        exit_reason = "HARD SL"
+                        exit_price = hard_stop
+
+            # 3) 9‑EMA close condition (after bar)
+            if exit_reason is None:
+                if direction == "LONG" and close < ema9_val:
+                    exit_reason = "EMA EXIT"
+                    exit_price = close
+                elif direction == "SHORT" and close > ema9_val:
+                    exit_reason = "EMA EXIT"
+                    exit_price = close
+
+            if exit_reason is not None:
                 pnl = (exit_price - entry) * qty if direction == "LONG" else (entry - exit_price) * qty
                 trade_log.append({
                     'timestamp': current_time, 'symbol': sym, 'action': direction,
-                    'hit_level': "TP", 'exit_price': exit_price,
-                    'quantity': qty, 'pnl': round(pnl, 4)
-                })
-                balance += pnl
-                closed_indices.append(idx)
-                continue
-
-            # Check stop loss
-            hit_sl = False
-            if direction == "LONG":
-                if low <= current_stop:
-                    hit_sl = True
-                    exit_price = current_stop
-            else:
-                if high >= current_stop:
-                    hit_sl = True
-                    exit_price = current_stop
-
-            if hit_sl:
-                pnl = (exit_price - entry) * qty if direction == "LONG" else (entry - exit_price) * qty
-                trade_log.append({
-                    'timestamp': current_time, 'symbol': sym, 'action': direction,
-                    'hit_level': "SL", 'exit_price': exit_price,
+                    'hit_level': exit_reason, 'exit_price': exit_price,
                     'quantity': qty, 'pnl': round(pnl, 4)
                 })
                 balance += pnl
@@ -354,29 +346,24 @@ def run_backtest():
                 if direction is None or score < 6.0:
                     continue
 
-                # ----- Initial ATR‑based stop -----
-                # Use 2%-6% bounds (default for non‑top‑10 coins)
+                # Fixed ATR stop (2-6% clamp)
                 min_stop_pct = 0.02
                 max_stop_pct = 0.06
                 raw_stop = atr_val * 2.5 if (atr_val is not None and not math.isnan(atr_val)) else price * 0.02
                 stop_distance = np.clip(raw_stop, price * min_stop_pct, price * max_stop_pct)
 
                 if direction == "LONG":
-                    stop = price - stop_distance
-                    # optionally incorporate swing level (optional, keeping it simple)
+                    hard_stop = price - stop_distance
                     if swing_level and swing_level > price - stop_distance * 1.2:
-                        stop = min(stop, swing_level - 0.05 * (atr_val if atr_val else price * 0.01))
+                        hard_stop = min(hard_stop, swing_level - 0.05 * (atr_val if atr_val else price * 0.01))
                 else:
-                    stop = price + stop_distance
+                    hard_stop = price + stop_distance
                     if swing_level and swing_level < price + stop_distance * 1.2:
-                        stop = max(stop, swing_level + 0.05 * (atr_val if atr_val else price * 0.01))
+                        hard_stop = max(hard_stop, swing_level + 0.05 * (atr_val if atr_val else price * 0.01))
 
-                risk = abs(price - stop)
+                risk = abs(price - hard_stop)
                 if risk <= 0:
                     continue
-
-                # Position size based on risk
-                qty = round((balance * RISK_PER_TRADE) / risk, 8)
 
                 # 10R target
                 if direction == "LONG":
@@ -384,9 +371,11 @@ def run_backtest():
                 else:
                     tp = price - 10 * risk
 
+                qty = round((balance * RISK_PER_TRADE) / risk, 8)
+
                 candidates.append({
                     'symbol': sym, 'direction': direction, 'entry': price,
-                    'stop': stop, 'tp': tp, 'quantity': qty, 'score': score
+                    'hard_stop': hard_stop, 'tp': tp, 'quantity': qty, 'score': score
                 })
             if candidates:
                 best = max(candidates, key=lambda x: x['score'])
@@ -437,7 +426,7 @@ def run_backtest():
 
     summary = (
         f"\n{'='*50}\n"
-        f"BACKTEST RESULTS (ATR Stop + 9‑EMA Trailing, 1:10 RR)\n"
+        f"BACKTEST RESULTS (Fixed ATR Stop + 9‑EMA Close Exit, 1:10 RR)\n"
         f"{'='*50}\n"
         f"Period: {BACKTEST_START} → {datetime.now().strftime('%Y-%m-%d')}\n"
         f"Initial Balance: ${INITIAL_BALANCE:.2f}\n"
