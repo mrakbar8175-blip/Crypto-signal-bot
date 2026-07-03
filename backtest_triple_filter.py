@@ -4,6 +4,7 @@ Triple‑Filter Backtester – 4H, KuCoin, 1:10 RR, FIXED ATR STOP + 9‑EMA TRA
 Entry: triple filter + scoring.
 Exit: 10R TP, or candle closes beyond 9‑EMA against trade, or hard ATR stop hit.
 One trade at a time, highest‑scored coin.
+$20 account, 10% risk per trade.
 Usage: python backtest_triple_filter.py
 """
 
@@ -17,9 +18,9 @@ from datetime import datetime, timedelta
 # CONFIGURATION
 # ============================================================
 BACKTEST_START = "2025-01-01"
-INITIAL_BALANCE = 1000.0
-RISK_PER_TRADE = 0.01          # 1% of balance
-MAX_RISKY_TRADES = 1           # one trade at a time
+INITIAL_BALANCE = 20.0          # $20 starting capital
+RISK_PER_TRADE = 0.10           # 10% risk per trade
+MAX_RISKY_TRADES = 1            # one trade at a time
 DATA_FOLDER = "kucoin_data_backtest"
 
 CRYPTO_PAIRS = [
@@ -36,7 +37,7 @@ CRYPTO_PAIRS = [
 ]
 
 # ============================================================
-# TECHNICAL INDICATORS (same as live bot)
+# TECHNICAL INDICATORS (unchanged)
 # ============================================================
 def ema(series, period):
     return series.ewm(span=period, adjust=False).mean()
@@ -190,7 +191,7 @@ def score_pair(df_4h, df_1h, df_d, btc_df_4h=None):
     return total, direction, price, atr_val, (sup if direction=="LONG" else res), layers
 
 # ============================================================
-# DATA FETCHING
+# DATA FETCHING (unchanged)
 # ============================================================
 def fetch_kucoin_klines(symbol, timeframe, start_date, end_date):
     exchange = ccxt.kucoin({'enableRateLimit': True})
