@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-Triple‑Filter Backtester – 4H timeframe, KuCoin data, 1:1 RR (single TP)
-Uses: EMA stack, ADX > 25, volume > avg, candle direction
-No partial exits, full position closed at TP or SL.
+Triple‑Filter Backtester – 4H, KuCoin, 1:1 RR, ONE BEST TRADE AT A TIME
+Uses: EMA stack, ADX > 25, volume > avg, candle direction.
+Only the highest-scored coin enters. No new trade until current closes.
 Usage: python backtest_triple_filter.py
 """
 
@@ -16,12 +16,12 @@ from datetime import datetime, timedelta
 # CONFIGURATION
 # ============================================================
 BACKTEST_START = "2025-01-01"
-INITIAL_BALANCE = 1000.0       # Starting capital
+INITIAL_BALANCE = 1000.0
 RISK_PER_TRADE = 0.01          # 1% risk per trade
-MAX_RISKY_TRADES = 5
+MAX_RISKY_TRADES = 1           # <-- only one trade at a time
 DATA_FOLDER = "kucoin_data_backtest"
 
-# Top‑50 coins (can be expanded to 100)
+# Top‑50 coins (expand as you like)
 CRYPTO_PAIRS = [
     "BTC-USDT","ETH-USDT","BNB-USDT","SOL-USDT","XRP-USDT",
     "ADA-USDT","DOGE-USDT","DOT-USDT","MATIC-USDT","LINK-USDT",
@@ -82,7 +82,7 @@ def support_resistance_levels(df, lookback=20):
     return recent['High'].max(), recent['Low'].min()
 
 # ============================================================
-# SCORING (Triple Filter + 11 layers) – identical to live bot
+# SCORING (Triple Filter + 11 layers)
 # ============================================================
 def score_pair(df_4h, df_1h, df_d, btc_df_4h=None):
     layers = {}
@@ -96,7 +96,6 @@ def score_pair(df_4h, df_1h, df_d, btc_df_4h=None):
     ema20 = ema(df_4h['Close'], 20).iloc[-1]
     ema50 = ema(df_4h['Close'], 50).iloc[-1]
     ema200 = ema(df_4h['Close'], 200).iloc[-1]
-
     bullish_stack = (ema9 > ema20) and (ema20 > ema50) and (ema50 > ema200)
     bearish_stack = (ema9 < ema20) and (ema20 < ema50) and (ema50 < ema200)
     if not bullish_stack and not bearish_stack:
@@ -134,7 +133,7 @@ def score_pair(df_4h, df_1h, df_d, btc_df_4h=None):
     if direction == "SHORT" and last_candle['Close'] >= last_candle['Open']:
         return 0, None, None, None, None, {}
 
-    # ---- Remaining indicators for scoring ----
+    # ---- Remaining indicators ----
     rsi_val = rsi(df_4h)
     macd_line, macd_signal, macd_hist, macd_hist_prev = macd(df_4h)
     atr_val = atr(df_4h)
@@ -157,7 +156,7 @@ def score_pair(df_4h, df_1h, df_d, btc_df_4h=None):
 
     def bool_score(cond): return 1 if cond else 0
 
-    # 11 layers (identical weights)
+    # 11 layers
     if direction == "LONG": ema_align = price > ema50 and ema50 > ema200
     else: ema_align = price < ema50 and ema50 < ema200
     layers["EMA Align"] = (bool_score(ema_align) * 1.5, 1.5, "OK")
@@ -173,7 +172,7 @@ def score_pair(df_4h, df_1h, df_d, btc_df_4h=None):
         else: sr_score = bool_score((res-price) < atr_val*0.5)
         layers["S/R"] = (sr_score*1.0, 1.0, "OK")
     else: layers["S/R"] = (0, 1.0, "FAIL")
-    layers["Volume"] = (bool_score(True) * 0.5, 0.5, "OK")  # already filtered
+    layers["Volume"] = (bool_score(True) * 0.5, 0.5, "OK")
     if "Market" not in layers: layers["Market"] = (bool_score(market_aligned)*0.5, 0.5, "OK")
     candle_ok = (bullish_momentum > 0.5) if direction=="LONG" else (bullish_momentum < -0.5)
     layers["Candle Mom"] = (bool_score(candle_ok)*2.0, 2.0, "OK")
@@ -230,12 +229,12 @@ def get_data_for_pair(ccxt_symbol, interval):
     return df
 
 # ============================================================
-# BACKTEST ENGINE (1:1 RR, no partials)
+# BACKTEST ENGINE (1:1 RR, one trade at a time)
 # ============================================================
 def run_backtest():
     print("Loading data...")
     data = {}
-    for pair in CRYPTO_PAIRS[:50]:   # limit to 50 for speed; increase later
+    for pair in CRYPTO_PAIRS[:50]:
         ccxt_symbol = pair.replace("-USDT", "/USDT")
         df_4h = get_data_for_pair(ccxt_symbol, '4h')
         df_1h = get_data_for_pair(ccxt_symbol, '1h')
@@ -257,11 +256,11 @@ def run_backtest():
     timeline = btc_4h.index[(btc_4h.index >= start) & (btc_4h.index <= end)]
 
     balance = INITIAL_BALANCE
-    open_trades = []   # each trade: {'symbol', 'direction', 'entry', 'stop', 'tp', 'quantity'}
+    open_trades = []   # will hold at most one trade
     trade_log = []
     equity = []
 
-    print(f"Running 1:1 RR backtest from {BACKTEST_START} to {end.date()}...")
+    print(f"Running 1:1 RR backtest (ONE TRADE AT A TIME) from {BACKTEST_START} to {end.date()}...")
     print(f"Timeline: {len(timeline)} 4H candles")
 
     for current_time in timeline:
@@ -313,14 +312,10 @@ def run_backtest():
         for idx in sorted(closed_indices, reverse=True):
             open_trades.pop(idx)
 
-        # 2. Generate new signals
-        risky_count = len(open_trades)
-        if risky_count < MAX_RISKY_TRADES:
+        # 2. Generate new signal ONLY if no open trade
+        if len(open_trades) == 0:
             candidates = []
-            open_symbols = {t['symbol'] for t in open_trades}
             for sym, sym_data in data.items():
-                if sym in open_symbols:
-                    continue
                 df_4h = sym_data['4h'].loc[:current_time]
                 df_1h = sym_data['1h'].loc[:current_time]
                 df_d = sym_data['1d'].loc[:current_time]
@@ -408,7 +403,7 @@ def run_backtest():
 
     summary = (
         f"\n{'='*50}\n"
-        f"BACKTEST RESULTS (Triple Filter, 1:1 RR)\n"
+        f"BACKTEST RESULTS (Triple Filter, 1:1 RR, ONE TRADE AT A TIME)\n"
         f"{'='*50}\n"
         f"Period: {BACKTEST_START} → {datetime.now().strftime('%Y-%m-%d')}\n"
         f"Initial Balance: ${INITIAL_BALANCE:.2f}\n"
