@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-Triple‑Filter Backtester – 4H timeframe, KuCoin data, 1:2 RR partials
+Triple‑Filter Backtester – 4H timeframe, KuCoin data, 1:1 RR (single TP)
 Uses: EMA stack, ADX > 25, volume > avg, candle direction
-Partial exits 30/10/10/10/40, trailing stop (BE after TP1, etc.)
+No partial exits, full position closed at TP or SL.
 Usage: python backtest_triple_filter.py
 """
 
@@ -16,12 +16,12 @@ from datetime import datetime, timedelta
 # CONFIGURATION
 # ============================================================
 BACKTEST_START = "2025-01-01"
-INITIAL_BALANCE = 1000.0       # Change to any starting amount
+INITIAL_BALANCE = 1000.0       # Starting capital
 RISK_PER_TRADE = 0.01          # 1% risk per trade
 MAX_RISKY_TRADES = 5
 DATA_FOLDER = "kucoin_data_backtest"
 
-# Top‑100 coins (we'll fetch only those that have data)
+# Top‑50 coins (can be expanded to 100)
 CRYPTO_PAIRS = [
     "BTC-USDT","ETH-USDT","BNB-USDT","SOL-USDT","XRP-USDT",
     "ADA-USDT","DOGE-USDT","DOT-USDT","MATIC-USDT","LINK-USDT",
@@ -32,11 +32,8 @@ CRYPTO_PAIRS = [
     "EGLD-USDT","IMX-USDT","SAND-USDT","AXS-USDT","MANA-USDT",
     "AAVE-USDT","MKR-USDT","SNX-USDT","CRV-USDT","COMP-USDT",
     "ZEC-USDT","BAT-USDT","ENJ-USDT","CHZ-USDT","HOT-USDT",
-    "KSM-USDT","DASH-USDT","CELO-USDT","QTUM-USDT","IOST-USDT",
-    # Add more pairs to reach 100 – here we list a subset, but the script will fetch top 100 from KuCoin
-    # For simplicity, we'll use a static list of 100 pairs (you can expand)
+    "KSM-USDT","DASH-USDT","CELO-USDT","QTUM-USDT","IOST-USDT"
 ]
-# If you want real top‑100 from KuCoin, use exchange.fetch_markets() – but static list works for backtest.
 
 # ============================================================
 # TECHNICAL INDICATORS (same as live bot)
@@ -85,20 +82,16 @@ def support_resistance_levels(df, lookback=20):
     return recent['High'].max(), recent['Low'].min()
 
 # ============================================================
-# SCORING (Triple Filter + 11 layers)
+# SCORING (Triple Filter + 11 layers) – identical to live bot
 # ============================================================
 def score_pair(df_4h, df_1h, df_d, btc_df_4h=None):
-    """
-    Returns (total_score, direction, price, atr_val, swing_level, layers)
-    or (0, None, ...) if any filter fails.
-    """
     layers = {}
     if len(df_4h) < 50 or len(df_1h) < 10 or len(df_d) < 50:
         return 0, None, None, None, None, {}
 
     price = df_4h['Close'].iloc[-1]
 
-    # ---- FILTER 1: EMA Stack Alignment ----
+    # FILTER 1: EMA Stack
     ema9 = ema(df_4h['Close'], 9).iloc[-1]
     ema20 = ema(df_4h['Close'], 20).iloc[-1]
     ema50 = ema(df_4h['Close'], 50).iloc[-1]
@@ -109,12 +102,12 @@ def score_pair(df_4h, df_1h, df_d, btc_df_4h=None):
     if not bullish_stack and not bearish_stack:
         return 0, None, None, None, None, {}
 
-    # ---- FILTER 2: ADX > 25 ----
+    # FILTER 2: ADX > 25
     adx_val, di_plus, di_minus = adx(df_4h)
     if adx_val is None or adx_val <= 25:
         return 0, None, None, None, None, {}
 
-    # ---- FILTER 3: Volume > 20‑avg ----
+    # FILTER 3: Volume > 20‑avg
     vol_last = df_4h['Volume'].iloc[-1]
     vol_avg = df_4h['Volume'].iloc[-21:-1].mean() if len(df_4h) >= 21 else vol_last
     if vol_avg > 0 and vol_last < vol_avg:
@@ -134,7 +127,7 @@ def score_pair(df_4h, df_1h, df_d, btc_df_4h=None):
 
     direction = "LONG" if trend_daily == 1 else "SHORT"
 
-    # ---- FILTER 4: Candle direction ----
+    # FILTER 4: Candle direction
     last_candle = df_4h.iloc[-1]
     if direction == "LONG" and last_candle['Close'] <= last_candle['Open']:
         return 0, None, None, None, None, {}
@@ -164,7 +157,7 @@ def score_pair(df_4h, df_1h, df_d, btc_df_4h=None):
 
     def bool_score(cond): return 1 if cond else 0
 
-    # 11 layers
+    # 11 layers (identical weights)
     if direction == "LONG": ema_align = price > ema50 and ema50 > ema200
     else: ema_align = price < ema50 and ema50 < ema200
     layers["EMA Align"] = (bool_score(ema_align) * 1.5, 1.5, "OK")
@@ -228,7 +221,6 @@ def get_data_for_pair(ccxt_symbol, interval):
     file_name = os.path.join(DATA_FOLDER, f"{ccxt_symbol.replace('/', '_')}_{interval}.parquet")
     if os.path.exists(file_name):
         df = pd.read_parquet(file_name)
-        # Filter to backtest period
         df = df[df.index >= BACKTEST_START]
     else:
         df = fetch_kucoin_klines(ccxt_symbol, interval, BACKTEST_START, datetime.now().strftime("%Y-%m-%d"))
@@ -238,40 +230,38 @@ def get_data_for_pair(ccxt_symbol, interval):
     return df
 
 # ============================================================
-# BACKTEST ENGINE
+# BACKTEST ENGINE (1:1 RR, no partials)
 # ============================================================
 def run_backtest():
     print("Loading data...")
     data = {}
-    # Fetch data for all pairs and store
-    for pair in CRYPTO_PAIRS[:50]:   # limit to 50 to keep runtime reasonable; can increase
+    for pair in CRYPTO_PAIRS[:50]:   # limit to 50 for speed; increase later
         ccxt_symbol = pair.replace("-USDT", "/USDT")
         df_4h = get_data_for_pair(ccxt_symbol, '4h')
         df_1h = get_data_for_pair(ccxt_symbol, '1h')
         if df_4h.empty or df_1h.empty:
             continue
-        # Resample daily from 4h
-        df_d = df_4h.resample('1d').agg({'Open': 'first', 'High': 'max', 'Low': 'min', 'Close': 'last', 'Volume': 'sum'}).dropna()
+        df_d = df_4h.resample('1d').agg({
+            'Open': 'first', 'High': 'max', 'Low': 'min', 'Close': 'last', 'Volume': 'sum'
+        }).dropna()
         yahoo_sym = pair.replace("-USDT", "-USD")
         data[yahoo_sym] = {'4h': df_4h, '1h': df_1h, '1d': df_d}
 
-    # BTC data for context
     btc_4h = data.get("BTC-USD", {}).get('4h')
     if btc_4h is None:
         print("BTC data missing – cannot run.")
         return
 
-    # Create a unified timeline from BTC 4h
     start = pd.Timestamp(BACKTEST_START)
     end = pd.Timestamp.now()
     timeline = btc_4h.index[(btc_4h.index >= start) & (btc_4h.index <= end)]
 
     balance = INITIAL_BALANCE
-    open_trades = []
+    open_trades = []   # each trade: {'symbol', 'direction', 'entry', 'stop', 'tp', 'quantity'}
     trade_log = []
     equity = []
 
-    print(f"Running backtest from {BACKTEST_START} to {end.date()}...")
+    print(f"Running 1:1 RR backtest from {BACKTEST_START} to {end.date()}...")
     print(f"Timeline: {len(timeline)} 4H candles")
 
     for current_time in timeline:
@@ -286,68 +276,36 @@ def run_backtest():
                 continue
             bar = df_4h_sym.loc[current_time]
             high, low = bar['High'], bar['Low']
-            entry, stop, tps = trade['entry'], trade['stop'], trade['tps']
+            entry, stop, tp = trade['entry'], trade['stop'], trade['tp']
             direction = trade['direction']
-            remaining_qty = trade['quantity']
-            fractions = [0.30, 0.10, 0.10, 0.10, 0.40]
+            qty = trade['quantity']
 
-            # Check TPs from highest to lowest index
-            new_tp_idx = None
+            hit_tp = False
+            hit_sl = False
+            exit_price = None
+
             if direction == "LONG":
-                for i in range(len(tps)-1, -1, -1):
-                    if high >= tps[i] and i > trade.get('highest_tp', -1):
-                        new_tp_idx = i
-                        break
+                if high >= tp:
+                    hit_tp = True
+                    exit_price = tp
+                elif low <= stop:
+                    hit_sl = True
+                    exit_price = stop
             else:
-                for i in range(len(tps)-1, -1, -1):
-                    if low <= tps[i] and i > trade.get('highest_tp', -1):
-                        new_tp_idx = i
-                        break
+                if low <= tp:
+                    hit_tp = True
+                    exit_price = tp
+                elif high >= stop:
+                    hit_sl = True
+                    exit_price = stop
 
-            if new_tp_idx is not None:
-                for i in range(trade.get('highest_tp', -1)+1, new_tp_idx+1):
-                    if remaining_qty <= 0:
-                        break
-                    frac = fractions[i]
-                    exit_qty = trade['original_qty'] * frac
-                    if exit_qty > remaining_qty:
-                        exit_qty = remaining_qty
-                    if exit_qty > 0:
-                        exit_price = tps[i]
-                        pnl = (exit_price - entry) * exit_qty if direction == "LONG" else (entry - exit_price) * exit_qty
-                        trade_log.append({
-                            'timestamp': current_time, 'symbol': sym, 'action': direction,
-                            'hit_level': f"TP{i+1}", 'exit_price': exit_price,
-                            'quantity': exit_qty, 'pnl': round(pnl, 4)
-                        })
-                        balance += pnl
-                        remaining_qty -= exit_qty
-                        trade['highest_tp'] = i
-                        if i == 0:
-                            trade['breakeven'] = True
-                if remaining_qty <= 0:
-                    closed_indices.append(idx)
-                    continue
-
-            # Update stop based on trailing
-            current_stop = entry if trade.get('breakeven', False) else stop
-            if trade.get('highest_tp', -1) >= 0:
-                if trade['highest_tp'] == 0:
-                    current_stop = entry
-                elif trade['highest_tp'] == 1:
-                    current_stop = tps[0]
-                elif trade['highest_tp'] >= 2:
-                    current_stop = tps[1]  # etc.
-
-            # Check stop loss
-            sl_hit = (low <= current_stop) if direction == "LONG" else (high >= current_stop)
-            if sl_hit and remaining_qty > 0:
-                exit_price = current_stop
-                pnl = (exit_price - entry) * remaining_qty if direction == "LONG" else (entry - exit_price) * remaining_qty
+            if hit_tp or hit_sl:
+                pnl = (exit_price - entry) * qty if direction == "LONG" else (entry - exit_price) * qty
                 trade_log.append({
                     'timestamp': current_time, 'symbol': sym, 'action': direction,
-                    'hit_level': "SL", 'exit_price': exit_price,
-                    'quantity': remaining_qty, 'pnl': round(pnl, 4)
+                    'hit_level': "TP" if hit_tp else "SL",
+                    'exit_price': exit_price, 'quantity': qty,
+                    'pnl': round(pnl, 4)
                 })
                 balance += pnl
                 closed_indices.append(idx)
@@ -355,7 +313,7 @@ def run_backtest():
         for idx in sorted(closed_indices, reverse=True):
             open_trades.pop(idx)
 
-        # 2. Generate new signals (up to MAX_RISKY_TRADES)
+        # 2. Generate new signals
         risky_count = len(open_trades)
         if risky_count < MAX_RISKY_TRADES:
             candidates = []
@@ -373,7 +331,8 @@ def run_backtest():
                 )
                 if direction is None or score < 6.0:
                     continue
-                # Compute stop & TPs (same as live)
+
+                # Compute stop (same as live)
                 min_stop_pct = 0.02; max_stop_pct = 0.06
                 raw_stop = (atr_val * 2.5) if (atr_val is not None and not math.isnan(atr_val)) else price * 0.02
                 stop_distance = np.clip(raw_stop, price*min_stop_pct, price*max_stop_pct)
@@ -386,20 +345,23 @@ def run_backtest():
                     if swing_level and swing_level < price + stop_distance*1.2:
                         stop = max(stop, swing_level + 0.05*(atr_val if atr_val else price*0.01))
                 risk = abs(price - stop)
-                tp_multipliers = [0.4, 0.8, 1.2, 1.6, 2.0]
-                tps = [round(price + m*risk, 6) if direction=="LONG" else round(price - m*risk, 6) for m in tp_multipliers]
+                if risk <= 0:
+                    continue
+                # 1:1 target
+                if direction == "LONG":
+                    tp = price + risk
+                else:
+                    tp = price - risk
                 qty = round((balance * RISK_PER_TRADE) / risk, 8)
                 candidates.append({
                     'symbol': sym, 'direction': direction, 'entry': price,
-                    'stop': stop, 'tps': tps, 'quantity': qty, 'original_qty': qty,
-                    'highest_tp': -1, 'breakeven': False, 'score': score
+                    'stop': stop, 'tp': tp, 'quantity': qty,
+                    'score': score
                 })
-            # Take the highest scored candidate
             if candidates:
                 best = max(candidates, key=lambda x: x['score'])
                 open_trades.append(best)
 
-        # Record equity
         equity.append((current_time, balance))
 
     # Close any remaining trades at last price
@@ -408,13 +370,13 @@ def run_backtest():
         if sym in data:
             last_price = data[sym]['4h']['Close'].iloc[-1]
             entry = trade['entry']
-            remaining_qty = trade['quantity']
+            qty = trade['quantity']
             direction = trade['direction']
-            pnl = (last_price - entry) * remaining_qty if direction == "LONG" else (entry - last_price) * remaining_qty
+            pnl = (last_price - entry) * qty if direction == "LONG" else (entry - last_price) * qty
             trade_log.append({
                 'timestamp': data[sym]['4h'].index[-1], 'symbol': sym, 'action': direction,
                 'hit_level': 'MARKET CLOSE', 'exit_price': last_price,
-                'quantity': remaining_qty, 'pnl': round(pnl, 4)
+                'quantity': qty, 'pnl': round(pnl, 4)
             })
             balance += pnl
 
@@ -423,7 +385,6 @@ def run_backtest():
         print("No trades were generated.")
         return
     trades_df = pd.DataFrame(trade_log)
-    # Group by (timestamp, symbol) to get trade-level P&L
     groups = trades_df.groupby(['timestamp', 'symbol'])
     full_trades = []
     for (ts, sym), grp in groups:
@@ -445,10 +406,9 @@ def run_backtest():
     eq_df['dd'] = (eq_df['peak'] - eq_df['balance']) / eq_df['peak']
     max_dd = eq_df['dd'].max() * 100
 
-    # Print summary
     summary = (
         f"\n{'='*50}\n"
-        f"BACKTEST RESULTS (Triple Filter + Partials)\n"
+        f"BACKTEST RESULTS (Triple Filter, 1:1 RR)\n"
         f"{'='*50}\n"
         f"Period: {BACKTEST_START} → {datetime.now().strftime('%Y-%m-%d')}\n"
         f"Initial Balance: ${INITIAL_BALANCE:.2f}\n"
