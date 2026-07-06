@@ -13,7 +13,12 @@ on:
           - monitor
           - add-last-signal
           - list-trades
+          - remove-trade
           - report
+      symbol:
+        description: 'Symbol to remove (for remove-trade mode)'
+        required: false
+        default: ''
 
 jobs:
   run:
@@ -35,8 +40,12 @@ jobs:
       
       - run: |
           MODE="${{ github.event.inputs.mode }}"
+          SYMBOL="${{ github.event.inputs.symbol }}"
+          
           if [ "$MODE" = "signals" ]; then
             python alphaswing.py
+          elif [ "$MODE" = "remove-trade" ] && [ -n "$SYMBOL" ]; then
+            python alphaswing.py --remove-trade "$SYMBOL"
           else
             python alphaswing.py --$MODE
           fi
