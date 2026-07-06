@@ -1,14 +1,17 @@
 #!/usr/bin/env python3
 """
-AlphaSwing v4 – Quant Signal Generator + Auto-Journal (4H)
-Generates signals, monitors trades, and automatically journals performance.
-Reports stats every 10 trades.
+AlphaSwing v4.1 – Quant Signal Generator + Auto-Journal (4H)
+Now with easy trade management commands!
 
 Usage:
-    python alphaswing.py              # Generate signals
-    python alphaswing.py --monitor    # Monitor open trades
-    python alphaswing.py --loop       # Both, every 4 hours
-    python alphaswing.py --report     # Show performance report now
+    python alphaswing.py                              # Generate signals
+    python alphaswing.py --monitor                    # Monitor open trades
+    python alphaswing.py --add-last-signal            # Add last signal as trade
+    python alphaswing.py --add-trade SOL LONG 142.35 136.82  # Manual add
+    python alphaswing.py --list-trades                # Show open trades
+    python alphaswing.py --remove-trade SOL           # Remove a trade
+    python alphaswing.py --report                     # Performance report
+    python alphaswing.py --loop                       # Run signals + monitor
 """
 
 import os, json, time, sys, atexit
@@ -70,26 +73,22 @@ def initialize_files():
     """Automatically create all required files if they don't exist."""
     print("[*] Initializing data files...")
     
-    # Create portfolio.json
     if not os.path.exists(CONFIG["files"]["portfolio_file"]):
         with open(CONFIG["files"]["portfolio_file"], 'w') as f:
             json.dump({"balance": 1000.0}, f, indent=2)
         print(f"  ✓ Created {CONFIG['files']['portfolio_file']}")
     
-    # Create open_trades.json
     if not os.path.exists(CONFIG["files"]["open_trades_file"]):
         with open(CONFIG["files"]["open_trades_file"], 'w') as f:
             json.dump([], f)
         print(f"  ✓ Created {CONFIG['files']['open_trades_file']}")
     
-    # Create signal_log.csv with headers
     if not os.path.exists(CONFIG["files"]["signal_log"]):
         cols = ["timestamp", "symbol", "direction", "entry", "stop", 
                 "tp1", "tp2", "tp3", "score", "mom_z", "clv", "qty", "notional"]
         pd.DataFrame(columns=cols).to_csv(CONFIG["files"]["signal_log"], index=False)
         print(f"  ✓ Created {CONFIG['files']['signal_log']}")
     
-    # Create trade_results.csv with headers
     if not os.path.exists(CONFIG["files"]["trade_results_file"]):
         cols = ["open_time", "close_time", "symbol", "direction", "entry", "stop",
                 "tp1", "tp2", "tp3", "tp4", "tp5", "exit_price", "qty", "pnl_pct",
@@ -97,7 +96,6 @@ def initialize_files():
         pd.DataFrame(columns=cols).to_csv(CONFIG["files"]["trade_results_file"], index=False)
         print(f"  ✓ Created {CONFIG['files']['trade_results_file']}")
     
-    # Create perf_counter.txt
     if not os.path.exists(CONFIG["files"]["perf_counter_file"]):
         with open(CONFIG["files"]["perf_counter_file"], 'w') as f:
             f.write("0")
@@ -150,6 +148,192 @@ def safe_append_csv(filepath, df_new):
         print(f"[!] CSV append failed: {e}")
         header = not os.path.exists(filepath) or os.path.getsize(filepath) == 0
         df_new.to_csv(filepath, mode='a', header=header, index=False)
+
+# ======================== NEW: TRADE MANAGEMENT COMMANDS ========================
+def add_last_signal_as_trade():
+    """Add the most recent signal from signal_log.csv as an open trade."""
+    filepath = CONFIG["files"]["signal_log"]
+    if not os.path.exists(filepath):
+        print("[!] No signal log found. Run signals first.")
+        return
+    
+    try:
+        df = pd.read_csv(filepath)
+        if df.empty:
+            print("[!] Signal log is empty. Run signals first.")
+            return
+        
+        last = df.iloc[-1]
+        symbol = last["symbol"]
+        direction = last["direction"]
+        entry = float(last["entry"])
+        stop = float(last["stop"])
+        tp1 = float(last["tp1"])
+        tp2 = float(last["tp2"])
+        tp3 = float(last["tp3"])
+        qty = float(last["qty"])
+        score = float(last["score"])
+        mom_z = float(last["mom_z"])
+        clv = float(last["clv"])
+        notional = float(last["notional"])
+        
+        # Calculate TP4, TP5 from pattern
+        risk = abs(entry - stop)
+        tp4 = entry + 2.0 * risk if direction == "LONG" else entry - 2.0 * risk
+        tp5 = entry + 3.0 * risk if direction == "LONG" else entry - 3.0 * risk
+        
+        # Estimate ATR from stop distance (stop = 2x ATR)
+        atr = risk / CONFIG["trading"]["atr_stop_multiplier"]
+        
+        # Check if already monitoring this symbol
+        trades = load_open_trades()
+        if any(t["symbol"] == symbol for t in trades):
+            print(f"[!] {symbol} is already being monitored.")
+            return
+        
+        trade = {
+            "symbol": symbol,
+            "direction": direction,
+            "entry": entry,
+            "stop": stop,
+            "tps": [tp1, tp2, tp3, tp4, tp5],
+            "qty": qty,
+            "atr": atr,
+            "score": score,
+            "mom_z": mom_z,
+            "clv": clv,
+            "notional": notional,
+            "highest_tp_hit": -1,
+            "current_stop": stop,
+            "opened_at": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
+        }
+        
+        trades.append(trade)
+        save_open_trades(trades)
+        
+        print(f"\n{'='*55}")
+        print(f"  ✅ TRADE ADDED TO MONITORING")
+        print(f"{'='*55}")
+        print(f"  Symbol:    {symbol}")
+        print(f"  Direction: {direction}")
+        print(f"  Entry:     ${entry:.4f}")
+        print(f"  Stop:      ${stop:.4f}")
+        print(f"  TP1-TP5:   ${tp1:.4f} / ${tp2:.4f} / ${tp3:.4f} / ${tp4:.4f} / ${tp5:.4f}")
+        print(f"  Qty:       {qty}")
+        print(f"{'='*55}\n")
+        
+        # Send Discord alert
+        alert = (
+            f"📝 **Trade Added to Monitor**\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"{'🟢' if direction == 'LONG' else '🔴'} {direction} {symbol.replace('-USD','')}\n"
+            f"📍 Entry: `${entry:.4f}`\n"
+            f"🛑 Stop: `${stop:.4f}`\n"
+            f"🎯 TPs: ${tp1:.4f} → ${tp5:.4f}\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"Now monitoring for TP hits!"
+        )
+        send_discord(alert)
+        
+    except Exception as e:
+        print(f"[!] Error adding trade: {e}")
+
+def add_manual_trade(symbol, direction, entry, stop):
+    """Manually add a trade with custom parameters."""
+    try:
+        entry = float(entry)
+        stop = float(stop)
+    except:
+        print("[!] Entry and stop must be numbers.")
+        return
+    
+    if direction.upper() not in ["LONG", "SHORT"]:
+        print("[!] Direction must be LONG or SHORT.")
+        return
+    
+    direction = direction.upper()
+    symbol = symbol.upper()
+    if not symbol.endswith("-USD"):
+        symbol = f"{symbol}-USD"
+    
+    # Calculate TPs
+    risk = abs(entry - stop)
+    tps = []
+    for m in CONFIG["trading"]["tp_multipliers"]:
+        tp = entry + m * risk if direction == "LONG" else entry - m * risk
+        tps.append(round(tp, 6))
+    
+    # Estimate ATR and qty
+    atr = risk / CONFIG["trading"]["atr_stop_multiplier"]
+    balance = portfolio["balance"]
+    risk_dollars = balance * CONFIG["trading"]["risk_per_trade_pct"] / 100
+    qty = round(risk_dollars / risk, 6)
+    notional = round(qty * entry, 2)
+    
+    # Check duplicates
+    trades = load_open_trades()
+    if any(t["symbol"] == symbol for t in trades):
+        print(f"[!] {symbol} is already being monitored.")
+        return
+    
+    trade = {
+        "symbol": symbol,
+        "direction": direction,
+        "entry": entry,
+        "stop": stop,
+        "tps": tps,
+        "qty": qty,
+        "atr": atr,
+        "score": 0,
+        "mom_z": 0,
+        "clv": 0,
+        "notional": notional,
+        "highest_tp_hit": -1,
+        "current_stop": stop,
+        "opened_at": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
+    }
+    
+    trades.append(trade)
+    save_open_trades(trades)
+    
+    print(f"\n✅ Added {direction} {symbol} @ ${entry:.4f}")
+    print(f"   Stop: ${stop:.4f} | TPs: {', '.join([f'${tp:.4f}' for tp in tps])}")
+
+def list_open_trades():
+    """Display all currently monitored trades."""
+    trades = load_open_trades()
+    if not trades:
+        print("\n[*] No open trades being monitored.")
+        return
+    
+    print(f"\n{'='*75}")
+    print(f"  OPEN TRADES ({len(trades)} active)")
+    print(f"{'='*75}")
+    print(f"  {'#':<3} {'Symbol':<10} {'Dir':<6} {'Entry':<12} {'Stop':<12} {'TP Hit':<8} {'Current Stop':<12}")
+    print(f"  {'-'*70}")
+    
+    for i, t in enumerate(trades):
+        sym = t["symbol"].replace("-USD", "")
+        tp_status = "None" if t["highest_tp_hit"] == -1 else f"TP{t['highest_tp_hit']+1}"
+        print(f"  {i+1:<3} {sym:<10} {t['direction']:<6} ${t['entry']:<11.4f} ${t['stop']:<11.4f} {tp_status:<8} ${t['current_stop']:<11.4f}")
+    
+    print(f"{'='*75}\n")
+
+def remove_trade(symbol):
+    """Remove a trade from monitoring."""
+    symbol = symbol.upper()
+    if not symbol.endswith("-USD"):
+        symbol = f"{symbol}-USD"
+    
+    trades = load_open_trades()
+    new_trades = [t for t in trades if t["symbol"] != symbol]
+    
+    if len(new_trades) == len(trades):
+        print(f"[!] {symbol} not found in open trades.")
+        return
+    
+    save_open_trades(new_trades)
+    print(f"✅ Removed {symbol} from monitoring.")
 
 # ======================== COIN UNIVERSE ========================
 def fetch_top_liquid_coins():
@@ -718,6 +902,10 @@ def format_discord_alert(sig):
         f"━━━━━━━━━━━━━━━━━━━━━━━━\n"
         f"💰 Size: `{sig['qty']}` units (`${sig['notional']:.2f}`)\n"
         f"⚠️ Risk: `${sig['risk_dollars']:.2f}` ({CONFIG['trading']['risk_per_trade_pct']}% of balance)\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"💡 After taking this trade, run:\n"
+        f"`python alphaswing.py --add-last-signal`\n"
+        f"to start monitoring it!"
     )
     return msg
 
@@ -739,7 +927,7 @@ def log_signal(sig):
 def print_console_report(signals, top_candidates, regime):
     now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
     print(f"\n{'='*55}")
-    print(f"  ALPHASWING v4 – SIGNAL REPORT")
+    print(f"  ALPHASWING v4.1 – SIGNAL REPORT")
     print(f"  {now}")
     print(f"  BTC Regime: {regime} | Balance: ${portfolio['balance']:.2f}")
     print(f"{'='*55}")
@@ -797,16 +985,35 @@ def run_monitor():
         release_lock()
 
 def main():
-    # Initialize all data files automatically
     initialize_files()
 
-    if "--report" in sys.argv:
+    args = sys.argv[1:]
+    
+    # NEW: Trade management commands
+    if "--add-last-signal" in args:
+        add_last_signal_as_trade()
+    elif "--add-trade" in args:
+        idx = args.index("--add-trade")
+        if len(args) >= idx + 5:
+            add_manual_trade(args[idx+1], args[idx+2], args[idx+3], args[idx+4])
+        else:
+            print("Usage: python alphaswing.py --add-trade SYMBOL DIRECTION ENTRY STOP")
+            print("Example: python alphaswing.py --add-trade SOL LONG 142.35 136.82")
+    elif "--list-trades" in args:
+        list_open_trades()
+    elif "--remove-trade" in args:
+        idx = args.index("--remove-trade")
+        if len(args) >= idx + 2:
+            remove_trade(args[idx+1])
+        else:
+            print("Usage: python alphaswing.py --remove-trade SYMBOL")
+    elif "--report" in args:
         show_performance_report()
-    elif "--monitor" in sys.argv:
-        print(f"[*] AlphaSwing v4 – Trade Monitor")
+    elif "--monitor" in args:
+        print(f"[*] AlphaSwing v4.1 – Trade Monitor")
         run_monitor()
-    elif "--loop" in sys.argv:
-        print(f"[*] AlphaSwing v4 – Loop mode")
+    elif "--loop" in args:
+        print(f"[*] AlphaSwing v4.1 – Loop mode")
         while True:
             try:
                 run_signals()
