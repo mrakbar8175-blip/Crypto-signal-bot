@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-AlphaSwing v4.4 – FULL Quant Signal Generator + Auto-Journal (4H)
-Fixed: KuCoin validation + Chart sending issues
+AlphaSwing v4.5 – FULL Quant Signal Generator + Auto-Journal (4H)
+Added: Ban/Unban coins feature
 """
 
 import os, json, time, sys, atexit
@@ -36,6 +36,7 @@ CONFIG = {
         "open_trades_file": "open_trades.json",
         "trade_results_file": "trade_results.csv",
         "perf_counter_file": "perf_counter.txt",
+        "banned_coins_file": "banned_coins.json",  # ⭐ NEW
     },
     "loop_interval_hours": 4,
     "report_every_n_trades": 10,
@@ -96,6 +97,12 @@ def initialize_files():
             f.write("0")
         print(f"  ✓ Created {CONFIG['files']['perf_counter_file']}")
     
+    # ⭐ NEW: Banned coins file
+    if not os.path.exists(CONFIG["files"]["banned_coins_file"]):
+        with open(CONFIG["files"]["banned_coins_file"], 'w') as f:
+            json.dump([], f)
+        print(f"  ✓ Created {CONFIG['files']['banned_coins_file']}")
+    
     print("[✓] All data files initialized!\n")
 
 # ======================== PORTFOLIO ========================
@@ -134,6 +141,86 @@ def save_open_trades(trades):
     with open(tmp, 'w') as f:
         json.dump(trades, f, indent=2)
     os.replace(tmp, filepath)
+
+# ⭐ NEW: Banned Coins Management
+def load_banned_coins():
+    filepath = CONFIG["files"]["banned_coins_file"]
+    if os.path.exists(filepath):
+        try:
+            with open(filepath) as f:
+                return json.load(f)
+        except:
+            pass
+    return []
+
+def save_banned_coins(banned):
+    filepath = CONFIG["files"]["banned_coins_file"]
+    tmp = filepath + ".tmp"
+    with open(tmp, 'w') as f:
+        json.dump(banned, f, indent=2)
+    os.replace(tmp, filepath)
+
+def ban_coin(symbol):
+    """Add a coin to the permanent blacklist."""
+    symbol = symbol.upper()
+    if not symbol.endswith("-USD"):
+        symbol = f"{symbol}-USD"
+    
+    banned = load_banned_coins()
+    
+    if symbol in banned:
+        print(f"[!] {symbol} is already banned.")
+        return
+    
+    banned.append(symbol)
+    save_banned_coins(banned)
+    
+    print(f"\n{'='*55}")
+    print(f"  🚫 COIN BANNED")
+    print(f"{'='*55}")
+    print(f"  {symbol} has been added to the blacklist.")
+    print(f"  It will never appear in signals again.")
+    print(f"  Total banned: {len(banned)}")
+    print(f"{'='*55}\n")
+    
+    # Send Discord alert
+    send_discord(f"🚫 **Coin Banned**\n`{symbol}` added to blacklist.\nTotal banned: {len(banned)}")
+
+def unban_coin(symbol):
+    """Remove a coin from the blacklist."""
+    symbol = symbol.upper()
+    if not symbol.endswith("-USD"):
+        symbol = f"{symbol}-USD"
+    
+    banned = load_banned_coins()
+    
+    if symbol not in banned:
+        print(f"[!] {symbol} is not in the blacklist.")
+        return
+    
+    banned.remove(symbol)
+    save_banned_coins(banned)
+    
+    print(f"\n✅ {symbol} has been unbanned.")
+    print(f"   Total banned: {len(banned)}")
+    
+    send_discord(f"✅ **Coin Unbanned**\n`{symbol}` removed from blacklist.")
+
+def list_banned_coins():
+    """Show all banned coins."""
+    banned = load_banned_coins()
+    
+    print(f"\n{'='*55}")
+    print(f"  🚫 BANNED COINS ({len(banned)} total)")
+    print(f"{'='*55}")
+    
+    if not banned:
+        print("  (No coins banned yet)")
+    else:
+        for i, coin in enumerate(banned):
+            print(f"  {i+1}. {coin}")
+    
+    print(f"{'='*55}\n")
 
 def safe_append_csv(filepath, df_new):
     tmp = filepath + ".tmp"
@@ -306,17 +393,22 @@ def remove_trade(symbol):
 
 # ======================== COIN UNIVERSE ========================
 def fetch_top_liquid_coins():
+    """Fetch top liquid coins, excluding both hardcoded blacklist AND user-banned coins."""
     url = "https://api.coingecko.com/api/v3/coins/markets"
     params = {"vs_currency": "usd", "order": "market_cap_desc", "per_page": 100, "page": 1, "sparkline": False}
     try:
         resp = requests.get(url, params=params, timeout=15)
         data = resp.json()
         symbols = []
-        blacklist = set(CONFIG["universe"]["blacklist"])
+        # ⭐ Combine hardcoded blacklist with user-banned coins
+        hardcoded_blacklist = set(CONFIG["universe"]["blacklist"])
+        user_banned = set(load_banned_coins())
+        combined_blacklist = hardcoded_blacklist.union(user_banned)
+        
         for coin in data:
             sym = coin.get("symbol", "").upper()
-            if sym and sym not in blacklist:
-                ys = f"{sym}-USD"
+            ys = f"{sym}-USD"
+            if sym and ys not in combined_blacklist:
                 if ys not in symbols:
                     symbols.append(ys)
         return symbols[:CONFIG["universe"]["limit"]]
@@ -392,7 +484,6 @@ def fetch_all_data(coins):
         base = yahoo_sym.replace("-USD", "")
         kucoin_sym = f"{base}-USDT"
         
-        # Check if symbol exists on KuCoin first
         if not check_kucoin_symbol(kucoin_sym):
             return yahoo_sym, pd.DataFrame(), False
         
@@ -494,6 +585,11 @@ def generate_signals():
     print(f"\n[*] Scanning {len(coins)} coins...")
     if risky_symbols:
         print(f"[*] Skipping {len(risky_symbols)} coins with risky open trades: {', '.join(risky_symbols)}")
+    
+    # ⭐ Show banned coins count
+    banned = load_banned_coins()
+    if banned:
+        print(f"[*] {len(banned)} coins permanently banned: {', '.join(banned)}")
 
     btc_df = get_kucoin_klines("BTC-USD", '4h', days=21)
     regime = get_btc_regime(btc_df)
@@ -844,7 +940,6 @@ def show_performance_report():
 
 # ======================== CHARTING ========================
 def generate_chart(sig):
-    """Create a professional candlestick chart with entry/stop/TP lines."""
     try:
         import matplotlib
         matplotlib.use('Agg')
@@ -852,7 +947,6 @@ def generate_chart(sig):
         import mplfinance as mpf
     except ImportError as e:
         print(f"[!] Chart libraries not installed: {e}")
-        print(f"    Run: pip install matplotlib mplfinance")
         return None
 
     sym = sig["symbol"]
@@ -916,7 +1010,6 @@ def send_discord(text):
 
 def send_discord_image(image_path, caption=""):
     if not DISCORD_WEBHOOK_URL or not image_path or not os.path.exists(image_path):
-        print(f"[!] Cannot send image: path={image_path}, exists={os.path.exists(image_path) if image_path else False}")
         return
     try:
         with open(image_path, 'rb') as img:
@@ -973,7 +1066,7 @@ def log_signal(sig):
 def print_console_report(signals, top_candidates, regime):
     now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
     print(f"\n{'='*60}")
-    print(f"  ALPHASWING v4.4 – SIGNAL REPORT")
+    print(f"  ALPHASWING v4.5 – SIGNAL REPORT")
     print(f"  {now}")
     print(f"  BTC Regime: {regime} | Balance: ${portfolio['balance']:.2f}")
     print(f"{'='*60}")
@@ -1054,13 +1147,29 @@ def main():
             remove_trade(args[idx + 1])
         else:
             print("Usage: python alphaswing.py --remove-trade SYMBOL")
+    # ⭐ NEW: Ban/Unban commands
+    elif "--ban-coin" in args:
+        idx = args.index("--ban-coin")
+        if len(args) >= idx + 2:
+            ban_coin(args[idx + 1])
+        else:
+            print("Usage: python alphaswing.py --ban-coin SYMBOL")
+            print("Example: python alphaswing.py --ban-coin DEXE")
+    elif "--unban-coin" in args:
+        idx = args.index("--unban-coin")
+        if len(args) >= idx + 2:
+            unban_coin(args[idx + 1])
+        else:
+            print("Usage: python alphaswing.py --unban-coin SYMBOL")
+    elif "--list-banned" in args:
+        list_banned_coins()
     elif "--report" in args:
         show_performance_report()
     elif "--monitor" in args:
-        print(f"[*] AlphaSwing v4.4 – Trade Monitor")
+        print(f"[*] AlphaSwing v4.5 – Trade Monitor")
         run_monitor()
     elif "--loop" in args:
-        print(f"[*] AlphaSwing v4.4 – Loop mode ({CONFIG['loop_interval_hours']}h interval)")
+        print(f"[*] AlphaSwing v4.5 – Loop mode ({CONFIG['loop_interval_hours']}h interval)")
         print(f"[*] Portfolio balance: ${portfolio['balance']:.2f}")
         while True:
             try:
