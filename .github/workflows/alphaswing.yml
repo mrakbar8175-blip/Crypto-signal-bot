@@ -1,11 +1,7 @@
 name: AlphaSwing - Crypto Signal Generator
 
 on:
-  # Run every 4 hours
-  schedule:
-    - cron: '0 */4 * * *'
-  
-  # Allow manual trigger
+  # Manual trigger only
   workflow_dispatch:
     inputs:
       mode:
