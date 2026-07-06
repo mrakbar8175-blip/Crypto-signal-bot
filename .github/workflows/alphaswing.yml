@@ -14,9 +14,12 @@ on:
           - add-last-signal
           - list-trades
           - remove-trade
+          - ban-coin
+          - unban-coin
+          - list-banned
           - report
       symbol:
-        description: 'Symbol to remove (for remove-trade mode)'
+        description: 'Symbol (for remove-trade / ban-coin / unban-coin)'
         required: false
         default: ''
 
@@ -44,8 +47,8 @@ jobs:
           
           if [ "$MODE" = "signals" ]; then
             python alphaswing.py
-          elif [ "$MODE" = "remove-trade" ] && [ -n "$SYMBOL" ]; then
-            python alphaswing.py --remove-trade "$SYMBOL"
+          elif [ -n "$SYMBOL" ]; then
+            python alphaswing.py --$MODE "$SYMBOL"
           else
             python alphaswing.py --$MODE
           fi
