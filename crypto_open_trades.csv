@@ -1,1 +1,2 @@
-
+timestamp,symbol,action,entry,stop,TP1,TP2,TP3,TP4,TP5,status,quantity,original_qty,highest_tp,breakeven
+2026-07-06 04:25:04,GHO-USD,SHORT,0.9979478716850281,1.017907,0.989964,0.981981,0.973997,0.966013,0.95803,open,475.56990704,475.56990704,-1,False
