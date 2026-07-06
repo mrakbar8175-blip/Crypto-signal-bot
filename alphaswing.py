@@ -1,17 +1,7 @@
 #!/usr/bin/env python3
 """
-AlphaSwing v4.3 – FULL Quant Signal Generator + Auto-Journal (4H)
-Complete version with all features restored.
-
-Usage:
-    python alphaswing.py                              # Generate 1 signal
-    python alphaswing.py --monitor                    # Monitor open trades
-    python alphaswing.py --add-last-signal            # Add last signal to monitoring
-    python alphaswing.py --add-trade SOL LONG 142.35 136.82  # Manual add
-    python alphaswing.py --list-trades                # Show open trades
-    python alphaswing.py --remove-trade SOL           # Remove a trade
-    python alphaswing.py --report                     # Performance report
-    python alphaswing.py --loop                       # Run signals + monitor forever
+AlphaSwing v4.4 – FULL Quant Signal Generator + Auto-Journal (4H)
+Fixed: KuCoin validation + Chart sending issues
 """
 
 import os, json, time, sys, atexit
@@ -24,8 +14,8 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 # ======================== CONFIGURATION ========================
 CONFIG = {
     "trading": {
-        "max_signals": 1,                            # 1 signal per run
-        "max_concurrent_risky_trades": 3,            # Max trades that haven't hit TP1
+        "max_signals": 1,
+        "max_concurrent_risky_trades": 3,
         "risk_per_trade_pct": 1.0,
         "min_score_to_enter": 1.5,
         "atr_stop_multiplier": 2.0,
@@ -76,7 +66,6 @@ atexit.register(release_lock)
 
 # ======================== AUTO FILE INITIALIZATION ========================
 def initialize_files():
-    """Automatically create all required files if they don't exist."""
     print("[*] Initializing data files...")
     
     if not os.path.exists(CONFIG["files"]["portfolio_file"]):
@@ -147,7 +136,6 @@ def save_open_trades(trades):
     os.replace(tmp, filepath)
 
 def safe_append_csv(filepath, df_new):
-    """Atomically append to CSV with backup."""
     tmp = filepath + ".tmp"
     try:
         if os.path.exists(filepath) and os.path.getsize(filepath) > 0:
@@ -164,7 +152,6 @@ def safe_append_csv(filepath, df_new):
 
 # ======================== TRADE MANAGEMENT COMMANDS ========================
 def add_last_signal_as_trade():
-    """Add the most recent signal from signal_log.csv as an open trade."""
     filepath = CONFIG["files"]["signal_log"]
     if not os.path.exists(filepath):
         print("[!] No signal log found. Run signals first.")
@@ -190,34 +177,21 @@ def add_last_signal_as_trade():
         clv = float(last["clv"])
         notional = float(last["notional"])
         
-        # Calculate TP4, TP5 from pattern
         risk = abs(entry - stop)
         tp4 = entry + 2.0 * risk if direction == "LONG" else entry - 2.0 * risk
         tp5 = entry + 3.0 * risk if direction == "LONG" else entry - 3.0 * risk
-        
-        # Estimate ATR from stop distance (stop = 2x ATR)
         atr = risk / CONFIG["trading"]["atr_stop_multiplier"]
         
-        # Check if already monitoring this symbol
         trades = load_open_trades()
         if any(t["symbol"] == symbol for t in trades):
             print(f"[!] {symbol} is already being monitored.")
             return
         
         trade = {
-            "symbol": symbol,
-            "direction": direction,
-            "entry": entry,
-            "stop": stop,
-            "tps": [tp1, tp2, tp3, tp4, tp5],
-            "qty": qty,
-            "atr": atr,
-            "score": score,
-            "mom_z": mom_z,
-            "clv": clv,
-            "notional": notional,
-            "highest_tp_hit": -1,
-            "current_stop": stop,
+            "symbol": symbol, "direction": direction, "entry": entry, "stop": stop,
+            "tps": [tp1, tp2, tp3, tp4, tp5], "qty": qty, "atr": atr,
+            "score": score, "mom_z": mom_z, "clv": clv, "notional": notional,
+            "highest_tp_hit": -1, "current_stop": stop,
             "opened_at": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
         }
         
@@ -235,7 +209,6 @@ def add_last_signal_as_trade():
         print(f"  Qty:       {qty}")
         print(f"{'='*55}\n")
         
-        # Send Discord alert
         alert = (
             f"📝 **Trade Added to Monitor**\n"
             f"━━━━━━━━━━━━━━━━━━━━━━━━\n"
@@ -252,7 +225,6 @@ def add_last_signal_as_trade():
         print(f"[!] Error adding trade: {e}")
 
 def add_manual_trade(symbol, direction, entry, stop):
-    """Manually add a trade with custom parameters."""
     try:
         entry = float(entry)
         stop = float(stop)
@@ -269,40 +241,23 @@ def add_manual_trade(symbol, direction, entry, stop):
     if not symbol.endswith("-USD"):
         symbol = f"{symbol}-USD"
     
-    # Calculate TPs
     risk = abs(entry - stop)
-    tps = []
-    for m in CONFIG["trading"]["tp_multipliers"]:
-        tp = entry + m * risk if direction == "LONG" else entry - m * risk
-        tps.append(round(tp, 6))
-    
-    # Estimate ATR and qty
+    tps = [round(entry + m * risk if direction == "LONG" else entry - m * risk, 6) for m in CONFIG["trading"]["tp_multipliers"]]
     atr = risk / CONFIG["trading"]["atr_stop_multiplier"]
     balance = portfolio["balance"]
     risk_dollars = balance * CONFIG["trading"]["risk_per_trade_pct"] / 100
     qty = round(risk_dollars / risk, 6)
     notional = round(qty * entry, 2)
     
-    # Check duplicates
     trades = load_open_trades()
     if any(t["symbol"] == symbol for t in trades):
         print(f"[!] {symbol} is already being monitored.")
         return
     
     trade = {
-        "symbol": symbol,
-        "direction": direction,
-        "entry": entry,
-        "stop": stop,
-        "tps": tps,
-        "qty": qty,
-        "atr": atr,
-        "score": 0,
-        "mom_z": 0,
-        "clv": 0,
-        "notional": notional,
-        "highest_tp_hit": -1,
-        "current_stop": stop,
+        "symbol": symbol, "direction": direction, "entry": entry, "stop": stop,
+        "tps": tps, "qty": qty, "atr": atr, "score": 0, "mom_z": 0, "clv": 0,
+        "notional": notional, "highest_tp_hit": -1, "current_stop": stop,
         "opened_at": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
     }
     
@@ -315,7 +270,6 @@ def add_manual_trade(symbol, direction, entry, stop):
     print(f"   Qty: {qty} units (${notional})")
 
 def list_open_trades():
-    """Display all currently monitored trades."""
     trades = load_open_trades()
     if not trades:
         print("\n[*] No open trades being monitored.")
@@ -336,7 +290,6 @@ def list_open_trades():
     print(f"{'='*80}\n")
 
 def remove_trade(symbol):
-    """Remove a trade from monitoring."""
     symbol = symbol.upper()
     if not symbol.endswith("-USD"):
         symbol = f"{symbol}-USD"
@@ -353,15 +306,8 @@ def remove_trade(symbol):
 
 # ======================== COIN UNIVERSE ========================
 def fetch_top_liquid_coins():
-    """Fetch top liquid coins from CoinGecko."""
     url = "https://api.coingecko.com/api/v3/coins/markets"
-    params = {
-        "vs_currency": "usd",
-        "order": "market_cap_desc",
-        "per_page": 100,
-        "page": 1,
-        "sparkline": False
-    }
+    params = {"vs_currency": "usd", "order": "market_cap_desc", "per_page": 100, "page": 1, "sparkline": False}
     try:
         resp = requests.get(url, params=params, timeout=15)
         data = resp.json()
@@ -380,8 +326,17 @@ def fetch_top_liquid_coins():
                 "ADA-USD", "DOGE-USD", "AVAX-USD", "DOT-USD", "LINK-USD"]
 
 # ======================== DATA FETCHING ========================
+def check_kucoin_symbol(kucoin_sym):
+    """Check if a symbol exists on KuCoin."""
+    url = f"https://api.kucoin.com/api/v1/market/orderbook/level1?symbol={kucoin_sym}"
+    try:
+        resp = requests.get(url, timeout=5)
+        data = resp.json()
+        return data.get("code") == "200000"
+    except:
+        return False
+
 def get_kucoin_klines(kucoin_sym, interval, days=14):
-    """Fetch OHLCV candles from KuCoin public API."""
     interval_map = {'1h': '1hour', '4h': '4hour', '1d': '1day'}
     end_time = datetime.now(timezone.utc)
     start_time = end_time - timedelta(days=days)
@@ -419,7 +374,6 @@ def get_kucoin_klines(kucoin_sym, interval, days=14):
     return pd.DataFrame()
 
 def get_current_price(kucoin_sym):
-    """Get current price from KuCoin ticker."""
     url = f"https://api.kucoin.com/api/v1/market/orderbook/level1?symbol={kucoin_sym.replace('-USD', '-USDT')}"
     try:
         resp = requests.get(url, timeout=5)
@@ -431,30 +385,41 @@ def get_current_price(kucoin_sym):
     return None
 
 def fetch_all_data(coins):
-    """Fetch 4h candles for all coins in parallel."""
+    """Fetch 4h candles for all coins in parallel, filtering out coins not on KuCoin."""
     results = {}
     
     def fetch_one(yahoo_sym):
+        base = yahoo_sym.replace("-USD", "")
+        kucoin_sym = f"{base}-USDT"
+        
+        # Check if symbol exists on KuCoin first
+        if not check_kucoin_symbol(kucoin_sym):
+            return yahoo_sym, pd.DataFrame(), False
+        
         df = get_kucoin_klines(yahoo_sym, '4h', days=21)
-        return yahoo_sym, df
+        return yahoo_sym, df, True
 
     with ThreadPoolExecutor(max_workers=5) as executor:
         futures = {executor.submit(fetch_one, sym): sym for sym in coins}
+        skipped = 0
         for future in as_completed(futures):
             try:
-                sym, df = future.result()
+                sym, df, exists = future.result()
+                if not exists:
+                    skipped += 1
+                    continue
                 if not df.empty and len(df) >= 50:
                     results[sym] = df
             except Exception as e:
                 print(f"[!] Error fetching {sym}: {e}")
+        
+        if skipped > 0:
+            print(f"[*] Skipped {skipped} coins not available on KuCoin")
+    
     return results
 
 # ======================== QUANT FACTORS ========================
 def factor_clv_pressure(df, lookback=12):
-    """
-    FACTOR 1: Close Location Value × Volume
-    Measures WHERE in the candle's range price closed, weighted by volume.
-    """
     if len(df) < lookback:
         return 0.0
     recent = df.tail(lookback)
@@ -468,10 +433,6 @@ def factor_clv_pressure(df, lookback=12):
     return float(np.clip(vol_weighted_clv / total_vol, -1, 1))
 
 def factor_volatility_regime(df, lookback=50):
-    """
-    FACTOR 2: ATR Percentile Rank
-    Where does current volatility sit compared to the last 50 candles?
-    """
     if len(df) < lookback:
         return 0.0
     tr = pd.concat([
@@ -489,10 +450,6 @@ def factor_volatility_regime(df, lookback=50):
     return -0.5
 
 def factor_cross_sectional_momentum(all_returns, target_sym):
-    """
-    FACTOR 3: Cross-Sectional Z-Score
-    How is this coin performing compared to the ENTIRE universe?
-    """
     if target_sym not in all_returns or len(all_returns) < 10:
         return 0.0
     values = list(all_returns.values())
@@ -503,7 +460,6 @@ def factor_cross_sectional_momentum(all_returns, target_sym):
     return float((all_returns[target_sym] - mean_ret) / std_ret)
 
 def calculate_atr(df, period=14):
-    """Standard ATR for stop-loss calculation."""
     tr = pd.concat([
         df['High'] - df['Low'],
         (df['High'] - df['Close'].shift()).abs(),
@@ -513,9 +469,6 @@ def calculate_atr(df, period=14):
     return float(atr_val) if not pd.isna(atr_val) else None
 
 def get_btc_regime(btc_df):
-    """
-    BTC Market Regime Filter
-    """
     if btc_df.empty or len(btc_df) < 50:
         return "NEUTRAL"
     ema50 = btc_df['Close'].ewm(span=50, adjust=False).mean().iloc[-1]
@@ -528,9 +481,6 @@ def get_btc_regime(btc_df):
 
 # ======================== SIGNAL GENERATION ========================
 def generate_signals():
-    """Generate trading signals with risky trade filtering."""
-    
-    # ⭐ CHECK RISKY OPEN TRADES FIRST
     trades = load_open_trades()
     risky_symbols = {t["symbol"] for t in trades if t.get("highest_tp_hit", -1) == -1}
     
@@ -556,17 +506,14 @@ def generate_signals():
         print("[!] Not enough data. Aborting.")
         return [], [], regime
 
-    # Calculate 48h returns for cross-sectional comparison
     all_returns = {}
     for sym, df in all_data.items():
         if len(df) >= 12:
             ret = (df['Close'].iloc[-1] / df['Close'].iloc[-12]) - 1
             all_returns[sym] = ret
 
-    # Score every coin
     scored = []
     for sym, df in all_data.items():
-        # ⭐ SKIP COINS WITH RISKY OPEN TRADES
         if sym in risky_symbols:
             continue
         
@@ -577,14 +524,12 @@ def generate_signals():
 
         direction = "LONG" if mom_z > 0 else "SHORT"
 
-        # BTC regime adjustment
         regime_penalty = 0.0
         if regime == "BULLISH" and direction == "SHORT":
             regime_penalty = -0.3
         if regime == "BEARISH" and direction == "LONG":
             regime_penalty = -0.3
 
-        # Final composite score
         score = (mom_z * 0.6) + (clv * np.sign(mom_z) * 0.3) + (vol * 0.1) + regime_penalty
 
         atr_val = calculate_atr(df)
@@ -598,7 +543,6 @@ def generate_signals():
             "vol_regime": round(vol, 2), "regime": regime,
         })
 
-    # Sort by absolute score, pick top N above threshold
     scored.sort(key=lambda x: abs(x["score"]), reverse=True)
     signals = []
     for s in scored:
@@ -611,7 +555,6 @@ def generate_signals():
     return signals, scored[:10], regime
 
 def build_signal(s):
-    """Convert a scored coin into a full trade signal."""
     direction = s["direction"]
     price = s["price"]
     atr_val = s["atr"]
@@ -621,10 +564,7 @@ def build_signal(s):
     stop = entry - stop_dist if direction == "LONG" else entry + stop_dist
     risk = abs(entry - stop)
 
-    tps = []
-    for m in CONFIG["trading"]["tp_multipliers"]:
-        tp = entry + m * risk if direction == "LONG" else entry - m * risk
-        tps.append(round(tp, 6))
+    tps = [round(entry + m * risk if direction == "LONG" else entry - m * risk, 6) for m in CONFIG["trading"]["tp_multipliers"]]
 
     balance = portfolio["balance"]
     risk_dollars = balance * CONFIG["trading"]["risk_per_trade_pct"] / 100
@@ -647,13 +587,11 @@ def build_signal(s):
         "qty": round(qty, 6), "notional": round(notional, 2),
         "risk_dollars": round(risk_dollars, 2), "risk_pct": round(risk / entry * 100, 2),
         "score": s["score"], "mom_z": s["mom_z"], "clv": s["clv"],
-        "vol_regime": s["vol_regime"], "regime": s["regime"],
-        "atr": atr_val,
+        "vol_regime": s["vol_regime"], "regime": s["regime"], "atr": atr_val,
     }
 
 # ======================== TRADE MONITORING + JOURNALING ========================
 def monitor_open_trades():
-    """Check all open trades for TP hits and stop losses."""
     trades = load_open_trades()
     if not trades:
         print("[*] No open trades to monitor")
@@ -677,10 +615,10 @@ def monitor_open_trades():
 
         current_price = get_current_price(kucoin_sym)
         if current_price is None:
-            print(f"[!] Could not fetch price for {sym}")
+            print(f"[!] Could not fetch price for {sym} - coin may not be on KuCoin")
+            print(f"    Run: python alphaswing.py --remove-trade {base}")
             continue
 
-        # Check if any new TPs were hit
         new_tp_hit = False
         for i in range(highest_tp_hit + 1, len(tps)):
             tp = tps[i]
@@ -694,7 +632,6 @@ def monitor_open_trades():
                 trade["highest_tp_hit"] = i
                 new_tp_hit = True
 
-                # Calculate new stop level
                 if i == 0:
                     new_stop = entry
                     stop_msg = f"🔒 Move stop to BREAKEVEN: `${entry:.4f}`"
@@ -731,7 +668,6 @@ def monitor_open_trades():
                 alerts.append(alert)
                 print(f"[✓] {base} hit TP{i+1} at ${current_price:.4f}")
 
-        # Check if stop was hit
         stop_hit = False
         if direction == "LONG" and current_price <= current_stop:
             stop_hit = True
@@ -753,13 +689,12 @@ def monitor_open_trades():
             result = {
                 "open_time": trade["opened_at"],
                 "close_time": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
-                "symbol": sym, "direction": direction,
-                "entry": entry, "stop": trade["stop"],
+                "symbol": sym, "direction": direction, "entry": entry, "stop": trade["stop"],
                 "tp1": tps[0], "tp2": tps[1], "tp3": tps[2], "tp4": tps[3], "tp5": tps[4],
-                "exit_price": exit_price, "qty": qty,
-                "pnl_pct": round(pnl_pct, 2), "pnl_dollars": round(pnl_dollars, 2),
-                "r_multiple": round(r_multiple, 2), "hit_level": hit_level,
-                "score": trade.get("score", 0), "mom_z": trade.get("mom_z", 0), "clv": trade.get("clv", 0)
+                "exit_price": exit_price, "qty": qty, "pnl_pct": round(pnl_pct, 2),
+                "pnl_dollars": round(pnl_dollars, 2), "r_multiple": round(r_multiple, 2),
+                "hit_level": hit_level, "score": trade.get("score", 0),
+                "mom_z": trade.get("mom_z", 0), "clv": trade.get("clv", 0)
             }
             closed_trades.append(result)
 
@@ -775,7 +710,6 @@ def monitor_open_trades():
             alerts.append(alert)
             print(f"[✗] {base} stopped out at ${exit_price:.4f}")
 
-        # Check if all TPs hit
         if highest_tp_hit == len(tps) - 1 and not stop_hit:
             exit_price = tps[-1]
             if direction == "LONG":
@@ -789,13 +723,12 @@ def monitor_open_trades():
             result = {
                 "open_time": trade["opened_at"],
                 "close_time": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
-                "symbol": sym, "direction": direction,
-                "entry": entry, "stop": trade["stop"],
+                "symbol": sym, "direction": direction, "entry": entry, "stop": trade["stop"],
                 "tp1": tps[0], "tp2": tps[1], "tp3": tps[2], "tp4": tps[3], "tp5": tps[4],
-                "exit_price": exit_price, "qty": qty,
-                "pnl_pct": round(pnl_pct, 2), "pnl_dollars": round(pnl_dollars, 2),
-                "r_multiple": round(r_multiple, 2), "hit_level": f"TP{len(tps)}",
-                "score": trade.get("score", 0), "mom_z": trade.get("mom_z", 0), "clv": trade.get("clv", 0)
+                "exit_price": exit_price, "qty": qty, "pnl_pct": round(pnl_pct, 2),
+                "pnl_dollars": round(pnl_dollars, 2), "r_multiple": round(r_multiple, 2),
+                "hit_level": f"TP{len(tps)}", "score": trade.get("score", 0),
+                "mom_z": trade.get("mom_z", 0), "clv": trade.get("clv", 0)
             }
             closed_trades.append(result)
 
@@ -809,15 +742,12 @@ def monitor_open_trades():
             alerts.append(alert)
             print(f"[🎉] {base} hit all TPs!")
 
-    # Journal closed trades
     if closed_trades:
         df_results = pd.DataFrame(closed_trades)
         safe_append_csv(CONFIG["files"]["trade_results_file"], df_results)
-
         closed_symbols = {t["symbol"] for t in closed_trades}
         trades = [t for t in trades if t["symbol"] not in closed_symbols]
         save_open_trades(trades)
-
         check_performance_report()
 
     for alert in alerts:
@@ -827,7 +757,6 @@ def monitor_open_trades():
         save_open_trades(trades)
 
 def check_performance_report():
-    """Generate performance report every N trades."""
     filepath = CONFIG["files"]["trade_results_file"]
     if not os.path.exists(filepath):
         return
@@ -856,12 +785,9 @@ def check_performance_report():
         total_wins = len(wins)
         total_losses = len(losses)
         winrate = (total_wins / total_trades * 100) if total_trades > 0 else 0
-
         total_pnl = df["pnl_dollars"].sum()
         avg_r = df["r_multiple"].mean()
-
         profit_factor = wins["pnl_dollars"].sum() / abs(losses["pnl_dollars"].sum()) if total_losses > 0 else float('inf')
-
         tp1_hits = len(df[df["hit_level"].str.contains("TP1", na=False)])
         tp2_hits = len(df[df["hit_level"].str.contains("TP2|TP3|TP4|TP5", na=False)])
 
@@ -887,7 +813,6 @@ def check_performance_report():
         print(f"[!] Report generation failed: {e}")
 
 def show_performance_report():
-    """Manually trigger performance report."""
     filepath = CONFIG["files"]["trade_results_file"]
     if not os.path.exists(filepath):
         print("[!] No trade results yet.")
@@ -904,7 +829,6 @@ def show_performance_report():
     total_wins = len(wins)
     total_losses = len(losses)
     winrate = (total_wins / total_trades * 100) if total_trades > 0 else 0
-
     total_pnl = df["pnl_dollars"].sum()
     avg_r = df["r_multiple"].mean()
     profit_factor = wins["pnl_dollars"].sum() / abs(losses["pnl_dollars"].sum()) if total_losses > 0 else float('inf')
@@ -926,14 +850,16 @@ def generate_chart(sig):
         matplotlib.use('Agg')
         import matplotlib.pyplot as plt
         import mplfinance as mpf
-    except ImportError:
-        print("[!] matplotlib/mplfinance not installed. Skipping chart.")
+    except ImportError as e:
+        print(f"[!] Chart libraries not installed: {e}")
+        print(f"    Run: pip install matplotlib mplfinance")
         return None
 
     sym = sig["symbol"]
     base = sym.replace("-USD", "")
     df = get_kucoin_klines(f"{base}-USDT", '4h', days=21)
     if df.empty or len(df) < 20:
+        print(f"[!] Not enough data for chart ({len(df)} candles)")
         return None
 
     if df.index.tz is not None:
@@ -974,6 +900,7 @@ def generate_chart(sig):
     path = f"chart_{base}_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}.png"
     fig.savefig(path, dpi=150, bbox_inches='tight', facecolor='#0d1117')
     plt.close(fig)
+    print(f"[✓] Chart generated: {path}")
     return path
 
 # ======================== DISCORD ========================
@@ -981,22 +908,28 @@ def send_discord(text):
     if not DISCORD_WEBHOOK_URL:
         return
     try:
-        requests.post(DISCORD_WEBHOOK_URL, json={"content": text[:2000]}, timeout=10)
-    except:
-        pass
+        resp = requests.post(DISCORD_WEBHOOK_URL, json={"content": text[:2000]}, timeout=10)
+        if resp.status_code != 204:
+            print(f"[!] Discord send failed: {resp.status_code}")
+    except Exception as e:
+        print(f"[!] Discord error: {e}")
 
 def send_discord_image(image_path, caption=""):
     if not DISCORD_WEBHOOK_URL or not image_path or not os.path.exists(image_path):
+        print(f"[!] Cannot send image: path={image_path}, exists={os.path.exists(image_path) if image_path else False}")
         return
     try:
         with open(image_path, 'rb') as img:
-            requests.post(DISCORD_WEBHOOK_URL, data={'content': caption[:2000]},
-                          files={'file': img}, timeout=15)
-    except:
-        pass
+            resp = requests.post(DISCORD_WEBHOOK_URL, data={'content': caption[:2000]},
+                                files={'file': img}, timeout=15)
+            if resp.status_code != 200:
+                print(f"[!] Discord image send failed: {resp.status_code}")
+            else:
+                print(f"[✓] Chart sent to Discord")
+    except Exception as e:
+        print(f"[!] Discord image error: {e}")
 
 def format_discord_alert(sig):
-    """Format a beautiful Discord message for a signal."""
     icon = "🟢" if sig['direction'] == "LONG" else "🔴"
     tp_lines = ""
     for i, tp in enumerate(sig['tps']):
@@ -1040,7 +973,7 @@ def log_signal(sig):
 def print_console_report(signals, top_candidates, regime):
     now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
     print(f"\n{'='*60}")
-    print(f"  ALPHASWING v4.3 – SIGNAL REPORT")
+    print(f"  ALPHASWING v4.4 – SIGNAL REPORT")
     print(f"  {now}")
     print(f"  BTC Regime: {regime} | Balance: ${portfolio['balance']:.2f}")
     print(f"{'='*60}")
@@ -1124,10 +1057,10 @@ def main():
     elif "--report" in args:
         show_performance_report()
     elif "--monitor" in args:
-        print(f"[*] AlphaSwing v4.3 – Trade Monitor")
+        print(f"[*] AlphaSwing v4.4 – Trade Monitor")
         run_monitor()
     elif "--loop" in args:
-        print(f"[*] AlphaSwing v4.3 – Loop mode ({CONFIG['loop_interval_hours']}h interval)")
+        print(f"[*] AlphaSwing v4.4 – Loop mode ({CONFIG['loop_interval_hours']}h interval)")
         print(f"[*] Portfolio balance: ${portfolio['balance']:.2f}")
         while True:
             try:
