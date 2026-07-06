@@ -1,7 +1,6 @@
 name: AlphaSwing - Crypto Signal Generator
 
 on:
-  # Manual trigger only
   workflow_dispatch:
     inputs:
       mode:
@@ -12,7 +11,25 @@ on:
         options:
           - signals
           - monitor
-          - loop
+          - add-last-signal
+          - list-trades
+          - report
+      symbol:
+        description: 'Symbol (for add-trade/remove-trade)'
+        required: false
+        default: ''
+      direction:
+        description: 'Direction LONG/SHORT (for add-trade)'
+        required: false
+        default: 'LONG'
+      entry:
+        description: 'Entry price (for add-trade)'
+        required: false
+        default: ''
+      stop:
+        description: 'Stop price (for add-trade)'
+        required: false
+        default: ''
 
 concurrency:
   group: alphaswing-${{ github.ref }}
@@ -45,13 +62,20 @@ jobs:
         env:
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
         run: |
-          if [ "${{ github.event.inputs.mode }}" = "monitor" ]; then
+          MODE="${{ github.event.inputs.mode }}"
+          SYMBOL="${{ github.event.inputs.symbol }}"
+          DIRECTION="${{ github.event.inputs.direction }}"
+          ENTRY="${{ github.event.inputs.entry }}"
+          STOP="${{ github.event.inputs.stop }}"
+          
+          if [ "$MODE" = "monitor" ]; then
             python alphaswing.py --monitor
-          elif [ "${{ github.event.inputs.mode }}" = "loop" ]; then
-            python alphaswing.py --loop &
-            PID=$!
-            sleep 120
-            kill $PID 2>/dev/null || true
+          elif [ "$MODE" = "add-last-signal" ]; then
+            python alphaswing.py --add-last-signal
+          elif [ "$MODE" = "list-trades" ]; then
+            python alphaswing.py --list-trades
+          elif [ "$MODE" = "report" ]; then
+            python alphaswing.py --report
           else
             python alphaswing.py
           fi
