@@ -65,6 +65,46 @@ def release_lock():
 
 atexit.register(release_lock)
 
+# ======================== AUTO FILE INITIALIZATION ========================
+def initialize_files():
+    """Automatically create all required files if they don't exist."""
+    print("[*] Initializing data files...")
+    
+    # Create portfolio.json
+    if not os.path.exists(CONFIG["files"]["portfolio_file"]):
+        with open(CONFIG["files"]["portfolio_file"], 'w') as f:
+            json.dump({"balance": 1000.0}, f, indent=2)
+        print(f"  ✓ Created {CONFIG['files']['portfolio_file']}")
+    
+    # Create open_trades.json
+    if not os.path.exists(CONFIG["files"]["open_trades_file"]):
+        with open(CONFIG["files"]["open_trades_file"], 'w') as f:
+            json.dump([], f)
+        print(f"  ✓ Created {CONFIG['files']['open_trades_file']}")
+    
+    # Create signal_log.csv with headers
+    if not os.path.exists(CONFIG["files"]["signal_log"]):
+        cols = ["timestamp", "symbol", "direction", "entry", "stop", 
+                "tp1", "tp2", "tp3", "score", "mom_z", "clv", "qty", "notional"]
+        pd.DataFrame(columns=cols).to_csv(CONFIG["files"]["signal_log"], index=False)
+        print(f"  ✓ Created {CONFIG['files']['signal_log']}")
+    
+    # Create trade_results.csv with headers
+    if not os.path.exists(CONFIG["files"]["trade_results_file"]):
+        cols = ["open_time", "close_time", "symbol", "direction", "entry", "stop",
+                "tp1", "tp2", "tp3", "tp4", "tp5", "exit_price", "qty", "pnl_pct",
+                "pnl_dollars", "r_multiple", "hit_level", "score", "mom_z", "clv"]
+        pd.DataFrame(columns=cols).to_csv(CONFIG["files"]["trade_results_file"], index=False)
+        print(f"  ✓ Created {CONFIG['files']['trade_results_file']}")
+    
+    # Create perf_counter.txt
+    if not os.path.exists(CONFIG["files"]["perf_counter_file"]):
+        with open(CONFIG["files"]["perf_counter_file"], 'w') as f:
+            f.write("0")
+        print(f"  ✓ Created {CONFIG['files']['perf_counter_file']}")
+    
+    print("[✓] All data files initialized!\n")
+
 # ======================== PORTFOLIO ========================
 def load_portfolio():
     pf = CONFIG["files"]["portfolio_file"]
@@ -110,14 +150,6 @@ def safe_append_csv(filepath, df_new):
         print(f"[!] CSV append failed: {e}")
         header = not os.path.exists(filepath) or os.path.getsize(filepath) == 0
         df_new.to_csv(filepath, mode='a', header=header, index=False)
-
-def init_trade_results_csv():
-    filepath = CONFIG["files"]["trade_results_file"]
-    if not os.path.exists(filepath):
-        cols = ["open_time", "close_time", "symbol", "direction", "entry", "stop",
-                "tp1", "tp2", "tp3", "tp4", "tp5", "exit_price", "qty", "pnl_pct",
-                "pnl_dollars", "r_multiple", "hit_level", "score", "mom_z", "clv"]
-        pd.DataFrame(columns=cols).to_csv(filepath, index=False)
 
 # ======================== COIN UNIVERSE ========================
 def fetch_top_liquid_coins():
@@ -765,7 +797,8 @@ def run_monitor():
         release_lock()
 
 def main():
-    init_trade_results_csv()
+    # Initialize all data files automatically
+    initialize_files()
 
     if "--report" in sys.argv:
         show_performance_report()
