@@ -39,8 +39,8 @@
     "mom_z": -4.41,
     "clv": 0.25,
     "notional": 41.08,
-    "highest_tp_hit": -1,
-    "current_stop": 18.645448,
+    "highest_tp_hit": 3,
+    "current_stop": 9.52068,
     "opened_at": "2026-07-07 00:28:20"
   }
 ]
