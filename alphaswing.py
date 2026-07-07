@@ -466,14 +466,46 @@ def get_kucoin_klines(kucoin_sym, interval, days=14):
     return pd.DataFrame()
 
 def get_current_price(kucoin_sym):
-    url = f"https://api.kucoin.com/api/v1/market/orderbook/level1?symbol={kucoin_sym.replace('-USD', '-USDT')}"
+    """Get current price with retries + Binance fallback."""
+    base = kucoin_sym.replace("-USD", "").replace("-USDT", "").upper()
+    
+    # ⭐ TRY 1: KuCoin (with 3 retries)
+    for attempt in range(3):
+        try:
+            url = f"https://api.kucoin.com/api/v1/market/orderbook/level1?symbol={base}-USDT"
+            resp = requests.get(url, timeout=5)
+            data = resp.json()
+            if data.get("code") == "200000":
+                return float(data["data"]["price"])
+            time.sleep(0.3)
+        except:
+            time.sleep(0.5)
+    
+    # ⭐ TRY 2: Binance fallback (very reliable)
     try:
+        url = f"https://api.binance.com/api/v3/ticker/price?symbol={base}USDT"
         resp = requests.get(url, timeout=5)
         data = resp.json()
-        if data.get("code") == "200000":
-            return float(data["data"]["price"])
+        if "price" in data:
+            print(f"  ↳ Used Binance fallback for {base}")
+            return float(data["price"])
     except:
         pass
+    
+    # ⭐ TRY 3: KuCoin alternative endpoint
+    try:
+        url = f"https://api.kucoin.com/api/v1/market/stats?symbol={base}-USDT"
+        resp = requests.get(url, timeout=5)
+        data = resp.json()
+        if data.get("code") == "200000" and "data" in data:
+            last_price = data["data"].get("last") or data["data"].get("lastPrice")
+            if last_price:
+                print(f"  ↳ Used KuCoin stats fallback for {base}")
+                return float(last_price)
+    except:
+        pass
+    
+    print(f"[!] All price sources failed for {base}")
     return None
 
 def fetch_all_data(coins):
