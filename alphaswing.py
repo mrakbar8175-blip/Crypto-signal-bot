@@ -359,22 +359,58 @@ def add_manual_trade(symbol, direction, entry, stop):
 def list_open_trades():
     trades = load_open_trades()
     if not trades:
-        print("\n[*] No open trades being monitored.")
+        msg = "📋 **No open trades being monitored.**"
+        print(msg)
+        send_discord(msg)
         return
     
+    # Build Discord-friendly message
+    lines = [f"📋 **OPEN TRADES ({len(trades)} active)**", "━━━━━━━━━━━━━━━━━━━━━━━━"]
+    
+    for i, t in enumerate(trades):
+        sym = t["symbol"].replace("-USD", "")
+        icon = "🟢" if t["direction"] == "LONG" else "🔴"
+        tp_status = "None" if t["highest_tp_hit"] == -1 else f"TP{t['highest_tp_hit']+1}"
+        risk_icon = "🔴" if t["highest_tp_hit"] == -1 else "🟢"
+        
+        # Calculate unrealized PnL
+        try:
+            current_price = get_current_price(t["symbol"])
+            if current_price:
+                if t["direction"] == "LONG":
+                    pnl_pct = (current_price - t["entry"]) / t["entry"] * 100
+                else:
+                    pnl_pct = (t["entry"] - current_price) / t["entry"] * 100
+                pnl_str = f"{pnl_pct:+.2f}%"
+            else:
+                pnl_str = "N/A"
+        except:
+            pnl_str = "N/A"
+        
+        lines.append(
+            f"{icon} **{sym}** {t['direction']} {risk_icon}\n"
+            f"  Entry: `${t['entry']:.4f}` | Stop: `${t['current_stop']:.4f}`\n"
+            f"  TP Hit: {tp_status} | PnL: `{pnl_str}`"
+        )
+    
+    lines.append("━━━━━━━━━━━━━━━━━━━━━━━━")
+    msg = "\n".join(lines)
+    
+    # Print to console
     print(f"\n{'='*80}")
     print(f"  OPEN TRADES ({len(trades)} active)")
     print(f"{'='*80}")
     print(f"  {'#':<3} {'Symbol':<10} {'Dir':<6} {'Entry':<12} {'Stop':<12} {'Current Stop':<12} {'TP Hit':<12} {'Status':<10}")
     print(f"  {'-'*77}")
-    
     for i, t in enumerate(trades):
         sym = t["symbol"].replace("-USD", "")
         tp_status = "None" if t["highest_tp_hit"] == -1 else f"TP{t['highest_tp_hit']+1}"
         risk_status = "🔴 Risky" if t["highest_tp_hit"] == -1 else "🟢 Safe"
         print(f"  {i+1:<3} {sym:<10} {t['direction']:<6} ${t['entry']:<11.4f} ${t['stop']:<11.4f} ${t['current_stop']:<11.4f} {tp_status:<12} {risk_status:<10}")
-    
     print(f"{'='*80}\n")
+    
+    # Send to Discord
+    send_discord(msg)
 
 def remove_trade(symbol):
     symbol = symbol.upper()
