@@ -467,7 +467,12 @@ def get_kucoin_klines(kucoin_sym, interval, days=14):
 
 def get_current_price(kucoin_sym):
     """Get current price with retries + Binance fallback."""
-    base = kucoin_sym.replace("-USD", "").replace("-USDT", "").upper()
+    # ⭐ FIXED: Strip suffix properly (no more NEART bug)
+    base = kucoin_sym.upper()
+    if base.endswith("-USDT"):
+        base = base[:-5]
+    elif base.endswith("-USD"):
+        base = base[:-4]
     
     # ⭐ TRY 1: KuCoin (with 3 retries)
     for attempt in range(3):
