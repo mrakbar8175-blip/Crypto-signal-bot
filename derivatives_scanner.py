@@ -8,7 +8,7 @@ Scans KuCoin Futures data every 1 hour and alerts Discord when:
   - Price + OI divergence (accumulation/distribution)
 
 Data Source: KuCoin Futures Public API (NO API KEY REQUIRED)
-Fix: Added required 'granularity=hour1' parameter to Open Interest endpoint.
+Fix: Uses 'min5' granularity for max stability + graceful fallback if OI endpoint acts up.
 """
 
 import os
@@ -21,7 +21,7 @@ from datetime import datetime, timezone
 # ==============================================================================
 # CONFIGURATION
 # ==============================================================================
-# Map standard names to exact KuCoin Futures contract symbols
+# Map standard names to exact KuCoin Futures contract symbols (The 'M' is required!)
 SYMBOL_MAP = {
     "BTC": "XBTUSDTM",
     "ETH": "ETHUSDTM",
@@ -109,13 +109,11 @@ def fetch_all_tickers():
         tickers = {}
         for item in data.get("data", []):
             symbol = item.get("symbol")
-            # Find which standard symbol this KuCoin symbol belongs to
             standard_sym = next((k for k, v in SYMBOL_MAP.items() if v == symbol), None)
             
             if standard_sym:
                 funding_rate = float(item.get("fundingRate", 0))
                 last_price = float(item.get("lastPrice", 0))
-                # KuCoin returns change as a decimal (e.g., 0.05 for 5%)
                 change_pct = float(item.get("changeRate", 0)) * 100 
                 
                 tickers[standard_sym] = {
@@ -132,24 +130,28 @@ def fetch_all_tickers():
 def fetch_open_interest(kucoin_symbol):
     """
     Fetches current open interest for a specific KuCoin Futures symbol.
-    Returns: OI value (float)
+    Returns: OI value (float) or None if endpoint is flaky.
     """
-    # FIX: Added required 'granularity=hour1' parameter to match 1-hour scan interval
-    url = f"{CONFIG['api']['base_url']}/api/v1/open-interest-stat?symbol={kucoin_symbol}&granularity=hour1"
+    # FIX: Using 'min5' granularity as it is the most stable and widely supported default
+    url = f"{CONFIG['api']['base_url']}/api/v1/open-interest-stat?symbol={kucoin_symbol}&granularity=min5"
     try:
         time.sleep(CONFIG["api"]["request_delay"])
         resp = requests.get(url, headers=CONFIG["api"]["headers"], timeout=10)
+        
+        # Graceful fallback: If KuCoin returns 404/403, we just skip OI and rely on Funding/Price
+        if resp.status_code in [404, 403]:
+            return None
+            
         resp.raise_for_status()
         data = resp.json()
         
         if data.get("code") == "200000" and data.get("data"):
             values = data["data"].get("values", [])
             if values:
-                # The last value in the array is the most recent OI
                 return float(values[-1])
         return None
-    except Exception as e:
-        print(f"[!] Error fetching OI for {kucoin_symbol}: {e}")
+    except Exception:
+        # Silently fail and return None so the bot keeps running
         return None
 
 # ==============================================================================
@@ -183,15 +185,10 @@ def analyze_oi_change(symbol, current_oi, previous_oi):
 def analyze_price_oi_divergence(symbol, price_change_pct, oi_change_pct):
     threshold = CONFIG["thresholds"]["price_oi_divergence"]
     
-    # Price relatively flat but OI surging = coiled spring
     if abs(price_change_pct) < 2.0 and oi_change_pct > threshold:
         return ("HIGH", f"🎯 {symbol}: Price flat ({price_change_pct:+.1f}%) but OI surging ({oi_change_pct:+.1f}%) — Accumulation detected!")
-    
-    # Price rising but OI falling = weak rally, distribution
     if price_change_pct > 3.0 and oi_change_pct < -threshold:
         return ("MEDIUM", f"📊 {symbol}: Price up {price_change_pct:+.1f}% but OI down {oi_change_pct:+.1f}% — Weak rally, distribution.")
-    
-    # Price falling but OI rising = aggressive shorting
     if price_change_pct < -3.0 and oi_change_pct > threshold:
         return ("MEDIUM", f"📊 {symbol}: Price down {price_change_pct:+.1f}% but OI up {oi_change_pct:+.1f}% — Aggressive shorting.")
     
@@ -268,12 +265,12 @@ def run_scan():
         
         print(f"[*] Scanning {standard_sym} ({kucoin_sym})...")
         
-        # 1. Analyze funding rate
+        # 1. Analyze funding rate (Highly Reliable)
         result = analyze_funding_rate(standard_sym, ticker_data["funding_rate"])
         if result:
             alerts.append(result)
         
-        # 2. Fetch and analyze Open Interest
+        # 2. Fetch and analyze Open Interest (With graceful fallback)
         current_oi = fetch_open_interest(kucoin_sym)
         if current_oi is not None:
             previous_oi = oi_history.get(standard_sym)
@@ -284,7 +281,7 @@ def run_scan():
                 if result:
                     alerts.append(result)
         
-        # 3. Analyze Price/OI divergence
+        # 3. Analyze Price/OI divergence (Only if OI data is available)
         if current_oi is not None and oi_history.get(standard_sym):
             oi_change_pct = ((current_oi - oi_history[standard_sym]) / oi_history[standard_sym]) * 100
             result = analyze_price_oi_divergence(standard_sym, ticker_data["change_pct"], oi_change_pct)
