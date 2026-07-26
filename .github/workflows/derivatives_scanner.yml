@@ -1,0 +1,42 @@
+name: Smart Money Derivatives Scanner
+
+on:
+  # Run every 15 minutes automatically
+  schedule:
+    - cron: '*/15 * * * *'
+  
+  # Allow manual triggering
+  workflow_dispatch:
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+      
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      
+      - name: Install dependencies
+        run: pip install requests
+      
+      - name: Run Derivatives Scanner
+        env:
+          DERIVATIVES_WEBHOOK: ${{ secrets.DERIVATIVES_WEBHOOK }}
+        run: python derivatives_scanner.py
+      
+      - name: Commit state updates
+        if: always()
+        run: |
+          git config user.name "Derivatives Scanner Bot"
+          git config user.email "scanner@alphaswing.local"
+          git add derivatives_state.json 2>/dev/null || true
+          git diff --staged --quiet || (git commit -m "📊 Derivatives state update $(date -u +%H:%M)" && git push)
