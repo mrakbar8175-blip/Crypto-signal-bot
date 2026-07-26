@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
 """
-Smart Money Derivatives Scanner
+Smart Money Derivatives Scanner (Bybit Edition)
 ================================
-Scans Binance Futures data every 15 minutes and alerts Discord when:
+Scans Bybit Futures data every 15 minutes and alerts Discord when:
   - Funding rates are extreme (overleveraged market)
   - Open Interest spikes (big move incoming)
   - Long/Short ratio is imbalanced (squeeze risk)
   - Price + OI divergence (accumulation/distribution)
 
-Data Source: Binance Futures Public API (NO API KEY REQUIRED)
+Data Source: Bybit V5 Public API (NO API KEY REQUIRED, GitHub Actions friendly)
 """
 
 import os
@@ -39,15 +39,19 @@ CONFIG = {
         "state_file": "derivatives_state.json",
     },
     "api": {
-        "base_url": "https://fapi.binance.com",
+        "base_url": "https://api.bybit.com",
         "request_delay": 0.1,  # 100ms between requests to avoid rate limits
+        # Crucial: User-Agent prevents GitHub Actions IPs from being auto-blocked
+        "headers": {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36"
+        }
     },
 }
 
 DISCORD_WEBHOOK_URL = os.environ.get("DERIVATIVES_WEBHOOK")
 
 # ==============================================================================
-# STATE MANAGEMENT (Tracks OI changes over time)
+# STATE MANAGEMENT
 # ==============================================================================
 def load_state():
     """Loads the previous state to detect changes over time."""
@@ -69,98 +73,91 @@ def save_state(state):
     os.replace(tmp, filepath)
 
 # ==============================================================================
-# BINANCE FUTURES API FUNCTIONS
+# BYBIT V5 API FUNCTIONS
 # ==============================================================================
-def fetch_funding_rates():
+def fetch_tickers():
     """
-    Fetches current funding rates for all symbols.
-    Returns: {symbol: funding_rate}
+    Fetches current tickers (includes funding rate and price) for all linear perpetuals.
+    Returns: {symbol: {"funding_rate": float, "price": float}}
     """
-    url = f"{CONFIG['api']['base_url']}/fapi/v1/premiumIndex"
+    url = f"{CONFIG['api']['base_url']}/v5/market/tickers"
+    params = {"category": "linear"}
+    
     try:
-        resp = requests.get(url, timeout=10)
+        resp = requests.get(url, params=params, headers=CONFIG["api"]["headers"], timeout=15)
         resp.raise_for_status()
         data = resp.json()
         
-        funding_rates = {}
-        for item in data:
+        if data.get("retCode") != 0:
+            print(f"[!] Bybit API Error: {data.get('retMsg')}")
+            return {}
+            
+        tickers = {}
+        for item in data.get("result", {}).get("list", []):
             symbol = item.get("symbol")
             if symbol in CONFIG["symbols"]:
-                rate = float(item.get("lastFundingRate", 0))
-                funding_rates[symbol] = rate
-        
-        return funding_rates
+                tickers[symbol] = {
+                    "funding_rate": float(item.get("fundingRate", 0)),
+                    "price": float(item.get("lastPrice", 0)),
+                    "price_change_pct": float(item.get("price24hPcnt", 0)) * 100
+                }
+        return tickers
     except Exception as e:
-        print(f"[!] Error fetching funding rates: {e}")
+        print(f"[!] Error fetching tickers: {e}")
         return {}
 
 def fetch_open_interest(symbol):
     """
     Fetches current open interest for a specific symbol.
-    Returns: OI in contracts (float)
+    Returns: OI value (float)
     """
-    url = f"{CONFIG['api']['base_url']}/fapi/v1/openInterest"
-    params = {"symbol": symbol}
+    url = f"{CONFIG['api']['base_url']}/v5/market/open-interest"
+    params = {"category": "linear", "symbol": symbol, "intervalTime": "5min"}
     
     try:
         time.sleep(CONFIG["api"]["request_delay"])
-        resp = requests.get(url, params=params, timeout=10)
+        resp = requests.get(url, params=params, headers=CONFIG["api"]["headers"], timeout=10)
         resp.raise_for_status()
         data = resp.json()
-        return float(data.get("openInterest", 0))
+        
+        if data.get("retCode") == 0 and data.get("result", {}).get("list"):
+            # The list is ordered newest first
+            return float(data["result"]["list"][0].get("openInterest", 0))
+        return None
     except Exception as e:
         print(f"[!] Error fetching OI for {symbol}: {e}")
         return None
 
-def fetch_long_short_ratio(symbol, period="5m"):
+def fetch_long_short_ratio(symbol):
     """
     Fetches global long/short account ratio.
-    Returns: {long_ratio, short_ratio}
+    Returns: {"long": float, "short": float}
     """
-    url = f"{CONFIG['api']['base_url']}/futures/data/globalLongShortAccountRatio"
-    params = {"symbol": symbol, "period": period, "limit": 1}
+    url = f"{CONFIG['api']['base_url']}/v5/market/account-ratio"
+    params = {"category": "linear", "symbol": symbol, "period": "5min"}
     
     try:
         time.sleep(CONFIG["api"]["request_delay"])
-        resp = requests.get(url, params=params, timeout=10)
+        resp = requests.get(url, params=params, headers=CONFIG["api"]["headers"], timeout=10)
         resp.raise_for_status()
         data = resp.json()
         
-        if data and len(data) > 0:
-            long_ratio = float(data[0].get("longAccount", 0))
-            short_ratio = float(data[0].get("shortAccount", 0))
-            return {"long": long_ratio, "short": short_ratio}
+        if data.get("retCode") == 0 and data.get("result", {}).get("list"):
+            latest = data["result"]["list"][0]
+            return {
+                "long": float(latest.get("buyRatio", 0)),
+                "short": float(latest.get("sellRatio", 0))
+            }
         return None
     except Exception as e:
         print(f"[!] Error fetching L/S ratio for {symbol}: {e}")
-        return None
-
-def fetch_price_change(symbol):
-    """
-    Fetches 24h price change percentage.
-    Returns: price_change_pct (float)
-    """
-    url = f"{CONFIG['api']['base_url']}/fapi/v1/ticker/24hr"
-    params = {"symbol": symbol}
-    
-    try:
-        time.sleep(CONFIG["api"]["request_delay"])
-        resp = requests.get(url, params=params, timeout=10)
-        resp.raise_for_status()
-        data = resp.json()
-        return float(data.get("priceChangePercent", 0))
-    except Exception as e:
-        print(f"[!] Error fetching price for {symbol}: {e}")
         return None
 
 # ==============================================================================
 # ANALYSIS FUNCTIONS
 # ==============================================================================
 def analyze_funding_rate(symbol, rate):
-    """
-    Analyzes funding rate severity.
-    Returns: (severity_level, message) or None if normal
-    """
+    """Analyzes funding rate severity."""
     abs_rate = abs(rate)
     thresholds = CONFIG["thresholds"]
     
@@ -174,10 +171,7 @@ def analyze_funding_rate(symbol, rate):
     return None
 
 def analyze_oi_change(symbol, current_oi, previous_oi):
-    """
-    Analyzes Open Interest change percentage.
-    Returns: (severity_level, message) or None if normal
-    """
+    """Analyzes Open Interest change percentage."""
     if previous_oi is None or previous_oi == 0:
         return None
     
@@ -185,17 +179,14 @@ def analyze_oi_change(symbol, current_oi, previous_oi):
     thresholds = CONFIG["thresholds"]
     
     if change_pct >= thresholds["oi_spike_pct"]:
-        return ("HIGH", f"📈 {symbol}: Open Interest surged {change_pct:+.1f}% — Big move incoming (likely LONG squeeze if price stalls).")
+        return ("HIGH", f"📈 {symbol}: Open Interest surged {change_pct:+.1f}% — Big move incoming.")
     elif change_pct <= thresholds["oi_drop_pct"]:
         return ("HIGH", f"📉 {symbol}: Open Interest dropped {change_pct:+.1f}% — Liquidation cascade detected!")
     
     return None
 
 def analyze_long_short_ratio(symbol, ls_data):
-    """
-    Analyzes long/short ratio imbalance.
-    Returns: (severity_level, message) or None if balanced
-    """
+    """Analyzes long/short ratio imbalance."""
     if ls_data is None:
         return None
     
@@ -211,25 +202,20 @@ def analyze_long_short_ratio(symbol, ls_data):
     return None
 
 def analyze_price_oi_divergence(symbol, price_change_pct, oi_change_pct):
-    """
-    Detects divergence between price movement and OI movement.
-    Price flat + OI rising = accumulation (big move coming)
-    Price rising + OI falling = distribution (weak rally)
-    Returns: (severity_level, message) or None
-    """
+    """Detects divergence between price movement and OI movement."""
     threshold = CONFIG["thresholds"]["price_oi_divergence"]
     
     # Price relatively flat but OI surging = coiled spring
     if abs(price_change_pct) < 2.0 and oi_change_pct > threshold:
-        return ("HIGH", f"🎯 {symbol}: Price flat ({price_change_pct:+.1f}%) but OI surging ({oi_change_pct:+.1f}%) — Accumulation detected. Volatile move incoming!")
+        return ("HIGH", f"🎯 {symbol}: Price flat ({price_change_pct:+.1f}%) but OI surging ({oi_change_pct:+.1f}%) — Accumulation detected!")
     
     # Price rising but OI falling = weak rally, distribution
     if price_change_pct > 3.0 and oi_change_pct < -threshold:
-        return ("MEDIUM", f"📊 {symbol}: Price up {price_change_pct:+.1f}% but OI down {oi_change_pct:+.1f}% — Weak rally, distribution phase.")
+        return ("MEDIUM", f"📊 {symbol}: Price up {price_change_pct:+.1f}% but OI down {oi_change_pct:+.1f}% — Weak rally, distribution.")
     
     # Price falling but OI rising = aggressive shorting
     if price_change_pct < -3.0 and oi_change_pct > threshold:
-        return ("MEDIUM", f"📊 {symbol}: Price down {price_change_pct:+.1f}% but OI up {oi_change_pct:+.1f}% — Aggressive shorting, potential short squeeze.")
+        return ("MEDIUM", f"📊 {symbol}: Price down {price_change_pct:+.1f}% but OI up {oi_change_pct:+.1f}% — Aggressive shorting.")
     
     return None
 
@@ -237,7 +223,6 @@ def analyze_price_oi_divergence(symbol, price_change_pct, oi_change_pct):
 # DISCORD ALERT FORMATTING
 # ==============================================================================
 def format_alert_header():
-    """Formats the header for the Discord alert."""
     now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
     return (
         f"🚨 **SMART MONEY ALERT** — Derivatives Scan\n"
@@ -247,7 +232,6 @@ def format_alert_header():
     )
 
 def format_alert_footer(alert_count):
-    """Formats the footer with recommendations."""
     return (
         f"━━━━━━━━━━━━━━━━━━━━━━━━\n"
         f"📋 **{alert_count} alert(s) triggered**\n"
@@ -256,13 +240,11 @@ def format_alert_footer(alert_count):
     )
 
 def send_discord_alert(message):
-    """Sends the formatted alert to Discord."""
     if not DISCORD_WEBHOOK_URL:
         print("[!] No Discord webhook configured. Skipping alert.")
         return
     
     try:
-        # Truncate if too long (Discord limit is 2000 chars)
         if len(message) > 1950:
             message = message[:1950] + "\n... (truncated)"
         
@@ -283,29 +265,24 @@ def send_discord_alert(message):
 # MAIN SCANNER LOGIC
 # ==============================================================================
 def run_scan():
-    """Main scan function that analyzes all symbols and triggers alerts."""
     print(f"\n[*] Starting derivatives scan at {datetime.now(timezone.utc).strftime('%H:%M:%S UTC')}")
     
-    # Load previous state
     state = load_state()
     oi_history = state.get("oi_history", {})
     
-    # Fetch funding rates (single API call for all symbols)
-    print("[*] Fetching funding rates...")
-    funding_rates = fetch_funding_rates()
-    print(f"[✓] Got funding rates for {len(funding_rates)} symbols")
+    print("[*] Fetching market tickers (Funding Rates & Prices)...")
+    tickers = fetch_tickers()
+    print(f"[✓] Got ticker data for {len(tickers)} symbols")
     
-    # Collect all alerts
     alerts = []
     new_oi_history = {}
     
-    # Analyze each symbol
     for symbol in CONFIG["symbols"]:
         print(f"[*] Scanning {symbol}...")
         
         # 1. Analyze funding rate
-        if symbol in funding_rates:
-            result = analyze_funding_rate(symbol, funding_rates[symbol])
+        if symbol in tickers:
+            result = analyze_funding_rate(symbol, tickers[symbol]["funding_rate"])
             if result:
                 alerts.append(result)
         
@@ -327,28 +304,23 @@ def run_scan():
             if result:
                 alerts.append(result)
         
-        # 4. Analyze Price/OI divergence (if we have historical data)
-        if symbol in funding_rates and current_oi is not None and oi_history.get(symbol):
-            price_change = fetch_price_change(symbol)
-            if price_change is not None:
-                oi_change_pct = ((current_oi - oi_history[symbol]) / oi_history[symbol]) * 100
-                result = analyze_price_oi_divergence(symbol, price_change, oi_change_pct)
-                if result:
-                    alerts.append(result)
+        # 4. Analyze Price/OI divergence
+        if symbol in tickers and current_oi is not None and oi_history.get(symbol):
+            price_change = tickers[symbol]["price_change_pct"]
+            oi_change_pct = ((current_oi - oi_history[symbol]) / oi_history[symbol]) * 100
+            result = analyze_price_oi_divergence(symbol, price_change, oi_change_pct)
+            if result:
+                alerts.append(result)
     
     # Sort alerts by severity
     severity_order = {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2}
     alerts.sort(key=lambda x: severity_order.get(x[0], 99))
     
-    # Send alert if we have any
     if alerts:
         print(f"\n[!] {len(alerts)} alerts triggered!")
         message = format_alert_header()
-        
-        # Group by severity
         for severity, msg in alerts:
             message += f"{msg}\n"
-        
         message += format_alert_footer(len(alerts))
         
         print(f"\n{message}")
@@ -356,7 +328,6 @@ def run_scan():
     else:
         print("[✓] No extreme conditions detected. Market is calm.")
     
-    # Save new state
     state["oi_history"] = new_oi_history
     state["last_scan"] = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
     save_state(state)
@@ -367,14 +338,12 @@ def run_scan():
 # ENTRY POINT
 # ==============================================================================
 def main():
-    """Main entry point."""
     print("=" * 60)
-    print("  SMART MONEY DERIVATIVES SCANNER")
+    print("  SMART MONEY DERIVATIVES SCANNER (BYBIT EDITION)")
     print("=" * 60)
     
     if not DISCORD_WEBHOOK_URL:
         print("[!] WARNING: DERIVATIVES_WEBHOOK environment variable not set!")
-        print("[!] Alerts will be logged to console but NOT sent to Discord.")
     
     try:
         run_scan()
