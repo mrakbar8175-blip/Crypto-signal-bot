@@ -8,7 +8,7 @@ Scans KuCoin Futures data every 15 minutes and alerts Discord when:
   - Price + OI divergence (accumulation/distribution)
 
 Data Source: KuCoin Futures Public API (NO API KEY REQUIRED)
-Fix: Includes browser-mimicking headers to bypass GitHub Actions 451 blocks.
+Fix: Corrected API endpoints (/api/v1/allTickers and /api/v1/open-interest-stat) + browser headers.
 """
 
 import os
@@ -96,7 +96,8 @@ def fetch_all_tickers():
     Fetches current tickers (includes funding rate and price) for ALL KuCoin Futures.
     Returns: {standard_symbol: {"funding_rate": float, "price": float, "change_pct": float}}
     """
-    url = f"{CONFIG['api']['base_url']}/api/v1/ticker/all"
+    # CORRECT ENDPOINT: /api/v1/allTickers
+    url = f"{CONFIG['api']['base_url']}/api/v1/allTickers"
     try:
         resp = requests.get(url, headers=CONFIG["api"]["headers"], timeout=15)
         resp.raise_for_status()
@@ -134,7 +135,8 @@ def fetch_open_interest(kucoin_symbol):
     Fetches current open interest for a specific KuCoin Futures symbol.
     Returns: OI value (float)
     """
-    url = f"{CONFIG['api']['base_url']}/api/v1/open-interest/stat?symbol={kucoin_symbol}"
+    # CORRECT ENDPOINT: /api/v1/open-interest-stat
+    url = f"{CONFIG['api']['base_url']}/api/v1/open-interest-stat?symbol={kucoin_symbol}"
     try:
         time.sleep(CONFIG["api"]["request_delay"])
         resp = requests.get(url, headers=CONFIG["api"]["headers"], timeout=10)
