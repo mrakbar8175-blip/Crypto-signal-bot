@@ -2,13 +2,13 @@
 """
 Smart Money Derivatives Scanner (KuCoin Futures Edition)
 ================================
-Scans KuCoin Futures data every 15 minutes and alerts Discord when:
+Scans KuCoin Futures data every 1 hour and alerts Discord when:
   - Funding rates are extreme (overleveraged market)
   - Open Interest spikes (big move incoming)
   - Price + OI divergence (accumulation/distribution)
 
 Data Source: KuCoin Futures Public API (NO API KEY REQUIRED)
-Fix: Corrected API endpoints (/api/v1/allTickers and /api/v1/open-interest-stat) + browser headers.
+Fix: Added required 'granularity=hour1' parameter to Open Interest endpoint.
 """
 
 import os
@@ -96,7 +96,6 @@ def fetch_all_tickers():
     Fetches current tickers (includes funding rate and price) for ALL KuCoin Futures.
     Returns: {standard_symbol: {"funding_rate": float, "price": float, "change_pct": float}}
     """
-    # CORRECT ENDPOINT: /api/v1/allTickers
     url = f"{CONFIG['api']['base_url']}/api/v1/allTickers"
     try:
         resp = requests.get(url, headers=CONFIG["api"]["headers"], timeout=15)
@@ -135,8 +134,8 @@ def fetch_open_interest(kucoin_symbol):
     Fetches current open interest for a specific KuCoin Futures symbol.
     Returns: OI value (float)
     """
-    # CORRECT ENDPOINT: /api/v1/open-interest-stat
-    url = f"{CONFIG['api']['base_url']}/api/v1/open-interest-stat?symbol={kucoin_symbol}"
+    # FIX: Added required 'granularity=hour1' parameter to match 1-hour scan interval
+    url = f"{CONFIG['api']['base_url']}/api/v1/open-interest-stat?symbol={kucoin_symbol}&granularity=hour1"
     try:
         time.sleep(CONFIG["api"]["request_delay"])
         resp = requests.get(url, headers=CONFIG["api"]["headers"], timeout=10)
@@ -215,7 +214,7 @@ def format_alert_footer(alert_count):
         f"━━━━━━━━━━━━━━━━━━━━━━━━\n"
         f"📋 **{alert_count} alert(s) triggered**\n"
         f"💡 **Recommendation:** Check your positions. Tighten stops if overleveraged.\n"
-        f"⚡ Scan runs every 15 minutes."
+        f"⚡ Scan runs every 1 hour."
     )
 
 def send_discord_alert(message):
