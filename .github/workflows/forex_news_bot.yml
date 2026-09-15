@@ -1,0 +1,43 @@
+name: Forex News & Macro Bot
+
+on:
+  # Run every 30 minutes (Forex moves fast!)
+  schedule:
+    - cron: '*/30 * * * *'
+  
+  # Allow manual triggering
+  workflow_dispatch:
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+      
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      
+      - name: Install dependencies
+        run: pip install requests feedparser
+      
+      - name: Run Forex News Scanner
+        env:
+          WEBHOOK_OWNER_HUB: ${{ secrets.WEBHOOK_OWNER_HUB }}
+          WEBHOOK_FOREX_NEWS: ${{ secrets.WEBHOOK_FOREX_NEWS }}
+        run: python forex_news_bot.py
+      
+      - name: Commit state updates
+        if: always()
+        run: |
+          git config user.name "Forex News Bot"
+          git config user.email "forex@tradingrationale.local"
+          git add forex_state.json 2>/dev/null || true
+          git diff --staged --quiet || (git commit -m " Forex state $(date -u +%H:%M)" && git push)
