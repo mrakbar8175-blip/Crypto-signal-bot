@@ -18,8 +18,8 @@ jobs:
         with:
           python-version: '3.11'
       
-      - name: Install feedparser
-        run: pip install feedparser
+      - name: Install dependencies
+        run: pip install feedparser requests  # <--- FIXED: Added 'requests' here
       
       - name: Post Forex News
         env:
