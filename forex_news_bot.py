@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-Simple Forex News Bot
-Posts financial news + this week's economic events
+Comprehensive Forex News & Events Bot
+Posts financial news + ALL market-moving events (High & Medium impact)
 """
 
 import os
@@ -12,18 +12,17 @@ from datetime import datetime, timedelta
 
 # Discord webhook
 WEBHOOK_URL = os.environ.get("FOREX_WEBHOOK")
-
-# State file to track posted news
 STATE_FILE = "posted_news.json"
 
-# News sources (RSS feeds)
+# News sources
 NEWS_SOURCES = [
     "https://www.investing.com/rss/news.rss",
     "https://feeds.reuters.com/reuters/businessNews"
 ]
-
-# Economic calendar API
 ECONOMIC_CALENDAR_URL = "https://nfs.faireconomy.media/ff_calendar_thisweek.json"
+
+# Major currencies that move the Forex market
+MAJOR_CURRENCIES = ["USD", "EUR", "GBP", "JPY", "AUD", "CAD", "CHF", "NZD"]
 
 def load_state():
     if os.path.exists(STATE_FILE):
@@ -31,8 +30,8 @@ def load_state():
             with open(STATE_FILE, 'r') as f:
                 return json.load(f)
         except:
-            return {"posted_titles": [], "last_update": None}
-    return {"posted_titles": [], "last_update": None}
+            return {"posted_titles": []}
+    return {"posted_titles": []}
 
 def save_state(state):
     with open(STATE_FILE + ".tmp", 'w') as f:
@@ -43,202 +42,136 @@ def send_to_discord(message):
     if not WEBHOOK_URL:
         print("No webhook configured")
         return False
-    
     try:
         resp = requests.post(WEBHOOK_URL, json={"content": message})
-        if resp.status_code in [200, 204]:
-            print("✓ News sent to Discord")
-            return True
-        return False
+        return resp.status_code in [200, 204]
     except Exception as e:
         print(f"Error: {e}")
         return False
 
 def fetch_news():
-    """Fetch latest financial news"""
     news_items = []
-    
     for feed_url in NEWS_SOURCES:
         try:
             feed = feedparser.parse(feed_url)
             for entry in feed.entries[:5]:
-                news_items.append({
-                    "title": entry.title,
-                    "link": entry.link,
-                    "published": entry.get("published", "")
-                })
-        except Exception as e:
-            print(f"Error fetching {feed_url}: {e}")
-    
+                news_items.append({"title": entry.title, "link": entry.link})
+        except:
+            pass
     return news_items
 
 def fetch_economic_events():
-    """Fetch this week's high-impact economic events"""
     events = []
     try:
-        print("[*] Fetching economic calendar...")
         resp = requests.get(ECONOMIC_CALENDAR_URL, timeout=10)
         data = resp.json()
-        
-        print(f"[*] Found {len(data)} total events in calendar")
-        
         today = datetime.now().date()
-        this_week_end = today + timedelta(days=7)
-        
-        for event in data:
-            try:
-                # Check if high impact
-                impact = event.get("impact", "")
-                if impact not in ["High", "3", "🔴"]:
-                    continue
-                
-                # Parse date - try different formats
-                date_str = event.get("date", "")
-                event_date = None
-                
-                # Try format: "Jul 27, 2026 12:30"
-                try:
-                    event_date = datetime.strptime(date_str, "%b %d, %Y %H:%M")
-                except:
-                    # Try format: "2026-07-27 12:30:00"
-                    try:
-                        event_date = datetime.strptime(date_str, "%Y-%m-%d %H:%M:%S")
-                    except:
-                        # Try format: "Jul 27 12:30"
-                        try:
-                            event_date = datetime.strptime(date_str, "%b %d %H:%M")
-                            # Assume current year and month
-                            event_date = event_date.replace(year=today.year)
-                        except:
-                            print(f"[!] Could not parse date: {date_str}")
-                            continue
-                
-                # Check if event is this week
-                if today <= event_date.date() <= this_week_end:
-                    events.append({
-                        "date": event_date.strftime("%a %H:%M"),
-                        "country": event.get("country", ""),
-                        "event": event.get("title", event.get("event", "")),
-                        "datetime": event_date,
-                        "impact": impact
-                    })
-                    print(f"[✓] Added event: {event.get('title', 'Unknown')} on {event_date}")
-                    
-            except Exception as e:
-                print(f"[!] Error processing event: {e}")
-                continue
-        
-        # Sort by date and limit to 5
-        events.sort(key=lambda x: x["datetime"])
-        print(f"[*] Total high-impact events this week: {len(events)}")
-        return events[:5]
-        
-    except Exception as e:
-        print(f"[!] Error fetching economic events: {e}")
-        # Return sample events for testing
-        print("[*] Returning sample events for testing...")
-        return [
-            {
-                "date": "Wed 12:30",
-                "country": "USD",
-                "event": "US Core CPI m/m",
-                "datetime": datetime.now() + timedelta(days=1)
-            },
-            {
-                "date": "Wed 12:30", 
-                "country": "USD",
-                "event": "CPI m/m",
-                "datetime": datetime.now() + timedelta(days=1)
-            },
-            {
-                "date": "Thu 12:45",
-                "country": "EUR",
-                "event": "ECB Interest Rate Decision",
-                "datetime": datetime.now() + timedelta(days=2)
-            }
-        ]
+        week_end = today + timedelta(days=7)
 
-def get_country_flag(country_code):
-    """Get emoji flag for country code"""
-    flags = {
-        "USD": "",
-        "EUR": "",
-        "GBP": "",
-        "JPY": "",
-        "AUD": "",
-        "CAD": "",
-        "CHF": "",
-        "NZD": "",
-        "CNY": "",
-        "INR": "",
-        "DEU": "",
-        "FRA": "",
-        "ITA": "",
-        "ESP": ""
-    }
-    return flags.get(country_code, "")
+        for event in data:
+            country = event.get("country", "")
+            impact = event.get("impact", "")
+            
+            # Filter: Major currencies ONLY, and High/Medium impact ONLY
+            if country not in MAJOR_CURRENCIES:
+                continue
+            if impact not in ["High", "Medium", "3", "2", "🔴", "🟠"]:
+                continue
+
+            # Parse date
+            try:
+                date_str = event.get("date", "")
+                event_date = datetime.strptime(date_str, "%b %d, %Y %H:%M")
+                
+                if today <= event_date.date() <= week_end:
+                    # Determine impact emoji
+                    impact_emoji = "🔴" if impact in ["High", "3", "🔴"] else ""
+                    
+                    events.append({
+                        "date_obj": event_date,
+                        "day": event_date.strftime("%A"),
+                        "time": event_date.strftime("%H:%M"),
+                        "country": country,
+                        "event": event.get("title", ""),
+                        "impact_emoji": impact_emoji
+                    })
+            except:
+                pass
+
+        # Sort by date, prioritize High impact (🔴) over Medium (🟠)
+        events.sort(key=lambda x: (x["date_obj"], 0 if x["impact_emoji"] == "🔴" else 1))
+        
+        # Limit to top 15 events to prevent Discord character limit issues
+        return events[:15]
+    except Exception as e:
+        print(f"Error fetching events: {e}")
+        return []
+
+def get_country_flag(code):
+    flags = {"USD": "", "EUR": "", "GBP": "", "JPY": "", "AUD": "", "CAD": "", "CHF": "", "NZD": ""}
+    return flags.get(code, "")
 
 def format_message(news_items, economic_events, state):
-    """Format message with clickable links"""
     today = datetime.now().strftime("%A, %B %d")
+    message = f" **FINANCIAL NEWS & FOREX EVENTS**\n{today}\n━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
     
-    message = f" **FINANCIAL NEWS & EVENTS**\n"
-    message += f"{today}\n"
-    message += "━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-    
-    # Section 1: This Week's Economic Events
+    # --- SECTION 1: FOREX EVENTS (Grouped by Day) ---
     if economic_events:
-        message += " **THIS WEEK'S EVENTS**\n"
+        message += " **THIS WEEK'S MARKET EVENTS**\n"
+        current_day = ""
         for event in economic_events:
+            # Print Day Header if it changes
+            if event["day"] != current_day:
+                current_day = event["day"]
+                message += f"\n **{current_day}**\n"
+            
             flag = get_country_flag(event["country"])
-            message += f"{flag} **{event['date']}** - {event['event']}\n"
+            # Format: 🔴 12:30 - US Core CPI
+            message += f"{event['impact_emoji']} {event['time']} - {flag} {event['event']}\n"
         message += "\n"
     else:
-        message += " **THIS WEEK'S EVENTS**\n"
-        message += "*No major high-impact events this week*\n\n"
-    
-    # Section 2: Latest News
+        message += " **THIS WEEK'S EVENTS**\n*No major market-moving events found*\n\n"
+
+    # --- SECTION 2: LATEST NEWS ---
     if news_items:
-        message += " **LATEST NEWS**\n"
+        message += " **LATEST FINANCIAL NEWS**\n"
         count = 0
         for item in news_items[:6]:
             if item["title"] not in state["posted_titles"]:
-                message += f"{count + 1}. **{item['title']}** [View Article]({item['link']})\n\n"
+                # Clickable link format
+                message += f"{count + 1}. **{item['title']}** [Read More]({item['link']})\n\n"
                 state["posted_titles"].append(item["title"])
                 count += 1
-        
+                if count >= 4: # Limit news to 4 items to save space for events
+                    break
         if count == 0:
             message += "*No new news since last update*\n\n"
+
+    message += "━━━━━━━━━━━━━━━━━━━━━━━━\n💡 *Stay informed, trade safe*"
     
-    message += "━━━━━━━━━━━━━━━━━━━━━━━━\n"
-    message += "💡 *Stay informed, trade safe*"
-    
-    return message[:1950], state
+    # Hard limit for Discord
+    return message[:1900], state
 
 def main():
-    print("Fetching financial news and economic events...")
-    
+    print("Fetching data...")
     state = load_state()
     news = fetch_news()
     events = fetch_economic_events()
     
-    print(f"[*] Found {len(news)} news items and {len(events)} economic events")
+    print(f"Found {len(news)} news and {len(events)} forex events")
     
-    new_news_count = sum(1 for item in news if item["title"] not in state["posted_titles"])
+    new_news = sum(1 for item in news if item["title"] not in state["posted_titles"])
     
-    if new_news_count == 0 and not events:
-        print("No new news or events to post")
+    if new_news == 0 and not events:
+        print("Nothing new to post.")
         return
-    
+
     message, updated_state = format_message(news, events, state)
-    updated_state["last_update"] = datetime.now().strftime("%Y-%m-%d %H:%M UTC")
     
     if send_to_discord(message):
         updated_state["posted_titles"] = updated_state["posted_titles"][-100:]
         save_state(updated_state)
-        print(f"✓ Posted {new_news_count} new news items and {len(events)} events")
-    else:
-        print("Failed to send message")
+        print("✓ Posted successfully")
 
 if __name__ == "__main__":
     main()
