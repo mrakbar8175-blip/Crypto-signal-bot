@@ -2,7 +2,7 @@
 """
 Simple Forex News Bot
 Posts financial news + this week's economic events
-NO DUPLICATES + SUPER CLEAN LINKS
+NO DUPLICATES + CLICKABLE CLEAN LINKS
 """
 
 import os
@@ -57,10 +57,6 @@ def send_to_discord(message):
     except Exception as e:
         print(f"Error: {e}")
         return False
-
-def make_clean_link(long_url):
-    """Return just 'View Article' as a clean clickable link"""
-    return "[View Article]"
 
 def fetch_news():
     """Fetch latest financial news"""
@@ -128,7 +124,7 @@ def get_country_flag(country_code):
     return flags.get(country_code, "")
 
 def format_message(news_items, economic_events, state):
-    """Format a clean message for Discord"""
+    """Format a clean message for Discord with CLICKABLE links"""
     today = datetime.now().strftime("%A, %B %d")
     
     message = f" **FINANCIAL NEWS & EVENTS**\n"
@@ -149,8 +145,8 @@ def format_message(news_items, economic_events, state):
         count = 0
         for item in news_items[:6]:
             if item["title"] not in state["posted_titles"]:
-                # Use clean link format
-                message += f"{count + 1}. **{item['title']}** {make_clean_link(item['link'])}\n\n"
+                # PROPER DISCORD MARKDOWN: [text](url)
+                message += f"{count + 1}. **{item['title']}** [View Article]({item['link']})\n\n"
                 state["posted_titles"].append(item["title"])
                 count += 1
         
@@ -158,7 +154,7 @@ def format_message(news_items, economic_events, state):
             message += "*No new news since last update*\n\n"
     
     message += "━━━━━━━━━━━━━━━━━━━━━━━━\n"
-    message += "💡 *Stay informed, trade safe*"
+    message += " *Stay informed, trade safe*"
     
     return message[:1950], state
 
