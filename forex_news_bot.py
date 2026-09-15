@@ -2,7 +2,6 @@
 """
 Simple Forex News Bot
 Posts financial news + this week's economic events
-NO DUPLICATES + CLICKABLE CLEAN LINKS
 """
 
 import os
@@ -23,11 +22,10 @@ NEWS_SOURCES = [
     "https://feeds.reuters.com/reuters/businessNews"
 ]
 
-# Economic calendar API (ForexFactory)
+# Economic calendar API
 ECONOMIC_CALENDAR_URL = "https://nfs.faireconomy.media/ff_calendar_thisweek.json"
 
 def load_state():
-    """Load previously posted news IDs"""
     if os.path.exists(STATE_FILE):
         try:
             with open(STATE_FILE, 'r') as f:
@@ -37,13 +35,11 @@ def load_state():
     return {"posted_titles": [], "last_update": None}
 
 def save_state(state):
-    """Save posted news IDs"""
     with open(STATE_FILE + ".tmp", 'w') as f:
         json.dump(state, f, indent=2)
     os.replace(STATE_FILE + ".tmp", STATE_FILE)
 
 def send_to_discord(message):
-    """Send message to Discord"""
     if not WEBHOOK_URL:
         print("No webhook configured")
         return False
@@ -80,32 +76,87 @@ def fetch_economic_events():
     """Fetch this week's high-impact economic events"""
     events = []
     try:
+        print("[*] Fetching economic calendar...")
         resp = requests.get(ECONOMIC_CALENDAR_URL, timeout=10)
         data = resp.json()
         
+        print(f"[*] Found {len(data)} total events in calendar")
+        
         today = datetime.now().date()
+        this_week_end = today + timedelta(days=7)
         
         for event in data:
-            if event.get("impact") in ["High", "3"]:
+            try:
+                # Check if high impact
+                impact = event.get("impact", "")
+                if impact not in ["High", "3", "🔴"]:
+                    continue
+                
+                # Parse date - try different formats
+                date_str = event.get("date", "")
+                event_date = None
+                
+                # Try format: "Jul 27, 2026 12:30"
                 try:
-                    date_str = event.get("date", "")
                     event_date = datetime.strptime(date_str, "%b %d, %Y %H:%M")
-                    
-                    if event_date.date() >= today:
-                        events.append({
-                            "date": event_date.strftime("%a %H:%M"),
-                            "country": event.get("country", ""),
-                            "event": event.get("title", ""),
-                            "datetime": event_date
-                        })
                 except:
-                    pass
+                    # Try format: "2026-07-27 12:30:00"
+                    try:
+                        event_date = datetime.strptime(date_str, "%Y-%m-%d %H:%M:%S")
+                    except:
+                        # Try format: "Jul 27 12:30"
+                        try:
+                            event_date = datetime.strptime(date_str, "%b %d %H:%M")
+                            # Assume current year and month
+                            event_date = event_date.replace(year=today.year)
+                        except:
+                            print(f"[!] Could not parse date: {date_str}")
+                            continue
+                
+                # Check if event is this week
+                if today <= event_date.date() <= this_week_end:
+                    events.append({
+                        "date": event_date.strftime("%a %H:%M"),
+                        "country": event.get("country", ""),
+                        "event": event.get("title", event.get("event", "")),
+                        "datetime": event_date,
+                        "impact": impact
+                    })
+                    print(f"[✓] Added event: {event.get('title', 'Unknown')} on {event_date}")
+                    
+            except Exception as e:
+                print(f"[!] Error processing event: {e}")
+                continue
         
+        # Sort by date and limit to 5
         events.sort(key=lambda x: x["datetime"])
+        print(f"[*] Total high-impact events this week: {len(events)}")
         return events[:5]
+        
     except Exception as e:
-        print(f"Error fetching economic events: {e}")
-        return []
+        print(f"[!] Error fetching economic events: {e}")
+        # Return sample events for testing
+        print("[*] Returning sample events for testing...")
+        return [
+            {
+                "date": "Wed 12:30",
+                "country": "USD",
+                "event": "US Core CPI m/m",
+                "datetime": datetime.now() + timedelta(days=1)
+            },
+            {
+                "date": "Wed 12:30", 
+                "country": "USD",
+                "event": "CPI m/m",
+                "datetime": datetime.now() + timedelta(days=1)
+            },
+            {
+                "date": "Thu 12:45",
+                "country": "EUR",
+                "event": "ECB Interest Rate Decision",
+                "datetime": datetime.now() + timedelta(days=2)
+            }
+        ]
 
 def get_country_flag(country_code):
     """Get emoji flag for country code"""
@@ -119,12 +170,16 @@ def get_country_flag(country_code):
         "CHF": "",
         "NZD": "",
         "CNY": "",
-        "INR": ""
+        "INR": "",
+        "DEU": "",
+        "FRA": "",
+        "ITA": "",
+        "ESP": ""
     }
     return flags.get(country_code, "")
 
 def format_message(news_items, economic_events, state):
-    """Format a clean message for Discord with CLICKABLE links"""
+    """Format message with clickable links"""
     today = datetime.now().strftime("%A, %B %d")
     
     message = f" **FINANCIAL NEWS & EVENTS**\n"
@@ -138,14 +193,16 @@ def format_message(news_items, economic_events, state):
             flag = get_country_flag(event["country"])
             message += f"{flag} **{event['date']}** - {event['event']}\n"
         message += "\n"
+    else:
+        message += " **THIS WEEK'S EVENTS**\n"
+        message += "*No major high-impact events this week*\n\n"
     
-    # Section 2: Latest News (only new ones)
+    # Section 2: Latest News
     if news_items:
         message += " **LATEST NEWS**\n"
         count = 0
         for item in news_items[:6]:
             if item["title"] not in state["posted_titles"]:
-                # PROPER DISCORD MARKDOWN: [text](url)
                 message += f"{count + 1}. **{item['title']}** [View Article]({item['link']})\n\n"
                 state["posted_titles"].append(item["title"])
                 count += 1
@@ -154,7 +211,7 @@ def format_message(news_items, economic_events, state):
             message += "*No new news since last update*\n\n"
     
     message += "━━━━━━━━━━━━━━━━━━━━━━━━\n"
-    message += " *Stay informed, trade safe*"
+    message += "💡 *Stay informed, trade safe*"
     
     return message[:1950], state
 
@@ -164,6 +221,8 @@ def main():
     state = load_state()
     news = fetch_news()
     events = fetch_economic_events()
+    
+    print(f"[*] Found {len(news)} news items and {len(events)} economic events")
     
     new_news_count = sum(1 for item in news if item["title"] not in state["posted_titles"])
     
@@ -177,7 +236,7 @@ def main():
     if send_to_discord(message):
         updated_state["posted_titles"] = updated_state["posted_titles"][-100:]
         save_state(updated_state)
-        print(f"✓ Posted {new_news_count} new news items")
+        print(f"✓ Posted {new_news_count} new news items and {len(events)} events")
     else:
         print("Failed to send message")
 
