@@ -1,7 +1,7 @@
-name: Forex News & Macro Bot
+name: Forex High-Impact News Bot
 
 on:
-  # Run every 30 minutes (Forex moves fast!)
+  # Run every 30 minutes to catch upcoming events
   schedule:
     - cron: '*/30 * * * *'
   
@@ -26,7 +26,7 @@ jobs:
           python-version: '3.11'
       
       - name: Install dependencies
-        run: pip install requests feedparser
+        run: pip install requests
       
       - name: Run Forex News Scanner
         env:
@@ -40,4 +40,4 @@ jobs:
           git config user.name "Forex News Bot"
           git config user.email "forex@tradingrationale.local"
           git add forex_state.json 2>/dev/null || true
-          git diff --staged --quiet || (git commit -m " Forex state $(date -u +%H:%M)" && git push)
+          git diff --staged --quiet || (git commit -m "📰 Forex state update $(date -u +%H:%M)" && git push)
