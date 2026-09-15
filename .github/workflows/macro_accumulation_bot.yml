@@ -1,0 +1,44 @@
+name: Macro Accumulation & Value Bot
+
+on:
+  # Run once a day at 12:00 PM UTC (Saves GitHub minutes & respects API limits)
+  schedule:
+    - cron: '0 12 * * *'
+  
+  # Allow manual triggering
+  workflow_dispatch:
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15 # Needs a bit more time due to 6.5s delays between 15 coins
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+      
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      
+      - name: Install dependencies
+        run: pip install requests pandas
+      
+      - name: Run Macro Accumulation Scanner
+        env:
+          WEBHOOK_OWNER_HUB: ${{ secrets.WEBHOOK_OWNER_HUB }}
+          WEBHOOK_INVESTMENT_WATCH: ${{ secrets.WEBHOOK_INVESTMENT_WATCH }}
+          WEBHOOK_MACRO_DIGEST: ${{ secrets.WEBHOOK_MACRO_DIGEST }}
+        run: python macro_accumulation_bot.py
+      
+      - name: Commit state updates
+        if: always()
+        run: |
+          git config user.name "Macro Accumulation Bot"
+          git config user.email "invest@alphaswing.local"
+          git add accumulation_state.json 2>/dev/null || true
+          git diff --staged --quiet || (git commit -m "📊 Accumulation state $(date -u +%H:%M)" && git push)
