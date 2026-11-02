@@ -1,5 +1,7 @@
 {
-  "last_fear_greed": 34,
-  "alerted_dca": [],
+  "last_fear_greed": 37,
+  "alerted_dca": [
+    "ATOM_FAIR_VALUE"
+  ],
   "last_weekly_reminder": null
 }
