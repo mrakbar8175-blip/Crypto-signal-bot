@@ -5,7 +5,8 @@
     "XRP_FAIR_VALUE",
     "DOT_FAIR_VALUE",
     "SOL_FAIR_VALUE",
-    "ETH_FAIR_VALUE"
+    "ETH_FAIR_VALUE",
+    "ADA_FAIR_VALUE"
   ],
   "last_weekly_reminder": null
 }
